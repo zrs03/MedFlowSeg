@@ -1,6 +1,7 @@
 # ======================================================
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
+# Threshold + Argmax decoding (SegDiff-style)
 # ======================================================
 
 import argparse
@@ -22,29 +23,55 @@ from utils.dataset import FolderDataset
 # ======================================================
 # Utils
 # ======================================================
-def sdf_to_mask(sdf: torch.Tensor) -> torch.Tensor:
+def sdf_to_mask_thresh_argmax_pred(sdf: torch.Tensor, thresh: float, fg_factor: float = 3.0) -> torch.Tensor:
     """
-    Convert multi-channel SDF to discrete mask.
+    Pred: threshold + argmax (SegDiff-style)
 
-    IMPORTANT:
-    - Only consider foreground channels 1..C-1.
-    - Output labels are ONLY in {1,2,3} (no background 0).
+    sdf: (B, C, H, W), signed distance (normalized to [-1,1] in your preprocessing)
+    - Use only foreground channels 1..C-1 for thresholding.
+    - Foreground binary: sdf <= fg_factor*thresh
+    - Add background channel=0 then argmax to get labels 0..C-1
 
-    sdf: (B, C, H, W)
-    returns: (B, H, W) with values 1..C-1
+    returns: (B, H, W) with values in {0..C-1}
     """
-    sdf_fg = sdf[:, 1:]  # ignore channel 0 (background)
-    mask_fg = torch.argmin(sdf_fg, dim=1) + 1
-    return mask_fg
+    # foreground channels (B, C-1, H, W)
+    sdf_fg = sdf[:, 1:]
+
+    # binary threshold
+    fg_bin = (sdf_fg <= (fg_factor * thresh)).to(torch.int8)
+
+    # prepend background channel zeros -> (B, C, H, W)
+    bg = torch.zeros_like(fg_bin[:, :1])
+    m = torch.cat([bg, fg_bin], dim=1)
+
+    # argmax -> (B, H, W)
+    return torch.argmax(m, dim=1)
 
 
-def mean_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
     """
-    Compute mean Dice for foreground classes only (1..num_classes-1)
-    pred, gt: (B,H,W) with labels in {1..num_classes-1}
+    GT: threshold + argmax.
+    Since GT sdf is signed distance: inside is negative, boundary=0, outside positive.
+    So foreground is sdf <= 0.
+
+    sdf_gt: (B, C, H, W)
+    returns: (B, H, W) with values in {0..C-1}
+    """
+    sdf_fg = sdf_gt[:, 1:]
+    fg_bin = (sdf_fg <= 0.0).to(torch.int8)
+
+    bg = torch.zeros_like(fg_bin[:, :1])
+    m = torch.cat([bg, fg_bin], dim=1)
+    return torch.argmax(m, dim=1)
+
+
+def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    Mean Dice over foreground classes only (1..num_classes-1).
+    pred, gt: (B,H,W) with labels in {0..num_classes-1}
     """
     dices = []
-    for c in range(1, num_classes):  # exclude background
+    for c in range(1, num_classes):
         p = (pred == c).float()
         g = (gt == c).float()
         inter = (p * g).sum(dim=(1, 2))
@@ -53,22 +80,15 @@ def mean_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.T
     return torch.stack(dices).mean()
 
 
-def colorize(mask: np.ndarray, num_classes: int) -> np.ndarray:
+def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
     """
-    Colorize mask with the rule you want:
-
-    - Only class 1/2/3 are colored (red/green/blue).
-    - Everything else (including 0 / out-of-range / negative) is pure black.
-
-    mask: (H, W) int
-    returns: (H, W, 3) uint8
+    Only color class 1/2/3; everything else (including background 0) is pure black.
+    mask: (H,W) int labels
     """
-    out = np.zeros((*mask.shape, 3), dtype=np.uint8)  # default black everywhere
-
-    out[mask == 1] = [255, 0, 0]  # class 1 -> red
-    out[mask == 2] = [0, 255, 0]  # class 2 -> green
-    out[mask == 3] = [0, 0, 255]  # class 3 -> blue
-
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)  # black
+    out[mask == 1] = [255, 0, 0]
+    out[mask == 2] = [0, 255, 0]
+    out[mask == 3] = [0, 0, 255]
     return out
 
 
@@ -83,6 +103,8 @@ class LitMedFlowSeg(pl.LightningModule):
         sample_steps: int = 10,
         vis_every: int = 5,
         output_root: str = "./Outputs/MedFlowSeg",
+        thresh: float = 0.2,     # ✅ new: threshold for pred decoding
+        fg_factor: float = 3.0,  # ✅ new: same as SegDiff: sdf <= 3*thresh
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -99,6 +121,9 @@ class LitMedFlowSeg(pl.LightningModule):
         self.vis_root = self.output_root / "vis"
         self.vis_root.mkdir(parents=True, exist_ok=True)
 
+        self.thresh = float(thresh)
+        self.fg_factor = float(fg_factor)
+
         self._val_vis_cache = []
 
     # --------------------------------------------------
@@ -114,7 +139,7 @@ class LitMedFlowSeg(pl.LightningModule):
 
         dt = 1.0 / self.sample_steps
         for i in range(self.sample_steps):
-            t = torch.full((B,), i * dt, device=image.device)  # in [0,1)
+            t = torch.full((B,), i * dt, device=image.device)
             v = self.model(x, image, t)
             x = x + v * dt
 
@@ -124,22 +149,17 @@ class LitMedFlowSeg(pl.LightningModule):
     # Training: Conditional Flow Matching (linear bridge)
     # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, x1 = batch  # x1 is sdf_gt, shape (B,C,H,W)
+        image, x1 = batch  # x1 is sdf_gt, (B,C,H,W)
 
         B = image.shape[0]
         device = image.device
 
-        # sample t ~ U(0,1)
-        t = torch.rand(B, device=device)  # (B,)
-        t_ = t[:, None, None, None]       # (B,1,1,1)
+        t = torch.rand(B, device=device)
+        t_ = t[:, None, None, None]
 
-        # sample noise endpoint x0 ~ N(0,I)
         x0 = torch.randn_like(x1)
-
-        # bridge state x_t = (1-t)x0 + t x1
         x_t = (1.0 - t_) * x0 + t_ * x1
 
-        # target velocity v* = dx_t/dt = x1 - x0
         v_star = x1 - x0
 
         v_pred = self.model(x_t, image, t)
@@ -155,10 +175,12 @@ class LitMedFlowSeg(pl.LightningModule):
         image, sdf_gt = batch
 
         sdf_pred = self.sample(image)
-        pred_mask = sdf_to_mask(sdf_pred)
-        gt_mask = sdf_to_mask(sdf_gt)
 
-        dice = mean_dice(pred_mask, gt_mask, self.num_classes)
+        # ✅ Threshold + argmax decoding
+        pred_mask = sdf_to_mask_thresh_argmax_pred(sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor)
+        gt_mask = sdf_to_mask_thresh_argmax_gt(sdf_gt)
+
+        dice = mean_dice_foreground(pred_mask, gt_mask, self.num_classes)
 
         self.log(
             "val_mean_dice",
@@ -206,11 +228,12 @@ class LitMedFlowSeg(pl.LightningModule):
             axs[0].set_title("Image")
             axs[0].axis("off")
 
-            axs[1].imshow(colorize(gt[i], self.num_classes))
+            # ✅ only 1/2/3 colored, everything else black
+            axs[1].imshow(colorize_three_fg_else_black(gt[i]))
             axs[1].set_title("GT")
             axs[1].axis("off")
 
-            axs[2].imshow(colorize(pred[i], self.num_classes))
+            axs[2].imshow(colorize_three_fg_else_black(pred[i]))
             axs[2].set_title("Pred")
             axs[2].axis("off")
 
@@ -251,6 +274,10 @@ def main():
     parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg")
     parser.add_argument("--vis_every", type=int, default=5)
 
+    # ✅ new: threshold for pred decoding (since your sdf is normalized to [-1,1])
+    parser.add_argument("--thresh", type=float, default=0.2)
+    parser.add_argument("--fg_factor", type=float, default=3.0)
+
     # -------- System --------
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpus", type=int, default=4)
@@ -289,6 +316,8 @@ def main():
         sample_steps=args.sample_steps,
         vis_every=args.vis_every,
         output_root=args.output_root,
+        thresh=args.thresh,
+        fg_factor=args.fg_factor,
     )
 
     # -------- Checkpoint --------
