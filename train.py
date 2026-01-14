@@ -23,10 +23,26 @@ from utils.dataset import FolderDataset
 # Utils
 # ======================================================
 def sdf_to_mask(sdf: torch.Tensor) -> torch.Tensor:
-    return torch.argmin(sdf, dim=1)
+    """
+    Convert multi-channel SDF to discrete mask.
+
+    IMPORTANT:
+    - Only consider foreground channels 1..C-1.
+    - Output labels are ONLY in {1,2,3} (no background 0).
+
+    sdf: (B, C, H, W)
+    returns: (B, H, W) with values 1..C-1
+    """
+    sdf_fg = sdf[:, 1:]  # ignore channel 0 (background)
+    mask_fg = torch.argmin(sdf_fg, dim=1) + 1
+    return mask_fg
 
 
 def mean_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    Compute mean Dice for foreground classes only (1..num_classes-1)
+    pred, gt: (B,H,W) with labels in {1..num_classes-1}
+    """
     dices = []
     for c in range(1, num_classes):  # exclude background
         p = (pred == c).float()
@@ -38,19 +54,21 @@ def mean_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.T
 
 
 def colorize(mask: np.ndarray, num_classes: int) -> np.ndarray:
-    colors = np.array(
-        [
-            [0, 0, 0],
-            [255, 0, 0],
-            [0, 255, 0],
-            [0, 0, 255],
-            [255, 255, 0],
-        ],
-        dtype=np.uint8,
-    )
-    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    for c in range(num_classes):
-        out[mask == c] = colors[c % len(colors)]
+    """
+    Colorize mask with the rule you want:
+
+    - Only class 1/2/3 are colored (red/green/blue).
+    - Everything else (including 0 / out-of-range / negative) is pure black.
+
+    mask: (H, W) int
+    returns: (H, W, 3) uint8
+    """
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)  # default black everywhere
+
+    out[mask == 1] = [255, 0, 0]  # class 1 -> red
+    out[mask == 2] = [0, 255, 0]  # class 2 -> green
+    out[mask == 3] = [0, 0, 255]  # class 3 -> blue
+
     return out
 
 
@@ -69,8 +87,8 @@ class LitMedFlowSeg(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Flow-matching model (expects x, image, t)
-        self.model = build_model(xt_in_ch=num_classes)
+        # Flow-matching model (expects x_t, image, t)
+        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=2)
 
         self.num_classes = num_classes
         self.lr = lr
@@ -84,31 +102,48 @@ class LitMedFlowSeg(pl.LightningModule):
         self._val_vis_cache = []
 
     # --------------------------------------------------
-    # Flow Matching sampling (Euler)
+    # Flow Matching sampling (Euler integrate dx/dt = v_theta)
     # --------------------------------------------------
     @torch.no_grad()
     def sample(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Start from x(0) ~ N(0, I) and integrate to t=1.
+        """
         B, _, H, W = image.shape
         x = torch.randn(B, self.num_classes, H, W, device=image.device)
 
+        dt = 1.0 / self.sample_steps
         for i in range(self.sample_steps):
-            t = torch.full((B,), i / self.sample_steps, device=image.device)
+            t = torch.full((B,), i * dt, device=image.device)  # in [0,1)
             v = self.model(x, image, t)
-            x = x + v / self.sample_steps
+            x = x + v * dt
 
         return x
 
     # --------------------------------------------------
-    # Training
+    # Training: Conditional Flow Matching (linear bridge)
     # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, sdf = batch
+        image, x1 = batch  # x1 is sdf_gt, shape (B,C,H,W)
 
         B = image.shape[0]
-        t = torch.rand(B, device=image.device)
+        device = image.device
 
-        v_pred = self.model(sdf, image, t)
-        loss = nn.functional.mse_loss(v_pred, sdf)
+        # sample t ~ U(0,1)
+        t = torch.rand(B, device=device)  # (B,)
+        t_ = t[:, None, None, None]       # (B,1,1,1)
+
+        # sample noise endpoint x0 ~ N(0,I)
+        x0 = torch.randn_like(x1)
+
+        # bridge state x_t = (1-t)x0 + t x1
+        x_t = (1.0 - t_) * x0 + t_ * x1
+
+        # target velocity v* = dx_t/dt = x1 - x0
+        v_star = x1 - x0
+
+        v_pred = self.model(x_t, image, t)
+        loss = nn.functional.mse_loss(v_pred, v_star)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
@@ -126,7 +161,7 @@ class LitMedFlowSeg(pl.LightningModule):
         dice = mean_dice(pred_mask, gt_mask, self.num_classes)
 
         self.log(
-            "val/mean_dice",
+            "val_mean_dice",
             dice,
             prog_bar=True,
             on_step=False,
@@ -207,9 +242,9 @@ def main():
     parser.add_argument("--sample_steps", type=int, default=10)
 
     # -------- Optimization --------
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=4)
 
     # -------- Output --------
@@ -218,7 +253,7 @@ def main():
 
     # -------- System --------
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--gpus", type=int, default=4)
 
     args = parser.parse_args()
     pl.seed_everything(args.seed)
@@ -228,10 +263,7 @@ def main():
     ckpt_root.mkdir(parents=True, exist_ok=True)
 
     # -------- Logger --------
-    logger = TensorBoardLogger(
-        save_dir=output_root,
-        name="logs",
-    )
+    logger = TensorBoardLogger(save_dir=output_root, name="logs")
 
     # -------- Dataset --------
     train_loader = DataLoader(
@@ -262,11 +294,12 @@ def main():
     # -------- Checkpoint --------
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_root,
-        filename="epoch{epoch:03d}-dice{val/mean_dice:.4f}",
-        monitor="val/mean_dice",
+        filename="epoch{epoch:03d}-dice{val_mean_dice:.4f}.ckpt",
+        monitor="val_mean_dice",
         mode="max",
         save_top_k=2,
         save_last=True,
+        auto_insert_metric_name=False,
     )
 
     # -------- Trainer --------

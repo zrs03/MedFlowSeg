@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # -------- 修改为你的路径 --------
-img_path = "/Birmingham/MedFlowSeg/dataset/ACDC/Aug/0001/image.npy"
-gt_path  = "/Birmingham/MedFlowSeg/dataset/ACDC/Aug/0001/sdf.npy"
+img_path = "/Birmingham/MedFlowSeg/dataset/ACDC/Aug/train/0001/img.npy"
+gt_path  = "/Birmingham/MedFlowSeg/dataset/ACDC/Aug/train/0001/sdf.npy"
 
 # -------- 输出文件 --------
 out_path = "./viz_patient001_ED_frame01.png"
