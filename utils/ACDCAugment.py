@@ -430,7 +430,7 @@ def main():
     # ---- Geometry (NO ROTATION) ----
     ap.add_argument("--p_hflip", type=float, default=0.5)
     ap.add_argument("--p_vflip", type=float, default=0.5)
-    ap.add_argument("--scale", type=float, default=0.10, help="Scale range (default 0.10 => [0.9,1.1])")
+    ap.add_argument("--scale", type=float, default=0.10, help="Scale range (default 0.10)")
     ap.add_argument("--trans", type=float, default=8.0, help="Translation range in pixels (default 8)")
 
     # padding constants
