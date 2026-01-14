@@ -376,9 +376,9 @@ def process_one_patient(
     gt_sdf = onehot_to_sdf_per_channel(gt_onehot, clip=sdf_clip, normalize=True)  # (4,H,W) float32
 
     _ensure_dirs(out_patient_dir)
-    np.save(out_patient_dir / f"ED_frame{ed_frame_num:02d}_img.npy", img_norm.astype(np.float32))
-    np.save(out_patient_dir / f"ED_frame{ed_frame_num:02d}_gt_onehot.npy", gt_onehot)
-    np.save(out_patient_dir / f"ED_frame{ed_frame_num:02d}_gt_sdf.npy", gt_sdf.astype(np.float32))
+    np.save(out_patient_dir / f"img.npy", img_norm.astype(np.float32))
+    np.save(out_patient_dir / f"onehot.npy", gt_onehot)
+    np.save(out_patient_dir / f"sdf.npy", gt_sdf.astype(np.float32))
 
     return True
 

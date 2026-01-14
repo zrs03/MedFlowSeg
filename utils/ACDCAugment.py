@@ -1,35 +1,48 @@
-# ACDCAugment.py
-# Offline augmentation for extracted ACDC ED samples.
-#
-# Input expects under --in_root:
-#   *_img.npy      : (H,W) float32 (ideally in [0,1] or [-1,1], both OK)
-#   *_gt_sdf.npy   : (C,H,W) float32  (C=4 by default; can be any C)
-#
-# Output under --out_root:
-#   000000/
-#     image.npy
-#     sdf.npy
-#     meta.json
-#   000001/
-#     ...
-#
-# Augmentations:
-#   Geometry (applied to image AND sdf):
-#     - random hflip / vflip
-#     - random translation (pixels)
-#     - random scaling
-#   Intensity (applied to image only):
-#     - brightness shift
-#     - contrast scaling
-#     - gamma
-#     - gaussian noise
-#     - gaussian blur
-#
-# Defaults are "common" in medical imaging segmentation projects.
-#
-# Usage:
-#   python ACDCAugment.py --in_root ./dataset/ACDC/ED --out_root ./dataset/ACDCAug --aug_per_sample 1 --seed 42
-#
+# -*- coding: utf-8 -*-
+"""
+ACDCAugment.py
+Offline augmentation for extracted ACDC ED samples.
+
+UPDATED (per your request):
+- Input pairs are found by searching for:
+    img.npy
+    sdf.npy
+  under --in_root recursively.
+- No longer depends on filename prefixes like *_img.npy or *_gt_sdf.npy.
+
+Expected input under --in_root (any nested structure is OK):
+  .../img.npy      : (H,W) float32 (ideally in [0,1] or [-1,1], both OK)
+  .../sdf.npy      : (C,H,W) float32 (C=4 by default; can be any C)
+
+Output under --out_root:
+  000000/
+    image.npy
+    sdf.npy
+    meta.json
+  000001/
+    ...
+
+Augmentations:
+  Geometry (applied to image AND sdf):
+    - random hflip / vflip
+    - random translation (pixels)
+    - random scaling
+  Intensity (applied to image only):
+    - brightness shift
+    - contrast scaling
+    - gamma
+    - gaussian noise
+    - gaussian blur
+
+Usage:
+  python ACDCAugment.py --in_root ./dataset/ACDC/SDF/train --out_root ./dataset/ACDC/Aug/train --aug_per_sample 2 --seed 42
+
+NOTE:
+- If your SDF was normalized to [-1,1] in preprocessing, you should set:
+    --sdf_cval 1.0
+  instead of the default 10.0, to keep padding scale consistent.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -52,21 +65,19 @@ def _ensure_dir(p: Path):
 def _find_samples(in_root: Path) -> List[Tuple[Path, Path]]:
     """
     Find pairs (img.npy, sdf.npy) under in_root recursively.
-    Expect:
-      .../*_img.npy
-      .../*_gt_sdf.npy  (preferred) OR .../*_sdf.npy
+
+    Expect in ANY subdirectory:
+      img.npy
+      sdf.npy
     """
-    img_files = sorted(in_root.rglob("*_img.npy"))
+    in_root = Path(in_root)
     pairs: List[Tuple[Path, Path]] = []
-    for img_p in img_files:
-        sdf_p = Path(str(img_p).replace("_img.npy", "_gt_sdf.npy"))
-        if not sdf_p.exists():
-            sdf_p2 = Path(str(img_p).replace("_img.npy", "_sdf.npy"))
-            if sdf_p2.exists():
-                sdf_p = sdf_p2
-            else:
-                continue
-        pairs.append((img_p, sdf_p))
+
+    for img_p in sorted(in_root.rglob("img.npy")):
+        sdf_p = img_p.parent / "sdf.npy"
+        if sdf_p.exists():
+            pairs.append((img_p, sdf_p))
+
     return pairs
 
 
@@ -115,7 +126,7 @@ def _build_affine_2d(
     affine_transform maps output coords -> input coords using matrix A and offset b:
         input_coord = A @ output_coord + offset
 
-    We apply scale + translation around image center (no rotation).
+    Apply scale + translation around image center (no rotation).
 
     Returns (A_yx, offset_yx).
     """
@@ -133,7 +144,6 @@ def _build_affine_2d(
                      [A_xy[0, 1], A_xy[0, 0]]], dtype=np.float32)
 
     # offset in (x,y):
-    # [x,y] = A_xy @ ([x',y'] - [cx+tx, cy+ty]) + [cx,cy]
     offset_xy = -A_xy @ np.array([cx + tx, cy + ty], dtype=np.float32) + np.array([cx, cy], dtype=np.float32)
 
     # to (y,x)
@@ -149,9 +159,7 @@ def _apply_affine_to_image(
     mode: str = "constant",
     cval: float = 0.0,
 ) -> np.ndarray:
-    """
-    img: (H,W)
-    """
+    """img: (H,W)"""
     return affine_transform(
         img,
         matrix=A_yx,
@@ -172,9 +180,7 @@ def _apply_affine_to_sdf(
     mode: str = "constant",
     cval: float = 0.0,
 ) -> np.ndarray:
-    """
-    sdf: (C,H,W)
-    """
+    """sdf: (C,H,W)"""
     C, H, W = sdf.shape
     out = np.empty_like(sdf, dtype=np.float32)
     for c in range(C):
@@ -337,7 +343,7 @@ def augment_dataset(
 
     pairs = _find_samples(in_root)
     if not pairs:
-        raise RuntimeError(f"No paired *_img.npy + *_gt_sdf.npy found under {in_root}.")
+        raise RuntimeError(f"No paired img.npy + sdf.npy found under {in_root}.")
 
     rng = np.random.default_rng(seed)
     out_idx = start_index
@@ -345,13 +351,14 @@ def augment_dataset(
     def _write_one(img_arr: np.ndarray, sdf_arr: np.ndarray, meta: Dict[str, Any]):
         nonlocal out_idx
         sample_dir = out_root / str(out_idx).zfill(id_width)
+
         if sample_dir.exists() and not overwrite:
             while (out_root / str(out_idx).zfill(id_width)).exists():
                 out_idx += 1
             sample_dir = out_root / str(out_idx).zfill(id_width)
 
         _ensure_dir(sample_dir)
-        np.save(sample_dir / "image.npy", img_arr.astype(np.float32, copy=False))
+        np.save(sample_dir / "img.npy", img_arr.astype(np.float32, copy=False))
         np.save(sample_dir / "sdf.npy", sdf_arr.astype(np.float32, copy=False))
         with open(sample_dir / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -397,7 +404,6 @@ def augment_dataset(
 # -------------------------
 
 def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    # args 全部是真实值（无 None）
     return {
         "p_hflip": float(args.p_hflip),
         "p_vflip": float(args.p_vflip),
@@ -418,8 +424,8 @@ def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_root", type=str, default="./dataset/ACDC/SDF/train", help="Input root with *_img.npy and *_gt_sdf.npy")
-    ap.add_argument("--out_root", type=str, default="./dataset/ACDC/Aug", help="Output root; numeric folders 000000/")
+    ap.add_argument("--in_root", type=str, default="./dataset/ACDC/SDF/train", help="Input root containing img.npy & sdf.npy")
+    ap.add_argument("--out_root", type=str, default="./dataset/ACDC/Aug/train", help="Output root; numeric folders 000000/")
     ap.add_argument("--aug_per_sample", type=int, default=2, help="Number of augmented variants per base sample")
     ap.add_argument("--no_original", action="store_true", help="Do not save the original sample")
     ap.add_argument("--seed", type=int, default=42)
@@ -435,7 +441,9 @@ def main():
 
     # padding constants
     ap.add_argument("--img_cval", type=float, default=0.0)
-    ap.add_argument("--sdf_cval", type=float, default=10.0)
+
+    # IMPORTANT: if your SDF is normalized to [-1,1], set sdf_cval=1.0
+    ap.add_argument("--sdf_cval", type=float, default=1.0)
 
     # ---- Intensity ----
     ap.add_argument("--brightness", type=float, default=0.08)
@@ -445,7 +453,7 @@ def main():
     ap.add_argument("--p_blur", type=float, default=0.2)
     ap.add_argument("--blur_sigma_max", type=float, default=0.8)
 
-    # clamp (按你的 [-1,1] 图像更合理；如果你还是 [0,1] 就改成 0/1)
+    # clamp
     ap.add_argument("--clamp_min", type=float, default=-1.0)
     ap.add_argument("--clamp_max", type=float, default=1.0)
 
