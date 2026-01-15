@@ -323,7 +323,7 @@ def main():
     # -------- Checkpoint --------
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_root,
-        filename="epoch{epoch:03d}-dice{val_mean_dice:.4f}.ckpt",
+        filename="epoch{epoch:03d}-dice{val_mean_dice:.4f}",
         monitor="val_mean_dice",
         mode="max",
         save_top_k=2,

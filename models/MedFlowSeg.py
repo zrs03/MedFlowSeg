@@ -3,27 +3,23 @@
 Flow-Matching Segmentation Network (ResUNet backbone) with:
 - Fore/Back separation (x_t: ch0=background, ch1..=foreground)
 - Fore/Back conditional encoders (independent)
-- Frequency-domain Cross Attention on deepest K levels (configurable)
-- Fore/Back decoders (independent)  <-- fixed as requested
-- Final velocity head predicts v_theta(x_t, image, t) with channels == xt_in_ch
+- Frequency-domain Cross Attention on deepest K encoder skip levels (optional)
+- ✅ NEW (3): Bottleneck coupling (Fore<->Back) with FreqCrossAttention at the deepest latent
+- ✅ NEW (4): Decoder Attention-Gated Skip connections
+- ✅ NEW (4): Optional Deep Supervision / Multi-Scale heads (kept backward-compatible by default)
 
-Key changes vs previous:
-- NO shared decoder.
-- Two decoders:
-    decoder_fore uses fore skips
-    decoder_back uses back skips
-- Deepest K encoder levels apply FreqCrossAttention (symmetric update) on the skip features.
-- Each stream decodes its own feature pyramid.
-- Output is formed by concatenating decoded features and mapping to xt_in_ch.
+Default behavior (backward-compatible):
+- forward(...) returns only v of shape (B, xt_in_ch, H, W)
 
-Only network code (PyTorch).
+If cfg.deep_supervision=True and forward(..., return_aux=True):
+- returns (v, aux) where aux is a list of upsampled multi-scale predictions (all at HxW)
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
@@ -48,7 +44,9 @@ class SinusoidalTimeEmbedding(nn.Module):
         half = self.dim // 2
         device = t.device
         freq = torch.exp(
-            -math.log(10000.0) * torch.arange(0, half, device=device).float() / max(half - 1, 1)
+            -math.log(10000.0)
+            * torch.arange(0, half, device=device).float()
+            / max(half - 1, 1)
         )
         args = t[:, None] * freq[None, :]
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
@@ -185,11 +183,14 @@ class SpatialCrossAttention(nn.Module):
 class FreqCrossAttention(nn.Module):
     """Symmetric frequency-domain cross-attention between two (B,C,H,W) real features."""
 
-    def __init__(self, ch: int, heads: int = 4, head_dim: int = 32):
+    def __init__(self, ch: int, heads: int = 4, head_dim: int = 32, gate_init: float = 0.0):
         super().__init__()
         self.ch = ch
         self.attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.gate = nn.Parameter(torch.tensor(1.0))
+        # ✅ stability: gate starts near 0 so early training doesn't blow up
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        # lightweight norm on delta for stability
+        self.delta_norm = GroupNorm32(2 * ch)
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -207,6 +208,7 @@ class FreqCrossAttention(nn.Module):
         Xri = self._to_ri(X)
         Cri = self._to_ri(C)
         delta = self.attn(Xri, Cri)
+        delta = self.delta_norm(delta)
         Xri = Xri + self.gate * delta
         X2 = self._to_complex(Xri)
         return torch.fft.ifft2(X2, dim=(-2, -1)).real
@@ -215,6 +217,41 @@ class FreqCrossAttention(nn.Module):
         fore2 = self._update(fore, back)
         back2 = self._update(back, fore)
         return fore2, back2
+
+
+# -----------------------------
+# ✅ Decoder attention-gated skip
+# -----------------------------
+class AttentionGate(nn.Module):
+    """
+    Classic attention-gated skip for UNet:
+    gate = sigmoid( conv( relu( Wg * x + Ws * skip ) ) )
+    skip_out = skip * gate
+    """
+
+    def __init__(self, x_ch: int, skip_ch: int, inter_ch: Optional[int] = None):
+        super().__init__()
+        if inter_ch is None:
+            inter_ch = max(8, min(x_ch, skip_ch) // 2)
+
+        self.Wg = nn.Sequential(
+            nn.Conv2d(x_ch, inter_ch, kernel_size=1, bias=False),
+            GroupNorm32(inter_ch),
+        )
+        self.Ws = nn.Sequential(
+            nn.Conv2d(skip_ch, inter_ch, kernel_size=1, bias=False),
+            GroupNorm32(inter_ch),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        # x and skip are at same spatial resolution
+        a = F.silu(self.Wg(x) + self.Ws(skip))
+        gate = self.psi(a)  # (B,1,H,W)
+        return skip * gate
 
 
 # -----------------------------
@@ -241,9 +278,22 @@ class EncoderStage(nn.Module):
 
 
 class DecoderStage(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, time_ch: int, num_blocks: int, up: bool, dropout: float):
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+        time_ch: int,
+        num_blocks: int,
+        up: bool,
+        dropout: float,
+        use_attn_gate: bool = True,
+    ):
         super().__init__()
         self.up = Upsample(in_ch) if up else None
+        self.use_attn_gate = use_attn_gate
+        self.gate = AttentionGate(x_ch=in_ch, skip_ch=skip_ch) if use_attn_gate else None
+
         blocks: List[nn.Module] = []
         ch = in_ch + skip_ch
         for _ in range(num_blocks):
@@ -254,6 +304,11 @@ class DecoderStage(nn.Module):
     def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         if self.up is not None:
             x = self.up(x)
+
+        # ✅ attention-gated skip
+        if self.use_attn_gate and self.gate is not None:
+            skip = self.gate(x, skip)
+
         x = torch.cat([x, skip], dim=1)
         for blk in self.blocks:
             x = blk(x, t_emb)
@@ -276,15 +331,27 @@ class Config:
     attn_heads: int = 4
     attn_head_dim: int = 32
 
-    # how many deepest encoder levels to apply FreqCrossAttention
+    # deepest K encoder levels to apply FreqCrossAttention on skips
     freq_attn_depth: int = 1
+
+    # ✅ NEW (3): also couple at bottleneck
+    use_bottleneck_coupling: bool = True
+    bottleneck_gate_init: float = 0.0  # start stable
+
+    # ✅ NEW (4): attention-gated skips
+    use_attn_gated_skip: bool = True
+
+    # ✅ NEW (4): deep supervision multi-scale heads
+    deep_supervision: bool = False
 
 
 class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
     """
     - Two streams (fore/back): independent encoders + independent decoders
-    - Deepest K encoder levels apply symmetric frequency-domain cross-attention
-    - Output head maps concat([decoded_fore, decoded_back]) -> velocity (xt_in_ch channels)
+    - Deepest K encoder levels apply symmetric frequency-domain cross-attention on skips
+    - ✅ Bottleneck coupling: symmetric FreqCrossAttention at deepest latent
+    - ✅ Decoder: attention-gated skip connections
+    - ✅ Optional deep supervision multi-scale heads
     """
 
     def __init__(self, cfg: Config):
@@ -318,15 +385,23 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
             self.back_enc.append(EncoderStage(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
             self.fore_enc.append(EncoderStage(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
 
-        # deepest K levels for attention
+        # deepest K levels for skip attention
         K = min(cfg.freq_attn_depth, n_levels)
-        self.attn_level_set = set(range(n_levels - K, n_levels))  # e.g. K=2 -> {n-2, n-1}
-
+        self.attn_level_set = set(range(n_levels - K, n_levels))
         self.freq_attn_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
-            self.freq_attn_modules[str(i)] = FreqCrossAttention(self.chs[i], cfg.attn_heads, cfg.attn_head_dim)
+            self.freq_attn_modules[str(i)] = FreqCrossAttention(
+                self.chs[i], cfg.attn_heads, cfg.attn_head_dim, gate_init=cfg.bottleneck_gate_init
+            )
 
-        # decoders (independent), standard UNet (in_ch comes from deep feature)
+        # ✅ NEW (3): bottleneck coupling module
+        self.bottleneck_coupler = (
+            FreqCrossAttention(self.chs[-1], cfg.attn_heads, cfg.attn_head_dim, gate_init=cfg.bottleneck_gate_init)
+            if cfg.use_bottleneck_coupling
+            else None
+        )
+
+        # decoders (independent)
         self.back_dec = nn.ModuleList()
         self.fore_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
@@ -334,14 +409,55 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
             in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
-            self.back_dec.append(DecoderStage(in_ch, skip_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, up, cfg.dropout))
-            self.fore_dec.append(DecoderStage(in_ch, skip_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, up, cfg.dropout))
+
+            self.back_dec.append(
+                DecoderStage(
+                    in_ch,
+                    skip_ch,
+                    out_ch,
+                    cfg.time_dim,
+                    cfg.num_res_blocks,
+                    up,
+                    cfg.dropout,
+                    use_attn_gate=cfg.use_attn_gated_skip,
+                )
+            )
+            self.fore_dec.append(
+                DecoderStage(
+                    in_ch,
+                    skip_ch,
+                    out_ch,
+                    cfg.time_dim,
+                    cfg.num_res_blocks,
+                    up,
+                    cfg.dropout,
+                    use_attn_gate=cfg.use_attn_gated_skip,
+                )
+            )
 
         # output head: concat decoded fore/back at base resolution
         self.out_norm = GroupNorm32(cfg.base_ch * 2)
         self.out_conv = nn.Conv2d(cfg.base_ch * 2, cfg.xt_in_ch, 3, padding=1)
 
-    def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
+        # ✅ NEW (4): multi-scale heads (one per decoder stage output)
+        # We upsample each to full-res if deep supervision enabled.
+        self.deep_supervision = cfg.deep_supervision
+        if self.deep_supervision:
+            self.ms_norms = nn.ModuleList()
+            self.ms_convs = nn.ModuleList()
+            # decoder outputs are at chs[i] for i=0..n-1, but we decode in reverse order.
+            # At each stage output, we have fore_h/back_h with same channels (out_ch).
+            for out_ch in [self.chs[i] for i in reversed(range(n_levels))]:
+                self.ms_norms.append(GroupNorm32(out_ch * 2))
+                self.ms_convs.append(nn.Conv2d(out_ch * 2, cfg.xt_in_ch, 3, padding=1))
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        image: torch.Tensor,
+        t: Union[torch.Tensor, float],
+        return_aux: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if isinstance(t, float):
             t = torch.tensor(t, device=x_t.device)
         if isinstance(t, torch.Tensor) and t.dim() == 0:
@@ -371,31 +487,60 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
             back, b_skip = enc_b(back, t_emb)
             fore, f_skip = enc_f(fore, t_emb)
 
+            # skip-level coupling on deepest K skips
             if level in self.attn_level_set:
                 attn = self.freq_attn_modules[str(level)]
-                f_skip, b_skip = attn(f_skip, b_skip)  # symmetric update at this level
+                f_skip, b_skip = attn(f_skip, b_skip)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
 
-        # start decoding from deepest skips (already updated if selected)
-        back_h = back_skips[-1]
-        fore_h = fore_skips[-1]
+        # ✅ NEW (3): bottleneck coupling at deepest latent
+        # (the last encoder stage has down=False, so back/fore here are at deepest resolution)
+        if self.bottleneck_coupler is not None:
+            fore, back = self.bottleneck_coupler(fore, back)
 
-        # decode (independent)
-        for dec_b, dec_f, b_skip, f_skip in zip(self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips)):
+        # start decoding from (coupled) bottleneck latents
+        back_h = fore_skips[-1].new_empty(0)  # just to satisfy type check (won't be used)
+        fore_h = fore_skips[-1].new_empty(0)
+
+        # Use the coupled bottleneck as initial hidden state
+        back_h = back
+        fore_h = fore
+
+        aux_preds: List[torch.Tensor] = []
+
+        # decode (independent) with gated skips
+        # note: decoder lists are already in deep->shallow order
+        for stage_idx, (dec_b, dec_f, b_skip, f_skip) in enumerate(
+            zip(self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips))
+        ):
             back_h = dec_b(back_h, b_skip, t_emb)
             fore_h = dec_f(fore_h, f_skip, t_emb)
 
-        # output velocity from concatenated decoded features
+            # ✅ NEW (4): multi-scale head at each decoder stage output
+            if self.deep_supervision and return_aux:
+                h_ms = torch.cat([fore_h, back_h], dim=1)
+                h_ms = F.silu(self.ms_norms[stage_idx](h_ms))
+                v_ms = self.ms_convs[stage_idx](h_ms)
+                # upsample to full resolution (same as final output)
+                # current spatial size is fore_h.size(-2/-1); final is same as image
+                if v_ms.shape[-2:] != image.shape[-2:]:
+                    v_ms = F.interpolate(v_ms, size=image.shape[-2:], mode="bilinear", align_corners=False)
+                aux_preds.append(v_ms)
+
+        # final head: concat decoded fore/back at base resolution
         h = torch.cat([fore_h, back_h], dim=1)  # (B, 2*base_ch, H, W)
         h = F.silu(self.out_norm(h))
         v = self.out_conv(h)
+
+        if self.deep_supervision and return_aux:
+            return v, aux_preds
         return v
 
 
 # -----------------------------
-# Factory + sanity
+# Factory
 # -----------------------------
 def build_model(
     img_in_ch: int = 1,
@@ -408,6 +553,11 @@ def build_model(
     attn_heads: int = 4,
     attn_head_dim: int = 32,
     freq_attn_depth: int = 1,
+    # ✅ expose new knobs
+    use_bottleneck_coupling: bool = True,
+    bottleneck_gate_init: float = 0.0,
+    use_attn_gated_skip: bool = True,
+    deep_supervision: bool = False,
 ) -> FMForeBackDeepKFreqXAttnDualDecoderResUNet:
     cfg = Config(
         img_in_ch=img_in_ch,
@@ -420,14 +570,31 @@ def build_model(
         attn_heads=attn_heads,
         attn_head_dim=attn_head_dim,
         freq_attn_depth=freq_attn_depth,
+        use_bottleneck_coupling=use_bottleneck_coupling,
+        bottleneck_gate_init=bottleneck_gate_init,
+        use_attn_gated_skip=use_attn_gated_skip,
+        deep_supervision=deep_supervision,
     )
     return FMForeBackDeepKFreqXAttnDualDecoderResUNet(cfg)
 
 
+# -----------------------------
+# Sanity
+# -----------------------------
 if __name__ == "__main__":
-    net = build_model(img_in_ch=1, xt_in_ch=4, base_ch=32, freq_attn_depth=2)
+    net = build_model(
+        img_in_ch=1,
+        xt_in_ch=4,
+        base_ch=32,
+        freq_attn_depth=2,
+        use_bottleneck_coupling=True,
+        use_attn_gated_skip=True,
+        deep_supervision=True,
+    )
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)
     t = torch.rand(2)
-    v = net(x_t, img, t)
+
+    v, aux = net(x_t, img, t, return_aux=True)
     print("v:", v.shape)
+    print("aux:", len(aux), aux[0].shape if len(aux) else None)
