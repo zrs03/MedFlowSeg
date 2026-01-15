@@ -275,7 +275,7 @@ def main():
     parser.add_argument("--vis_every", type=int, default=5)
 
     # ✅ new: threshold for pred decoding (since your sdf is normalized to [-1,1])
-    parser.add_argument("--thresh", type=float, default=0.2)
+    parser.add_argument("--thresh", type=float, default=1e-2)
     parser.add_argument("--fg_factor", type=float, default=3.0)
 
     # -------- System --------
