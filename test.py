@@ -2,6 +2,11 @@
 # test_medflowseg.py
 # Flow-Matching Medical Segmentation - Test / Inference
 # Threshold + Argmax decoding (SegDiff-style)
+#
+# ✅ EMA inference:
+# - If ckpt contains "ema_shadow" (saved by train script), load EMA weights by default.
+# - Fallback to normal "state_dict" weights if ema not found.
+# - You can force disable EMA with --no_ema
 # ======================================================
 
 import argparse
@@ -25,20 +30,20 @@ from utils.dataset import FolderDataset
 def sdf_to_mask_thresh_argmax_pred(sdf: torch.Tensor, thresh: float, fg_factor: float = 3.0) -> torch.Tensor:
     """
     Pred decoding: threshold + argmax (SegDiff-style).
-    sdf: (B,C,H,W), C=4
+    sdf: (B,C,H,W)
     """
-    sdf_fg = sdf[:, 1:]  # (B,3,H,W)
+    sdf_fg = sdf[:, 1:]
     fg_bin = (sdf_fg <= (fg_factor * thresh)).to(torch.int8)
-    bg = torch.zeros_like(fg_bin[:, :1])  # (B,1,H,W)
-    m = torch.cat([bg, fg_bin], dim=1)    # (B,4,H,W)
-    return torch.argmax(m, dim=1)         # (B,H,W) in {0..3}
+    bg = torch.zeros_like(fg_bin[:, :1])
+    m = torch.cat([bg, fg_bin], dim=1)
+    return torch.argmax(m, dim=1)
 
 
 @torch.no_grad()
 def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
     """
     GT decoding: signed distance => inside<=0.
-    sdf_gt: (B,C,H,W), C=4
+    sdf_gt: (B,C,H,W)
     """
     sdf_fg = sdf_gt[:, 1:]
     fg_bin = (sdf_fg <= 0.0).to(torch.int8)
@@ -51,7 +56,7 @@ def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
 def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int = 4) -> torch.Tensor:
     """
     Mean Dice over foreground classes only (1..num_classes-1).
-    pred, gt: (B,H,W) labels in {0..num_classes-1}
+    pred, gt: (B,H,W)
     """
     dices = []
     for c in range(1, num_classes):
@@ -68,9 +73,9 @@ def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
     Only color class 1/2/3; everything else (including background 0) is pure black.
     """
     out = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    out[mask == 1] = [255, 0, 0]   # red
-    out[mask == 2] = [0, 255, 0]   # green
-    out[mask == 3] = [0, 0, 255]   # blue
+    out[mask == 1] = [255, 0, 0]
+    out[mask == 2] = [0, 255, 0]
+    out[mask == 3] = [0, 0, 255]
     return out
 
 
@@ -100,16 +105,10 @@ class MedFlowSegTester(nn.Module):
         return x
 
 
-def load_lightning_ckpt_into_model(model: MedFlowSegTester, ckpt_path: str) -> None:
+def _strip_prefixes(state: dict) -> dict:
     """
-    Load Lightning .ckpt weights into our plain nn.Module wrapper.
-    Assumes LightningModule saved weights under "state_dict".
-    Keys usually look like: "model.xxx" because LightningModule had self.model = build_model(...)
+    Strip common Lightning prefixes to match model.net keys.
     """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt.get("state_dict", ckpt)
-
-    # Strip "model." prefix if present (because LightningModule used self.model)
     new_state = {}
     for k, v in state.items():
         if k.startswith("model."):
@@ -117,10 +116,35 @@ def load_lightning_ckpt_into_model(model: MedFlowSegTester, ckpt_path: str) -> N
         elif k.startswith("net."):
             new_state[k[len("net."):]] = v
         else:
-            # ignore other lightning keys like "time_mlp" if any; but in your case most are under model.*
             new_state[k] = v
+    return new_state
 
-    missing, unexpected = model.net.load_state_dict(new_state, strict=False)
+
+def load_lightning_ckpt_into_model(model: MedFlowSegTester, ckpt_path: str, use_ema: bool = True) -> None:
+    """
+    Load Lightning .ckpt weights into our plain nn.Module wrapper.
+
+    ✅ If use_ema=True and ckpt contains "ema_shadow", load EMA weights.
+    ✅ Else fallback to ckpt["state_dict"].
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    # 1) Try EMA
+    if use_ema and isinstance(ckpt.get("ema_shadow", None), dict):
+        ema_state = ckpt["ema_shadow"]
+        state = _strip_prefixes(ema_state)
+        missing, unexpected = model.net.load_state_dict(state, strict=False)
+        print("[INFO] Loaded EMA weights from ckpt (ema_shadow).")
+    else:
+        # 2) Fallback to normal weights
+        state_raw = ckpt.get("state_dict", ckpt)
+        state = _strip_prefixes(state_raw)
+        missing, unexpected = model.net.load_state_dict(state, strict=False)
+        if use_ema:
+            print("[WARN] EMA requested but ckpt has no ema_shadow. Loaded normal weights instead.")
+        else:
+            print("[INFO] Loaded normal (non-EMA) weights from ckpt.")
+
     if len(missing) > 0:
         print("[WARN] Missing keys:", missing[:10], "..." if len(missing) > 10 else "")
     if len(unexpected) > 0:
@@ -142,6 +166,7 @@ def run_test(
     thresh: float,
     fg_factor: float,
     max_vis: int,
+    use_ema: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
@@ -161,7 +186,7 @@ def run_test(
 
     # model
     model = MedFlowSegTester(num_classes=num_classes, sample_steps=sample_steps).to(device)
-    load_lightning_ckpt_into_model(model, ckpt)
+    load_lightning_ckpt_into_model(model, ckpt_path=ckpt, use_ema=use_ema)
     model.eval()
 
     dices = []
@@ -182,9 +207,9 @@ def run_test(
 
         # vis
         if vis_count < max_vis:
-            img_np = image.detach().cpu().numpy()[:, 0]   # (B,H,W)
-            pred_np = pred_mask.detach().cpu().numpy()    # (B,H,W)
-            gt_np = gt_mask.detach().cpu().numpy()        # (B,H,W)
+            img_np = image.detach().cpu().numpy()[:, 0]
+            pred_np = pred_mask.detach().cpu().numpy()
+            gt_np = gt_mask.detach().cpu().numpy()
 
             for i in range(min(image.shape[0], max_vis - vis_count)):
                 fig, axs = plt.subplots(1, 3, figsize=(12, 4))
@@ -211,7 +236,7 @@ def run_test(
             print(f"[{bidx+1}/{len(loader)}] mean dice so far: {np.mean(dices):.4f}")
 
     print("\n===== TEST DONE =====")
-    print(f"Samples: {len(dices)} batches")
+    print(f"Batches: {len(dices)}")
     print(f"Mean Dice (foreground 1..{num_classes-1}): {np.mean(dices):.4f}  ±  {np.std(dices):.4f}")
     print(f"Saved vis to: {out_dir / 'vis'}")
 
@@ -220,7 +245,8 @@ def main():
     parser = argparse.ArgumentParser("MedFlowSeg Test (Threshold+Argmax)")
 
     parser.add_argument("--ckpt", type=str, required=True, help="path to lightning .ckpt")
-    parser.add_argument("--data_root", type=str, default='./dataset/ACDC/SDF/test', help="e.g. ./dataset/ACDC/SDF/test or val")
+    parser.add_argument("--data_root", type=str, default="./dataset/ACDC/SDF/test",
+                        help="e.g. ./dataset/ACDC/SDF/test or val")
     parser.add_argument("--out_dir", type=str, default="./Outputs/MedFlowSeg_test")
 
     parser.add_argument("--num_classes", type=int, default=4)
@@ -233,6 +259,9 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
 
     parser.add_argument("--max_vis", type=int, default=16, help="save at most N visualizations")
+
+    # ✅ EMA: default ON, use --no_ema to disable
+    parser.add_argument("--no_ema", action="store_true", help="disable EMA inference (default: EMA on)")
 
     args = parser.parse_args()
     pl.seed_everything(42)
@@ -248,6 +277,7 @@ def main():
         thresh=args.thresh,
         fg_factor=args.fg_factor,
         max_vis=args.max_vis,
+        use_ema=(not args.no_ema),  # ✅ default ON
     )
 
 

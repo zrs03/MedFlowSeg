@@ -14,6 +14,13 @@ Flow-Matching Segmentation Network (ResUNet backbone) with:
   (B) frequency-domain (post-FFT) features via FFT band-selective cross-attn (low/high)
   plus cross-gating fusion and stable residual scalars (init ~0).
 
+✅ NEW (BG Suppression):
+- BG branch predicts a suppression map at each decoder level from BG skip features.
+- The suppression map gates (suppresses) FG skip features BEFORE FG decoder consumes them:
+    f_skip <- f_skip * (1 - S)
+- Optional: suppression strength scalar (init 0) for training stability.
+- Optional: detach BG features for suppression head (decouple gradients).
+
 Default behavior (backward-compatible):
 - forward(...) returns only v of shape (B, xt_in_ch, H, W)
 
@@ -193,7 +200,7 @@ class FreqCrossAttention(nn.Module):
         super().__init__()
         self.ch = ch
         self.attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        # ✅ stability: gate starts near 0 so early training doesn't blow up
+        # stability: gate starts near 0 so early training doesn't blow up
         self.gate = nn.Parameter(torch.tensor(float(gate_init)))
         # lightweight norm on delta for stability
         self.delta_norm = GroupNorm32(2 * ch)
@@ -226,7 +233,7 @@ class FreqCrossAttention(nn.Module):
 
 
 # -----------------------------
-# ✅ NEW: FAModule (Spatial + Frequency, band-selective, cross-gated fusion)
+# ✅ FAModule (Spatial + Frequency, band-selective, cross-gated fusion)
 # -----------------------------
 class FAModule(nn.Module):
     """
@@ -495,21 +502,25 @@ class Config:
     # deepest K encoder levels to apply coupling on skips
     freq_attn_depth: int = 1
 
-    # ✅ NEW: choose coupling block
-    # - if use_fa_module=True: use FAModule
-    # - else: use original FreqCrossAttention
+    # choose coupling block
     use_fa_module: bool = True
     fa_low_ratio: float = 0.25
 
-    # ✅ NEW (3): also couple at bottleneck
+    # bottleneck coupling
     use_bottleneck_coupling: bool = True
     bottleneck_gate_init: float = 0.0  # start stable
 
-    # ✅ NEW (4): attention-gated skips
+    # attention-gated skips (within each decoder)
     use_attn_gated_skip: bool = True
 
-    # ✅ NEW (4): deep supervision multi-scale heads
+    # deep supervision multi-scale heads
     deep_supervision: bool = False
+
+    # ✅ NEW: BG-guided suppression of FG skips
+    use_bg_suppression: bool = True
+    suppression_channels: int = 1       # 1: spatial map; or =skip_ch for channel-wise suppression
+    suppression_detach: bool = False    # detach BG skip for suppression head (decouple gradients)
+    suppression_gate_init: float = 0.0  # stable scalar for suppression strength (init ~0)
 
 
 class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
@@ -517,9 +528,10 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
     - Two streams (fore/back): independent encoders + independent decoders
     - Deepest K encoder levels apply symmetric coupling on skips
       (either FreqCrossAttention or FAModule, per cfg.use_fa_module)
-    - ✅ Bottleneck coupling: symmetric block at deepest latent
-    - ✅ Decoder: attention-gated skip connections
-    - ✅ Optional deep supervision multi-scale heads
+    - Bottleneck coupling: symmetric block at deepest latent
+    - Decoder: attention-gated skip connections
+    - ✅ BG-guided suppression: BG predicts suppression map to gate FG skips
+    - Optional deep supervision multi-scale heads
     """
 
     def __init__(self, cfg: Config):
@@ -577,7 +589,7 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
         for i in sorted(self.attn_level_set):
             self.couple_modules[str(i)] = make_coupler(self.chs[i])
 
-        # ✅ NEW (3): bottleneck coupling module
+        # bottleneck coupling module
         self.bottleneck_coupler = make_coupler(self.chs[-1]) if cfg.use_bottleneck_coupling else None
 
         # decoders (independent)
@@ -614,11 +626,27 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
                 )
             )
 
+        # ✅ BG-guided suppression heads (one per decoder stage)
+        self.use_bg_suppression = bool(getattr(cfg, "use_bg_suppression", False))
+        if self.use_bg_suppression:
+            self.supp_heads = nn.ModuleList()
+            supp_out_ch = int(getattr(cfg, "suppression_channels", 1))
+            for skip_ch in [self.chs[i] for i in reversed(range(n_levels))]:
+                self.supp_heads.append(
+                    nn.Sequential(
+                        GroupNorm32(skip_ch),
+                        nn.SiLU(),
+                        nn.Conv2d(skip_ch, supp_out_ch, kernel_size=1, bias=True),
+                    )
+                )
+            # stable scalar to control suppression strength (init ~0)
+            self.supp_lambda = nn.Parameter(torch.tensor(float(getattr(cfg, "suppression_gate_init", 0.0))))
+
         # output head: concat decoded fore/back at base resolution
         self.out_norm = GroupNorm32(cfg.base_ch * 2)
         self.out_conv = nn.Conv2d(cfg.base_ch * 2, cfg.xt_in_ch, 3, padding=1)
 
-        # ✅ NEW (4): multi-scale heads (one per decoder stage output)
+        # multi-scale heads (one per decoder stage output)
         self.deep_supervision = cfg.deep_supervision
         if self.deep_supervision:
             self.ms_norms = nn.ModuleList()
@@ -671,7 +699,7 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
 
-        # ✅ bottleneck coupling at deepest latent
+        # bottleneck coupling at deepest latent
         if self.bottleneck_coupler is not None:
             fore, back = self.bottleneck_coupler(fore, back)
 
@@ -681,10 +709,27 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
 
         aux_preds: List[torch.Tensor] = []
 
-        # decode (independent) with gated skips
+        # decode (independent) with BG-guided suppression + gated skips
         for stage_idx, (dec_b, dec_f, b_skip, f_skip) in enumerate(
             zip(self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips))
         ):
+            # ✅ BG-guided suppression: use BG skip to gate FG skip
+            if self.use_bg_suppression:
+                b_for_supp = b_skip.detach() if bool(getattr(self.cfg, "suppression_detach", False)) else b_skip
+                S = torch.sigmoid(self.supp_heads[stage_idx](b_for_supp))  # (B,1,H,W) or (B,C,H,W)
+
+                # stable strength in [0,1] via sigmoid
+                lam = torch.sigmoid(self.supp_lambda)
+
+                # apply suppression: keep = 1 - lam*S
+                keep = 1.0 - lam * S
+                if keep.shape[1] == 1 and f_skip.shape[1] != 1:
+                    f_skip = f_skip * keep  # broadcast over channels
+                else:
+                    # channel-wise suppression or matching channels
+                    f_skip = f_skip * keep
+
+            # normal decoding
             back_h = dec_b(back_h, b_skip, t_emb)
             fore_h = dec_f(fore_h, f_skip, t_emb)
 
@@ -726,9 +771,14 @@ def build_model(
     bottleneck_gate_init: float = 0.0,
     use_attn_gated_skip: bool = True,
     deep_supervision: bool = False,
-    # ✅ NEW: FA module knobs
+    # FA module knobs
     use_fa_module: bool = True,
     fa_low_ratio: float = 0.25,
+    # ✅ BG suppression knobs
+    use_bg_suppression: bool = True,
+    suppression_channels: int = 1,
+    suppression_detach: bool = False,
+    suppression_gate_init: float = 0.0,
 ) -> FMForeBackDeepKFreqXAttnDualDecoderResUNet:
     cfg = Config(
         img_in_ch=img_in_ch,
@@ -747,6 +797,11 @@ def build_model(
         deep_supervision=deep_supervision,
         use_fa_module=use_fa_module,
         fa_low_ratio=fa_low_ratio,
+        # BG suppression
+        use_bg_suppression=use_bg_suppression,
+        suppression_channels=suppression_channels,
+        suppression_detach=suppression_detach,
+        suppression_gate_init=suppression_gate_init,
     )
     return FMForeBackDeepKFreqXAttnDualDecoderResUNet(cfg)
 
@@ -763,10 +818,15 @@ if __name__ == "__main__":
         use_bottleneck_coupling=True,
         use_attn_gated_skip=True,
         deep_supervision=True,
-        # ✅ use FA module
+        # use FA module
         use_fa_module=True,
         fa_low_ratio=0.25,
         bottleneck_gate_init=0.0,
+        # ✅ enable BG suppression
+        use_bg_suppression=True,
+        suppression_channels=1,      # spatial suppression map
+        suppression_detach=False,    # allow gradients to flow to BG by default
+        suppression_gate_init=0.0,   # stable start
     )
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)

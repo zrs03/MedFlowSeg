@@ -2,6 +2,10 @@
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
 # Threshold + Argmax decoding (SegDiff-style)
+# + EMA (Exponential Moving Average)
+#
+# ✅ Fix: EMA default ON with "--no_ema" to disable
+# ✅ Save EMA shadow into Lightning checkpoint so test/inference can load EMA weights
 # ======================================================
 
 import argparse
@@ -34,17 +38,11 @@ def sdf_to_mask_thresh_argmax_pred(sdf: torch.Tensor, thresh: float, fg_factor: 
 
     returns: (B, H, W) with values in {0..C-1}
     """
-    # foreground channels (B, C-1, H, W)
     sdf_fg = sdf[:, 1:]
-
-    # binary threshold
     fg_bin = (sdf_fg <= (fg_factor * thresh)).to(torch.int8)
 
-    # prepend background channel zeros -> (B, C, H, W)
     bg = torch.zeros_like(fg_bin[:, :1])
     m = torch.cat([bg, fg_bin], dim=1)
-
-    # argmax -> (B, H, W)
     return torch.argmax(m, dim=1)
 
 
@@ -92,6 +90,64 @@ def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+
+    Train:
+        optimizer.step()
+        ema.update(model)
+
+    Val with EMA weights:
+        ema.store(model)
+        ema.copy_to(model)
+        ... val ...
+        ema.restore(model)
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        if not (0.0 < decay < 1.0):
+            raise ValueError("EMA decay must be in (0, 1).")
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name not in self.shadow:
+                self.shadow[name] = p.detach().clone()
+            else:
+                self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def store(self, model: nn.Module):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                p.data.copy_(self.shadow[name].to(p.device))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name].to(p.device))
+        self.backup = {}
+
+
 # ======================================================
 # Lightning Module
 # ======================================================
@@ -103,8 +159,11 @@ class LitMedFlowSeg(pl.LightningModule):
         sample_steps: int = 10,
         vis_every: int = 5,
         output_root: str = "./Outputs/MedFlowSeg",
-        thresh: float = 0.2,     # ✅ new: threshold for pred decoding
-        fg_factor: float = 3.0,  # ✅ new: same as SegDiff: sdf <= 3*thresh
+        thresh: float = 0.2,
+        fg_factor: float = 3.0,
+        # EMA (default ON)
+        use_ema: bool = True,
+        ema_decay: float = 0.9999,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -125,6 +184,51 @@ class LitMedFlowSeg(pl.LightningModule):
         self.fg_factor = float(fg_factor)
 
         self._val_vis_cache = []
+
+        # EMA (delay init to on_fit_start so device placement is done)
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
+        self.ema: EMA | None = None
+
+        # for resume from ckpt
+        self._ema_shadow_from_ckpt = None
+        self._ema_decay_from_ckpt = None
+
+    # -----------------------------
+    # EMA hooks
+    # -----------------------------
+    def on_fit_start(self):
+        # init EMA after Lightning moves model to correct device(s)
+        if self.use_ema and self.ema is None:
+            self.ema = EMA(self.model, decay=self.ema_decay)
+
+            # if resumed and ckpt had EMA shadow, restore it
+            if self._ema_shadow_from_ckpt is not None:
+                self.ema.shadow = {k: v.to(self.device) for k, v in self._ema_shadow_from_ckpt.items()}
+            if self._ema_decay_from_ckpt is not None:
+                self.ema.decay = float(self._ema_decay_from_ckpt)
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # called after optimizer.step() by default -> safe place to update EMA
+        if self.use_ema and self.ema is not None:
+            self.ema.update(self.model)
+
+    def on_validation_epoch_start(self):
+        # swap to EMA weights for the whole validation epoch
+        if self.use_ema and self.ema is not None:
+            self.ema.store(self.model)
+            self.ema.copy_to(self.model)
+
+    # ✅ save / load EMA into checkpoint so test can use EMA
+    def on_save_checkpoint(self, checkpoint):
+        if self.use_ema and self.ema is not None:
+            checkpoint["ema_shadow"] = {k: v.detach().cpu() for k, v in self.ema.shadow.items()}
+            checkpoint["ema_decay"] = float(self.ema.decay)
+
+    def on_load_checkpoint(self, checkpoint):
+        # cache; apply in on_fit_start after ema exists and device is set
+        self._ema_shadow_from_ckpt = checkpoint.get("ema_shadow", None)
+        self._ema_decay_from_ckpt = checkpoint.get("ema_decay", None)
 
     # --------------------------------------------------
     # Flow Matching sampling (Euler integrate dx/dt = v_theta)
@@ -176,7 +280,6 @@ class LitMedFlowSeg(pl.LightningModule):
 
         sdf_pred = self.sample(image)
 
-        # ✅ Threshold + argmax decoding
         pred_mask = sdf_to_mask_thresh_argmax_pred(sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor)
         gt_mask = sdf_to_mask_thresh_argmax_gt(sdf_gt)
 
@@ -208,40 +311,40 @@ class LitMedFlowSeg(pl.LightningModule):
 
         if (epoch + 1) % self.vis_every != 0:
             self._val_vis_cache.clear()
-            return
+        else:
+            if len(self._val_vis_cache) != 0:
+                save_dir = self.vis_root / f"epoch_{epoch:04d}"
+                save_dir.mkdir(parents=True, exist_ok=True)
 
-        if len(self._val_vis_cache) == 0:
-            return
+                cache = self._val_vis_cache[0]
+                img = cache["image"][:, 0].numpy()
+                pred = cache["pred"].numpy()
+                gt = cache["gt"].numpy()
 
-        save_dir = self.vis_root / f"epoch_{epoch:04d}"
-        save_dir.mkdir(parents=True, exist_ok=True)
+                for i in range(min(4, img.shape[0])):
+                    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
 
-        cache = self._val_vis_cache[0]
-        img = cache["image"][:, 0].numpy()
-        pred = cache["pred"].numpy()
-        gt = cache["gt"].numpy()
+                    axs[0].imshow(img[i], cmap="gray")
+                    axs[0].set_title("Image")
+                    axs[0].axis("off")
 
-        for i in range(min(4, img.shape[0])):
-            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+                    axs[1].imshow(colorize_three_fg_else_black(gt[i]))
+                    axs[1].set_title("GT")
+                    axs[1].axis("off")
 
-            axs[0].imshow(img[i], cmap="gray")
-            axs[0].set_title("Image")
-            axs[0].axis("off")
+                    axs[2].imshow(colorize_three_fg_else_black(pred[i]))
+                    axs[2].set_title("Pred")
+                    axs[2].axis("off")
 
-            # ✅ only 1/2/3 colored, everything else black
-            axs[1].imshow(colorize_three_fg_else_black(gt[i]))
-            axs[1].set_title("GT")
-            axs[1].axis("off")
+                    plt.tight_layout()
+                    plt.savefig(save_dir / f"sample_{i}.png")
+                    plt.close()
 
-            axs[2].imshow(colorize_three_fg_else_black(pred[i]))
-            axs[2].set_title("Pred")
-            axs[2].axis("off")
+            self._val_vis_cache.clear()
 
-            plt.tight_layout()
-            plt.savefig(save_dir / f"sample_{i}.png")
-            plt.close()
-
-        self._val_vis_cache.clear()
+        # restore original (non-EMA) weights after validation epoch
+        if self.use_ema and self.ema is not None:
+            self.ema.restore(self.model)
 
     # --------------------------------------------------
     # Optimizer
@@ -266,17 +369,21 @@ def main():
 
     # -------- Optimization --------
     parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
 
     # -------- Output --------
     parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg")
     parser.add_argument("--vis_every", type=int, default=5)
 
-    # ✅ new: threshold for pred decoding (since your sdf is normalized to [-1,1])
+    # threshold for pred decoding (since your sdf is normalized to [-1,1])
     parser.add_argument("--thresh", type=float, default=1e-2)
     parser.add_argument("--fg_factor", type=float, default=3.0)
+
+    # ✅ EMA: default ON, use --no_ema to disable
+    parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
 
     # -------- System --------
     parser.add_argument("--seed", type=int, default=42)
@@ -318,6 +425,8 @@ def main():
         output_root=args.output_root,
         thresh=args.thresh,
         fg_factor=args.fg_factor,
+        use_ema=(not args.no_ema),  # ✅ default ON
+        ema_decay=args.ema_decay,
     )
 
     # -------- Checkpoint --------
