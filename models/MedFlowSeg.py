@@ -6,10 +6,11 @@ Flow-Matching Segmentation Network (ResUNet backbone) with:
 - Frequency-domain Cross Attention on deepest K encoder skip levels (optional)
 - ✅ Bottleneck coupling (Fore<->Back) with FreqCrossAttention at the deepest latent
 - ✅ Decoder Attention-Gated Skip connections
-- ✅ Optional Deep Supervision / Multi-Scale heads (kept backward-compatible by default)
+- ✅ Optional Deep Supervision / Multi-Scale heads (backward-compatible by default)
 
 ✅ NOTE:
 - ✅ 已去掉 BG Suppression（suppression map 相关全部移除），其他保持不变。
+- ✅ FAModule 的频域部分：不再切 low/high 两个频带；直接对完整频谱做一次 cross-attn (RI) -> IFFT
 """
 
 from __future__ import annotations
@@ -215,13 +216,14 @@ class FreqCrossAttention(nn.Module):
 
 
 # -----------------------------
-# FAModule (Spatial + Frequency, band-selective, cross-gated fusion)
+# ✅ FAModule (Spatial + Frequency, FULL-spectrum cross-attn, cross-gated fusion)
 # -----------------------------
 class FAModule(nn.Module):
     """
     A richer "FA module" block:
     - Spatial dual-path: DWConv(local) + CrossAttn(global)
-    - Frequency band-selective: FFT -> low/high split -> CrossAttn in RI -> IFFT
+    - ✅ Frequency (NO low/high split):
+        FFT -> fftshift -> CrossAttn in RI (full spectrum) -> IFFT
     - Cross-gating fusion: freq controls spatial delta, spatial controls freq delta
     - Stable residual: learnable alpha/beta init ~0
 
@@ -234,11 +236,12 @@ class FAModule(nn.Module):
         heads: int = 4,
         head_dim: int = 32,
         gate_init: float = 0.0,
+        # 兼容旧 build_model 的参数签名：保留但不再使用
         low_ratio: float = 0.25,
     ):
         super().__init__()
         self.ch = ch
-        self.low_ratio = float(low_ratio)
+        self.low_ratio = float(low_ratio)  # compatibility, unused
 
         # ---- Spatial dual-path ----
         self.s_local = nn.Sequential(
@@ -255,13 +258,12 @@ class FAModule(nn.Module):
         )
         self.s_delta_norm = GroupNorm32(ch)
 
-        # ---- Frequency band-selective ----
-        self.f_low_attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.f_high_attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.f_mix = nn.Sequential(
-            GroupNorm32(4 * ch),
+        # ---- Frequency full-spectrum cross-attn (RI) ----
+        self.f_attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.f_post = nn.Sequential(
+            GroupNorm32(2 * ch),
             nn.SiLU(),
-            nn.Conv2d(4 * ch, 2 * ch, 1),
+            nn.Conv2d(2 * ch, 2 * ch, 1),
         )
         self.f_delta_norm_ri = GroupNorm32(2 * ch)
         self.f_delta_norm_sp = GroupNorm32(ch)
@@ -282,8 +284,9 @@ class FAModule(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.alpha = nn.Parameter(torch.tensor(float(gate_init)))
-        self.beta = nn.Parameter(torch.tensor(float(gate_init)))
+        # stable residual scalars (init ~0)
+        self.alpha = nn.Parameter(torch.tensor(float(gate_init)))  # spatial strength
+        self.beta = nn.Parameter(torch.tensor(float(gate_init)))   # freq strength
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -295,17 +298,6 @@ class FAModule(nn.Module):
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
-    @staticmethod
-    def _build_low_high_masks(h: int, w: int, device, low_ratio: float):
-        yy = torch.arange(h, device=device) - h // 2
-        xx = torch.arange(w, device=device) - w // 2
-        Y, X = torch.meshgrid(yy, xx, indexing="ij")
-        R = torch.sqrt(Y.float() ** 2 + X.float() ** 2)
-        r0 = float(low_ratio) * (min(h, w) / 2.0)
-        low = (R <= r0).float()[None, None, :, :]
-        high = 1.0 - low
-        return low, high
-
     def _spatial_delta(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         d_local = self.s_local(x)
         d_global = self.s_global(x, c)
@@ -314,25 +306,25 @@ class FAModule(nn.Module):
         return d
 
     def _freq_delta_spatial(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Full-spectrum frequency delta:
+        1) FFT + fftshift
+        2) RI encode
+        3) CrossAttn( X_ri , C_ri ) once
+        4) Post + norm (RI)
+        5) IFFT -> spatial delta
+        """
         X = torch.fft.fft2(x, dim=(-2, -1))
         C = torch.fft.fft2(c, dim=(-2, -1))
 
         Xs = torch.fft.fftshift(X, dim=(-2, -1))
         Cs = torch.fft.fftshift(C, dim=(-2, -1))
 
-        _, _, h, w = x.shape
-        low_m, high_m = self._build_low_high_masks(h, w, x.device, low_ratio=self.low_ratio)
+        Xs_ri = self._to_ri(Xs)  # (B,2C,H,W)
+        Cs_ri = self._to_ri(Cs)
 
-        X_low, X_high = Xs * low_m, Xs * high_m
-        C_low, C_high = Cs * low_m, Cs * high_m
-
-        Xl_ri, Xh_ri = self._to_ri(X_low), self._to_ri(X_high)
-        Cl_ri, Ch_ri = self._to_ri(C_low), self._to_ri(C_high)
-
-        d_low = self.f_low_attn(Xl_ri, Cl_ri)
-        d_high = self.f_high_attn(Xh_ri, Ch_ri)
-
-        d_ri = self.f_mix(torch.cat([d_low, d_high], dim=1))
+        d_ri = self.f_attn(Xs_ri, Cs_ri)
+        d_ri = self.f_post(d_ri)
         d_ri = self.f_delta_norm_ri(d_ri)
 
         d_c = self._to_complex(d_ri)
@@ -345,8 +337,8 @@ class FAModule(nn.Module):
         dS = self._spatial_delta(x, c)
         dF = self._freq_delta_spatial(x, c)
 
-        gS = self.gate_s(dF)
-        gF = self.gate_f(dS)
+        gS = self.gate_s(dF)  # freq -> spatial gate
+        gF = self.gate_f(dS)  # spatial -> freq gate
 
         return x + self.alpha * (gS * dS) + self.beta * (gF * dF)
 
@@ -463,7 +455,7 @@ class Config:
     freq_attn_depth: int = 1
 
     use_fa_module: bool = True
-    fa_low_ratio: float = 0.25
+    fa_low_ratio: float = 0.25  # compatibility, unused in new FAModule
 
     use_bottleneck_coupling: bool = True
     bottleneck_gate_init: float = 0.0
@@ -511,7 +503,7 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
                     heads=cfg.attn_heads,
                     head_dim=cfg.attn_head_dim,
                     gate_init=cfg.bottleneck_gate_init,
-                    low_ratio=cfg.fa_low_ratio,
+                    low_ratio=cfg.fa_low_ratio,  # kept for compatibility, unused
                 )
             return FreqCrossAttention(
                 ch=ch,
@@ -659,7 +651,7 @@ def build_model(
     use_attn_gated_skip: bool = True,
     deep_supervision: bool = False,
     use_fa_module: bool = True,
-    fa_low_ratio: float = 0.25,
+    fa_low_ratio: float = 0.25,  # compatibility, unused in new FAModule
 ) -> FMForeBackDeepKFreqXAttnDualDecoderResUNet:
     cfg = Config(
         img_in_ch=img_in_ch,
@@ -695,7 +687,7 @@ if __name__ == "__main__":
         use_attn_gated_skip=True,
         deep_supervision=True,
         use_fa_module=True,
-        fa_low_ratio=0.25,
+        fa_low_ratio=0.25,  # compatibility, unused
         bottleneck_gate_init=0.0,
     )
     x_t = torch.randn(2, 4, 256, 256)
