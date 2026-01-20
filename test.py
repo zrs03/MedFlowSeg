@@ -68,6 +68,22 @@ def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int 
     return torch.stack(dices).mean()
 
 
+@torch.no_grad()
+def mean_iou_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int = 4) -> torch.Tensor:
+    """
+    Mean IoU over foreground classes only (1..num_classes-1).
+    pred, gt: (B,H,W)
+    """
+    ious = []
+    for c in range(1, num_classes):
+        p = (pred == c).float()
+        g = (gt == c).float()
+        inter = (p * g).sum(dim=(1, 2))
+        union = (p + g - p * g).sum(dim=(1, 2)) + 1e-6
+        ious.append((inter / union).mean())
+    return torch.stack(ious).mean()
+
+
 def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
     """
     Only color class 1/2/3; everything else (including background 0) is pure black.
@@ -190,6 +206,7 @@ def run_test(
     model.eval()
 
     dices = []
+    ious = []
     vis_count = 0
 
     for bidx, batch in enumerate(loader):
@@ -203,7 +220,9 @@ def run_test(
         gt_mask = sdf_to_mask_thresh_argmax_gt(sdf_gt)
 
         dice = mean_dice_foreground(pred_mask, gt_mask, num_classes=num_classes)
+        iou = mean_iou_foreground(pred_mask, gt_mask, num_classes=num_classes)
         dices.append(dice.item())
+        ious.append(iou.item())
 
         # vis
         if vis_count < max_vis:
@@ -233,11 +252,15 @@ def run_test(
                     break
 
         if (bidx + 1) % 10 == 0:
-            print(f"[{bidx+1}/{len(loader)}] mean dice so far: {np.mean(dices):.4f}")
+            print(
+                f"[{bidx+1}/{len(loader)}] "
+                f"mean dice so far: {np.mean(dices):.4f} | mean IoU so far: {np.mean(ious):.4f}"
+            )
 
     print("\n===== TEST DONE =====")
     print(f"Batches: {len(dices)}")
     print(f"Mean Dice (foreground 1..{num_classes-1}): {np.mean(dices):.4f}  ±  {np.std(dices):.4f}")
+    print(f"Mean IoU  (foreground 1..{num_classes-1}): {np.mean(ious):.4f}  ±  {np.std(ious):.4f}")
     print(f"Saved vis to: {out_dir / 'vis'}")
 
 
@@ -245,8 +268,12 @@ def main():
     parser = argparse.ArgumentParser("MedFlowSeg Test (Threshold+Argmax)")
 
     parser.add_argument("--ckpt", type=str, required=True, help="path to lightning .ckpt")
-    parser.add_argument("--data_root", type=str, default="./dataset/ACDC/SDF/test",
-                        help="e.g. ./dataset/ACDC/SDF/test or val")
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="./dataset/ACDC/SDF/test",
+        help="e.g. ./dataset/ACDC/SDF/test or val",
+    )
     parser.add_argument("--out_dir", type=str, default="./Outputs/MedFlowSeg_test")
 
     parser.add_argument("--num_classes", type=int, default=4)
@@ -277,7 +304,7 @@ def main():
         thresh=args.thresh,
         fg_factor=args.fg_factor,
         max_vis=args.max_vis,
-        use_ema=(not args.no_ema),  # ✅ default ON
+        use_ema=(not args.no_ema),
     )
 
 

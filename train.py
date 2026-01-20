@@ -4,8 +4,11 @@
 # Threshold + Argmax decoding (SegDiff-style)
 # + EMA (Exponential Moving Average)
 #
-# ✅ Fix: EMA default ON with "--no_ema" to disable
+# ✅ EMA default ON with "--no_ema" to disable
 # ✅ Save EMA shadow into Lightning checkpoint so test/inference can load EMA weights
+#
+# ✅ VIS Fix (改法2): 记录并可视化前 N 个 val batches（而不是只记录 batch_idx==0）
+#    - 新增参数: --vis_batches  (默认 1)
 # ======================================================
 
 import argparse
@@ -158,6 +161,7 @@ class LitMedFlowSeg(pl.LightningModule):
         lr: float = 1e-4,
         sample_steps: int = 10,
         vis_every: int = 5,
+        vis_batches: int = 1,  # ✅ 改法2：可视化前 N 个 val batches
         output_root: str = "./Outputs/MedFlowSeg",
         thresh: float = 0.2,
         fg_factor: float = 3.0,
@@ -175,7 +179,9 @@ class LitMedFlowSeg(pl.LightningModule):
         self.lr = lr
         self.sample_steps = sample_steps
 
-        self.vis_every = vis_every
+        self.vis_every = int(vis_every)
+        self.vis_batches = int(max(1, vis_batches))
+
         self.output_root = Path(output_root)
         self.vis_root = self.output_root / "vis"
         self.vis_root.mkdir(parents=True, exist_ok=True)
@@ -294,12 +300,14 @@ class LitMedFlowSeg(pl.LightningModule):
             sync_dist=True,
         )
 
-        if batch_idx == 0:
+        # ✅ 改法2：缓存前 N 个 batch（而不是只缓存 batch_idx==0）
+        if batch_idx < self.vis_batches:
             self._val_vis_cache.append(
                 {
                     "image": image.detach().cpu(),
                     "pred": pred_mask.detach().cpu(),
                     "gt": gt_mask.detach().cpu(),
+                    "batch_idx": int(batch_idx),
                 }
             )
 
@@ -316,29 +324,31 @@ class LitMedFlowSeg(pl.LightningModule):
                 save_dir = self.vis_root / f"epoch_{epoch:04d}"
                 save_dir.mkdir(parents=True, exist_ok=True)
 
-                cache = self._val_vis_cache[0]
-                img = cache["image"][:, 0].numpy()
-                pred = cache["pred"].numpy()
-                gt = cache["gt"].numpy()
+                # ✅ 逐个 batch 可视化；每个 batch 最多画 4 张
+                for cache in self._val_vis_cache:
+                    img = cache["image"][:, 0].numpy()
+                    pred = cache["pred"].numpy()
+                    gt = cache["gt"].numpy()
+                    bidx = cache.get("batch_idx", 0)
 
-                for i in range(min(4, img.shape[0])):
-                    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+                    for i in range(min(4, img.shape[0])):
+                        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
 
-                    axs[0].imshow(img[i], cmap="gray")
-                    axs[0].set_title("Image")
-                    axs[0].axis("off")
+                        axs[0].imshow(img[i], cmap="gray")
+                        axs[0].set_title("Image")
+                        axs[0].axis("off")
 
-                    axs[1].imshow(colorize_three_fg_else_black(gt[i]))
-                    axs[1].set_title("GT")
-                    axs[1].axis("off")
+                        axs[1].imshow(colorize_three_fg_else_black(gt[i]))
+                        axs[1].set_title("GT")
+                        axs[1].axis("off")
 
-                    axs[2].imshow(colorize_three_fg_else_black(pred[i]))
-                    axs[2].set_title("Pred")
-                    axs[2].axis("off")
+                        axs[2].imshow(colorize_three_fg_else_black(pred[i]))
+                        axs[2].set_title("Pred")
+                        axs[2].axis("off")
 
-                    plt.tight_layout()
-                    plt.savefig(save_dir / f"sample_{i}.png")
-                    plt.close()
+                        plt.tight_layout()
+                        plt.savefig(save_dir / f"batch{bidx:03d}_sample{i}.png")
+                        plt.close()
 
             self._val_vis_cache.clear()
 
@@ -365,17 +375,18 @@ def main():
 
     # -------- Model --------
     parser.add_argument("--num_classes", type=int, default=4)
-    parser.add_argument("--sample_steps", type=int, default=10)
+    parser.add_argument("--sample_steps", type=int, default=50)
 
     # -------- Optimization --------
-    parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
 
     # -------- Output --------
-    parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg")
+    parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg-v-operator")
     parser.add_argument("--vis_every", type=int, default=5)
+    parser.add_argument("--vis_batches", type=int, default=3, help="visualize first N validation batches")
 
     # threshold for pred decoding (since your sdf is normalized to [-1,1])
     parser.add_argument("--thresh", type=float, default=1e-2)
@@ -383,7 +394,7 @@ def main():
 
     # ✅ EMA: default ON, use --no_ema to disable
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
-    parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
 
     # -------- System --------
     parser.add_argument("--seed", type=int, default=42)
@@ -422,6 +433,7 @@ def main():
         lr=args.lr,
         sample_steps=args.sample_steps,
         vis_every=args.vis_every,
+        vis_batches=args.vis_batches,  # ✅
         output_root=args.output_root,
         thresh=args.thresh,
         fg_factor=args.fg_factor,
@@ -444,6 +456,7 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
+        strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
         callbacks=[ckpt_cb],
         logger=logger,

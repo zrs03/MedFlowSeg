@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Flow-Matching Segmentation Network (ResUNet backbone) with:
-- Fore/Back separation (x_t: ch0=background, ch1..=foreground)
-- Fore/Back conditional encoders (independent)
-- Frequency-domain Cross Attention on deepest K encoder skip levels (optional)
-- ✅ Bottleneck coupling (Fore<->Back) with FreqCrossAttention at the deepest latent
-- ✅ Decoder Attention-Gated Skip connections
-- ✅ Optional Deep Supervision / Multi-Scale heads (backward-compatible by default)
+...（省略原注释，内容不变）
 
-✅ NOTE:
-- ✅ 已去掉 BG Suppression（suppression map 相关全部移除），其他保持不变。
-- ✅ FAModule 的频域部分：不再切 low/high 两个频带；直接对完整频谱做一次 cross-attn (RI) -> IFFT
+✅ NEW: FA is now a *bound pair* of two TriFFT blocks, treated as ONE FA module:
+    - Step 1: TriFFT WITH the radial operator (time-conditioned gate)
+    - Step 2: TriFFT WITHOUT the operator (pure attention update)
+
+✅ NEW: fa_modules (default=1) controls how many such bound FA modules to apply:
+    (fore, back, cond) -> [FA_Module]^M
+
+✅ CHANGE (your request): NO input-level concat(image, x_t).
+    - back encoder sees ONLY x_back
+    - fore encoder sees ONLY x_fore
+    - cond encoder sees ONLY image
+    - fusion happens ONLY in FA modules and decoder skip fusion
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union, Optional
+from typing import List, Sequence, Tuple, Union, Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -142,7 +145,7 @@ class Upsample(nn.Module):
 
 
 # -----------------------------
-# Spatial Cross Attention (real)
+# Spatial Cross Attention (multi-head)
 # -----------------------------
 class SpatialCrossAttention(nn.Module):
     def __init__(self, q_ch: int, kv_ch: int, heads: int = 4, head_dim: int = 32):
@@ -176,117 +179,98 @@ class SpatialCrossAttention(nn.Module):
 
 
 # -----------------------------
-# Frequency-domain Cross Attention (FFT -> XAttn -> IFFT)
+# Time-conditioned radial spectral gate g(r,t)=exp(-alpha(t)*r^p)
 # -----------------------------
-class FreqCrossAttention(nn.Module):
-    """Symmetric frequency-domain cross-attention between two (B,C,H,W) real features."""
-
-    def __init__(self, ch: int, heads: int = 4, head_dim: int = 32, gate_init: float = 0.0):
+class TimeRadialSpectralGate(nn.Module):
+    def __init__(
+        self,
+        time_ch: int,
+        p: float = 2.0,
+        alpha_init: float = 0.0,
+        per_channel: bool = False,
+        ch: int = 0,
+    ):
         super().__init__()
-        self.ch = ch
-        self.attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
-        self.delta_norm = GroupNorm32(2 * ch)
+        self.p = float(p)
+        self.per_channel = bool(per_channel)
+        self.ch = int(ch)
 
-    @staticmethod
-    def _to_ri(z: torch.Tensor) -> torch.Tensor:
-        return torch.cat([z.real, z.imag], dim=1)
+        out_dim = (2 * ch) if self.per_channel else 1
+        self.to_alpha = nn.Linear(time_ch, out_dim)
 
-    @staticmethod
-    def _to_complex(ri: torch.Tensor) -> torch.Tensor:
-        b, c2, h, w = ri.shape
-        c = c2 // 2
-        return torch.complex(ri[:, :c], ri[:, c:])
+        inv = math.log(math.expm1(max(alpha_init, 1e-6)))
+        nn.init.constant_(self.to_alpha.weight, 0.0)
+        nn.init.constant_(self.to_alpha.bias, inv)
 
-    def _update(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        X = torch.fft.fft2(x, dim=(-2, -1))
-        C = torch.fft.fft2(c, dim=(-2, -1))
-        Xri = self._to_ri(X)
-        Cri = self._to_ri(C)
-        delta = self.attn(Xri, Cri)
-        delta = self.delta_norm(delta)
-        Xri = Xri + self.gate * delta
-        X2 = self._to_complex(Xri)
-        return torch.fft.ifft2(X2, dim=(-2, -1)).real
+        self._grid_cache: Dict[Tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
 
-    def forward(self, fore: torch.Tensor, back: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        fore2 = self._update(fore, back)
-        back2 = self._update(back, fore)
-        return fore2, back2
+    def _radius_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (h, w, device, dtype)
+        if key in self._grid_cache:
+            return self._grid_cache[key]
+
+        yy = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype).view(h, 1).expand(h, w)
+        xx = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype).view(1, w).expand(h, w)
+        r = torch.sqrt(xx * xx + yy * yy)
+        r = r / (r.max().clamp_min(1e-6))
+        r = r[None, None, :, :]  # (1,1,H,W)
+
+        self._grid_cache[key] = r
+        return r
+
+    def forward(self, t_emb: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        b = t_emb.shape[0]
+        r = self._radius_grid(h, w, t_emb.device, t_emb.dtype)
+
+        alpha = F.softplus(self.to_alpha(t_emb))  # >=0
+        if self.per_channel:
+            alpha = alpha.view(b, 2 * self.ch, 1, 1)
+            mask = torch.exp(-alpha * (r ** self.p))
+        else:
+            alpha = alpha.view(b, 1, 1, 1)
+            mask = torch.exp(-alpha * (r ** self.p))
+        return mask
 
 
 # -----------------------------
-# ✅ FAModule (Spatial + Frequency, FULL-spectrum cross-attn, cross-gated fusion)
+# Tri-FFT Cross Attention Module
+# (optionally uses sign(Δ) * max(|Δ|,|gΔ|))
 # -----------------------------
-class FAModule(nn.Module):
-    """
-    A richer "FA module" block:
-    - Spatial dual-path: DWConv(local) + CrossAttn(global)
-    - ✅ Frequency (NO low/high split):
-        FFT -> fftshift -> CrossAttn in RI (full spectrum) -> IFFT
-    - Cross-gating fusion: freq controls spatial delta, spatial controls freq delta
-    - Stable residual: learnable alpha/beta init ~0
-
-    Symmetric usage: forward(fore, back) returns updated (fore, back).
-    """
-
+class TriFFTCrossAttention(nn.Module):
     def __init__(
         self,
         ch: int,
+        time_ch: int,
         heads: int = 4,
         head_dim: int = 32,
-        gate_init: float = 0.0,
-        # 兼容旧 build_model 的参数签名：保留但不再使用
-        low_ratio: float = 0.25,
+        use_time_radial_gate: bool = True,
+        radial_p: float = 2.0,
+        radial_alpha_init: float = 0.0,
+        radial_per_channel: bool = False,
     ):
         super().__init__()
         self.ch = ch
-        self.low_ratio = float(low_ratio)  # compatibility, unused
+        self.use_time_radial_gate = bool(use_time_radial_gate)
 
-        # ---- Spatial dual-path ----
-        self.s_local = nn.Sequential(
-            nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False),  # DWConv
-            GroupNorm32(ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, ch, 1, bias=False),
-        )
-        self.s_global = SpatialCrossAttention(q_ch=ch, kv_ch=ch, heads=heads, head_dim=head_dim)
-        self.s_fuse = nn.Sequential(
-            GroupNorm32(2 * ch),
-            nn.SiLU(),
-            nn.Conv2d(2 * ch, ch, 1),
-        )
-        self.s_delta_norm = GroupNorm32(ch)
+        self.attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
 
-        # ---- Frequency full-spectrum cross-attn (RI) ----
-        self.f_attn = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.f_post = nn.Sequential(
-            GroupNorm32(2 * ch),
-            nn.SiLU(),
-            nn.Conv2d(2 * ch, 2 * ch, 1),
-        )
-        self.f_delta_norm_ri = GroupNorm32(2 * ch)
-        self.f_delta_norm_sp = GroupNorm32(ch)
+        self.post_f = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.norm_f = GroupNorm32(2 * ch)
+        self.norm_b = GroupNorm32(2 * ch)
 
-        # ---- Cross-gating (SE-style) ----
-        self.gate_s = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(ch, max(8, ch // 4), 1),
-            nn.SiLU(),
-            nn.Conv2d(max(8, ch // 4), ch, 1),
-            nn.Sigmoid(),
-        )
-        self.gate_f = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(ch, max(8, ch // 4), 1),
-            nn.SiLU(),
-            nn.Conv2d(max(8, ch // 4), ch, 1),
-            nn.Sigmoid(),
-        )
-
-        # stable residual scalars (init ~0)
-        self.alpha = nn.Parameter(torch.tensor(float(gate_init)))  # spatial strength
-        self.beta = nn.Parameter(torch.tensor(float(gate_init)))   # freq strength
+        if self.use_time_radial_gate:
+            self.radial_gate = TimeRadialSpectralGate(
+                time_ch=time_ch,
+                p=radial_p,
+                alpha_init=radial_alpha_init,
+                per_channel=radial_per_channel,
+                ch=ch,
+            )
+        else:
+            self.radial_gate = None
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -298,54 +282,98 @@ class FAModule(nn.Module):
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
-    def _spatial_delta(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        d_local = self.s_local(x)
-        d_global = self.s_global(x, c)
-        d = self.s_fuse(torch.cat([d_local, d_global], dim=1))
-        d = self.s_delta_norm(d)
-        return d
+    def _apply_gate(self, delta_ri: torch.Tensor, t_emb: Optional[torch.Tensor]) -> torch.Tensor:
+        if (not self.use_time_radial_gate) or (self.radial_gate is None) or (t_emb is None):
+            return delta_ri
+        _, _, h, w = delta_ri.shape
+        g = self.radial_gate(t_emb, h, w)
+        delta_g = delta_ri * g
+        return torch.sign(delta_ri) * torch.maximum(delta_ri.abs(), delta_g.abs())
 
-    def _freq_delta_spatial(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """
-        Full-spectrum frequency delta:
-        1) FFT + fftshift
-        2) RI encode
-        3) CrossAttn( X_ri , C_ri ) once
-        4) Post + norm (RI)
-        5) IFFT -> spatial delta
-        """
-        X = torch.fft.fft2(x, dim=(-2, -1))
-        C = torch.fft.fft2(c, dim=(-2, -1))
+    def forward(
+        self,
+        fore: torch.Tensor,
+        back: torch.Tensor,
+        cond: torch.Tensor,
+        t_emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1)), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1)), dim=(-2, -1))
+        Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1)), dim=(-2, -1))
 
-        Xs = torch.fft.fftshift(X, dim=(-2, -1))
-        Cs = torch.fft.fftshift(C, dim=(-2, -1))
+        Fri = self._to_ri(Fz)
+        Bri = self._to_ri(Bz)
+        Cri = self._to_ri(Cz)
 
-        Xs_ri = self._to_ri(Xs)  # (B,2C,H,W)
-        Cs_ri = self._to_ri(Cs)
+        d_fb = self._apply_gate(self.attn_fb(Fri, Bri), t_emb)
+        d_fc = self._apply_gate(self.attn_fc(Fri, Cri), t_emb)
+        Fri2 = Fri + d_fb + d_fc
+        Fri2 = self.norm_f(self.post_f(Fri2))
 
-        d_ri = self.f_attn(Xs_ri, Cs_ri)
-        d_ri = self.f_post(d_ri)
-        d_ri = self.f_delta_norm_ri(d_ri)
+        d_bc = self._apply_gate(self.attn_bc(Bri, Cri), t_emb)
+        Bri2 = Bri + d_bc
+        Bri2 = self.norm_b(self.post_b(Bri2))
 
-        d_c = self._to_complex(d_ri)
-        d_c = torch.fft.ifftshift(d_c, dim=(-2, -1))
-        d_x = torch.fft.ifft2(d_c, dim=(-2, -1)).real
-        d_x = self.f_delta_norm_sp(d_x)
-        return d_x
+        F2c = self._to_complex(Fri2)
+        B2c = self._to_complex(Bri2)
 
-    def _update(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        dS = self._spatial_delta(x, c)
-        dF = self._freq_delta_spatial(x, c)
+        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
+        B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
 
-        gS = self.gate_s(dF)  # freq -> spatial gate
-        gF = self.gate_f(dS)  # spatial -> freq gate
+        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1)).real
+        back_out = torch.fft.ifft2(B2c, dim=(-2, -1)).real
+        return fore_out, back_out
 
-        return x + self.alpha * (gS * dS) + self.beta * (gF * dF)
 
-    def forward(self, fore: torch.Tensor, back: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        fore2 = self._update(fore, back)
-        back2 = self._update(back, fore)
-        return fore2, back2
+# -----------------------------
+# Bound FA module = (op-on) then (op-off)
+# -----------------------------
+class BoundFAModule(nn.Module):
+    def __init__(
+        self,
+        ch: int,
+        time_ch: int,
+        heads: int,
+        head_dim: int,
+        radial_p: float,
+        radial_alpha_init: float,
+        radial_per_channel: bool,
+        use_time_radial_gate: bool = True,
+    ):
+        super().__init__()
+
+        self.step1 = TriFFTCrossAttention(
+            ch=ch,
+            time_ch=time_ch,
+            heads=heads,
+            head_dim=head_dim,
+            use_time_radial_gate=use_time_radial_gate,
+            radial_p=radial_p,
+            radial_alpha_init=radial_alpha_init,
+            radial_per_channel=radial_per_channel,
+        )
+
+        self.step2 = TriFFTCrossAttention(
+            ch=ch,
+            time_ch=time_ch,
+            heads=heads,
+            head_dim=head_dim,
+            use_time_radial_gate=False,  # forced OFF
+            radial_p=radial_p,
+            radial_alpha_init=radial_alpha_init,
+            radial_per_channel=radial_per_channel,
+        )
+
+    def forward(
+        self,
+        fore: torch.Tensor,
+        back: torch.Tensor,
+        cond: torch.Tensor,
+        t_emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        fore, back = self.step1(fore, back, cond, t_emb=t_emb)
+        fore, back = self.step2(fore, back, cond, t_emb=t_emb)
+        return fore, back
 
 
 # -----------------------------
@@ -357,18 +385,9 @@ class AttentionGate(nn.Module):
         if inter_ch is None:
             inter_ch = max(8, min(x_ch, skip_ch) // 2)
 
-        self.Wg = nn.Sequential(
-            nn.Conv2d(x_ch, inter_ch, kernel_size=1, bias=False),
-            GroupNorm32(inter_ch),
-        )
-        self.Ws = nn.Sequential(
-            nn.Conv2d(skip_ch, inter_ch, kernel_size=1, bias=False),
-            GroupNorm32(inter_ch),
-        )
-        self.psi = nn.Sequential(
-            nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
+        self.Wg = nn.Sequential(nn.Conv2d(x_ch, inter_ch, 1, bias=False), GroupNorm32(inter_ch))
+        self.Ws = nn.Sequential(nn.Conv2d(skip_ch, inter_ch, 1, bias=False), GroupNorm32(inter_ch))
+        self.psi = nn.Sequential(nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True), nn.Sigmoid())
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         a = F.silu(self.Wg(x) + self.Ws(skip))
@@ -377,9 +396,9 @@ class AttentionGate(nn.Module):
 
 
 # -----------------------------
-# Encoder / Decoder stages
+# Encoder stage (FiLM)
 # -----------------------------
-class EncoderStage(nn.Module):
+class EncoderStageFiLM(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, time_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
@@ -399,22 +418,38 @@ class EncoderStage(nn.Module):
         return x, skip
 
 
-class DecoderStage(nn.Module):
+# -----------------------------
+# Decoder stage with Cond injection (ADD to skip)
+# -----------------------------
+class DecoderStageCondAddSkip(nn.Module):
     def __init__(
         self,
         in_ch: int,
         skip_ch: int,
+        cond_ch: int,
         out_ch: int,
         time_ch: int,
         num_blocks: int,
         up: bool,
         dropout: float,
         use_attn_gate: bool = True,
+        cond_proj: bool = True,
+        fuse_norm: bool = True,
     ):
         super().__init__()
         self.up = Upsample(in_ch) if up else None
+
         self.use_attn_gate = use_attn_gate
         self.gate = AttentionGate(x_ch=in_ch, skip_ch=skip_ch) if use_attn_gate else None
+
+        if cond_proj:
+            self.cond_proj = nn.Conv2d(cond_ch, skip_ch, 1, bias=False)
+        else:
+            if cond_ch != skip_ch:
+                raise ValueError("cond_proj=False requires cond_ch == skip_ch")
+            self.cond_proj = nn.Identity()
+
+        self.fuse_norm = GroupNorm32(skip_ch) if fuse_norm else nn.Identity()
 
         blocks: List[nn.Module] = []
         ch = in_ch + skip_ch
@@ -423,12 +458,15 @@ class DecoderStage(nn.Module):
             ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, cond_skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         if self.up is not None:
             x = self.up(x)
 
         if self.use_attn_gate and self.gate is not None:
             skip = self.gate(x, skip)
+
+        cond_skip = self.cond_proj(cond_skip)
+        skip = self.fuse_norm(skip + cond_skip)
 
         x = torch.cat([x, skip], dim=1)
         for blk in self.blocks:
@@ -453,101 +491,128 @@ class Config:
     attn_head_dim: int = 32
 
     freq_attn_depth: int = 1
-
-    use_fa_module: bool = True
-    fa_low_ratio: float = 0.25  # compatibility, unused in new FAModule
-
     use_bottleneck_coupling: bool = True
-    bottleneck_gate_init: float = 0.0
-
     use_attn_gated_skip: bool = True
+
+    use_cond_add_to_skip: bool = True
+    cond_proj: bool = True
+    cond_fuse_norm: bool = True
+
     deep_supervision: bool = False
 
+    # operator knobs (used by FA step1 only)
+    use_time_radial_gate: bool = True
+    radial_p: float = 2.0
+    radial_alpha_init: float = 0.0
+    radial_per_channel: bool = False
 
-class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
+    # number of bound FA modules per location
+    fa_modules: int = 1
+
+
+class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         if cfg.xt_in_ch < 2:
             raise ValueError("xt_in_ch must be >=2 (channel0 background, remaining foreground).")
         if cfg.freq_attn_depth < 1:
             raise ValueError("freq_attn_depth must be >= 1.")
-        self.cfg = cfg
+        if not cfg.use_cond_add_to_skip:
+            raise ValueError("This file implements Method A (use_cond_add_to_skip=True).")
+        if cfg.fa_modules < 1:
+            raise ValueError("fa_modules must be >= 1")
 
+        self.cfg = cfg
         self.time_mlp = TimeMLP(time_dim=cfg.time_dim, hidden_dim=cfg.time_dim)
 
-        back_in_ch = cfg.img_in_ch + 1
-        fore_in_ch = cfg.img_in_ch + (cfg.xt_in_ch - 1)
+        # ✅ CHANGE: stems no longer take image concat
+        back_in_ch = 1                      # x_back only
+        fore_in_ch = cfg.xt_in_ch - 1        # x_fore only
+        cond_in_ch = cfg.img_in_ch           # image only
 
         self.back_stem = nn.Conv2d(back_in_ch, cfg.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(fore_in_ch, cfg.base_ch, 3, padding=1)
+        self.cond_stem = nn.Conv2d(cond_in_ch, cfg.base_ch, 3, padding=1)
 
         self.chs = [cfg.base_ch * m for m in cfg.ch_mult]
         n_levels = len(self.chs)
 
         self.back_enc = nn.ModuleList()
         self.fore_enc = nn.ModuleList()
+        self.cond_enc = nn.ModuleList()
         for i in range(n_levels):
             in_ch = self.chs[i - 1] if i > 0 else cfg.base_ch
             out_ch = self.chs[i]
             down = i < (n_levels - 1)
-            self.back_enc.append(EncoderStage(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
-            self.fore_enc.append(EncoderStage(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
+
+            self.back_enc.append(EncoderStageFiLM(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
+            self.fore_enc.append(EncoderStageFiLM(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
+            self.cond_enc.append(EncoderStageFiLM(in_ch, out_ch, cfg.time_dim, cfg.num_res_blocks, down, cfg.dropout))
 
         K = min(cfg.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K, n_levels))
 
-        def make_coupler(ch: int) -> nn.Module:
-            if cfg.use_fa_module:
-                return FAModule(
-                    ch=ch,
-                    heads=cfg.attn_heads,
-                    head_dim=cfg.attn_head_dim,
-                    gate_init=cfg.bottleneck_gate_init,
-                    low_ratio=cfg.fa_low_ratio,  # kept for compatibility, unused
+        def make_bound_fa_list(ch: int) -> nn.ModuleList:
+            mods = nn.ModuleList()
+            for _ in range(cfg.fa_modules):
+                mods.append(
+                    BoundFAModule(
+                        ch=ch,
+                        time_ch=cfg.time_dim,
+                        heads=cfg.attn_heads,
+                        head_dim=cfg.attn_head_dim,
+                        radial_p=cfg.radial_p,
+                        radial_alpha_init=cfg.radial_alpha_init,
+                        radial_per_channel=cfg.radial_per_channel,
+                        use_time_radial_gate=cfg.use_time_radial_gate,
+                    )
                 )
-            return FreqCrossAttention(
-                ch=ch,
-                heads=cfg.attn_heads,
-                head_dim=cfg.attn_head_dim,
-                gate_init=cfg.bottleneck_gate_init,
-            )
+            return mods
 
         self.couple_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
-            self.couple_modules[str(i)] = make_coupler(self.chs[i])
+            self.couple_modules[str(i)] = make_bound_fa_list(self.chs[i])
 
-        self.bottleneck_coupler = make_coupler(self.chs[-1]) if cfg.use_bottleneck_coupling else None
+        self.bottleneck_coupler = make_bound_fa_list(self.chs[-1]) if cfg.use_bottleneck_coupling else None
 
+        # decoders
         self.back_dec = nn.ModuleList()
         self.fore_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
+            cond_ch = self.chs[i]
             in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
 
             self.back_dec.append(
-                DecoderStage(
-                    in_ch,
-                    skip_ch,
-                    out_ch,
-                    cfg.time_dim,
-                    cfg.num_res_blocks,
-                    up,
-                    cfg.dropout,
+                DecoderStageCondAddSkip(
+                    in_ch=in_ch,
+                    skip_ch=skip_ch,
+                    cond_ch=cond_ch,
+                    out_ch=out_ch,
+                    time_ch=cfg.time_dim,
+                    num_blocks=cfg.num_res_blocks,
+                    up=up,
+                    dropout=cfg.dropout,
                     use_attn_gate=cfg.use_attn_gated_skip,
+                    cond_proj=cfg.cond_proj,
+                    fuse_norm=cfg.cond_fuse_norm,
                 )
             )
             self.fore_dec.append(
-                DecoderStage(
-                    in_ch,
-                    skip_ch,
-                    out_ch,
-                    cfg.time_dim,
-                    cfg.num_res_blocks,
-                    up,
-                    cfg.dropout,
+                DecoderStageCondAddSkip(
+                    in_ch=in_ch,
+                    skip_ch=skip_ch,
+                    cond_ch=cond_ch,
+                    out_ch=out_ch,
+                    time_ch=cfg.time_dim,
+                    num_blocks=cfg.num_res_blocks,
+                    up=up,
+                    dropout=cfg.dropout,
                     use_attn_gate=cfg.use_attn_gated_skip,
+                    cond_proj=cfg.cond_proj,
+                    fuse_norm=cfg.cond_fuse_norm,
                 )
             )
 
@@ -578,42 +643,46 @@ class FMForeBackDeepKFreqXAttnDualDecoderResUNet(nn.Module):
 
         t_emb = self.time_mlp(t)
 
+        # split x_t
         x_back = x_t[:, 0:1]
         x_fore = x_t[:, 1:]
 
-        back_in = torch.cat([image, x_back], dim=1)
-        fore_in = torch.cat([image, x_fore], dim=1)
-
-        back = self.back_stem(back_in)
-        fore = self.fore_stem(fore_in)
+        # ✅ CHANGE: no input cat
+        back = self.back_stem(x_back)
+        fore = self.fore_stem(x_fore)
+        cond = self.cond_stem(image)
 
         back_skips: List[torch.Tensor] = []
         fore_skips: List[torch.Tensor] = []
+        cond_skips: List[torch.Tensor] = []
 
-        for level, (enc_b, enc_f) in enumerate(zip(self.back_enc, self.fore_enc)):
+        for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
             back, b_skip = enc_b(back, t_emb)
             fore, f_skip = enc_f(fore, t_emb)
+            cond, c_skip = enc_c(cond, t_emb)
 
             if level in self.attn_level_set:
-                coupler = self.couple_modules[str(level)]
-                f_skip, b_skip = coupler(f_skip, b_skip)
+                fa_list: nn.ModuleList = self.couple_modules[str(level)]
+                for fa in fa_list:
+                    f_skip, b_skip = fa(f_skip, b_skip, c_skip, t_emb=t_emb)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
+            cond_skips.append(c_skip)
 
         if self.bottleneck_coupler is not None:
-            fore, back = self.bottleneck_coupler(fore, back)
+            for fa in self.bottleneck_coupler:
+                fore, back = fa(fore, back, cond, t_emb=t_emb)
 
         back_h = back
         fore_h = fore
-
         aux_preds: List[torch.Tensor] = []
 
-        for stage_idx, (dec_b, dec_f, b_skip, f_skip) in enumerate(
-            zip(self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips))
+        for stage_idx, (dec_b, dec_f, b_skip, f_skip, c_skip) in enumerate(
+            zip(self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips), reversed(cond_skips))
         ):
-            back_h = dec_b(back_h, b_skip, t_emb)
-            fore_h = dec_f(fore_h, f_skip, t_emb)
+            back_h = dec_b(back_h, b_skip, c_skip, t_emb)
+            fore_h = dec_f(fore_h, f_skip, c_skip, t_emb)
 
             if self.deep_supervision and return_aux:
                 h_ms = torch.cat([fore_h, back_h], dim=1)
@@ -647,12 +716,17 @@ def build_model(
     attn_head_dim: int = 32,
     freq_attn_depth: int = 1,
     use_bottleneck_coupling: bool = True,
-    bottleneck_gate_init: float = 0.0,
     use_attn_gated_skip: bool = True,
     deep_supervision: bool = False,
-    use_fa_module: bool = True,
-    fa_low_ratio: float = 0.25,  # compatibility, unused in new FAModule
-) -> FMForeBackDeepKFreqXAttnDualDecoderResUNet:
+    use_cond_add_to_skip: bool = True,
+    cond_proj: bool = True,
+    cond_fuse_norm: bool = True,
+    use_time_radial_gate: bool = True,
+    radial_p: float = 2.0,
+    radial_alpha_init: float = 0.0,
+    radial_per_channel: bool = False,
+    fa_modules: int = 1,
+) -> FMForeBackCondDeepKTriFFTDualDecoderResUNet:
     cfg = Config(
         img_in_ch=img_in_ch,
         xt_in_ch=xt_in_ch,
@@ -665,30 +739,29 @@ def build_model(
         attn_head_dim=attn_head_dim,
         freq_attn_depth=freq_attn_depth,
         use_bottleneck_coupling=use_bottleneck_coupling,
-        bottleneck_gate_init=bottleneck_gate_init,
         use_attn_gated_skip=use_attn_gated_skip,
         deep_supervision=deep_supervision,
-        use_fa_module=use_fa_module,
-        fa_low_ratio=fa_low_ratio,
+        use_cond_add_to_skip=use_cond_add_to_skip,
+        cond_proj=cond_proj,
+        cond_fuse_norm=cond_fuse_norm,
+        use_time_radial_gate=use_time_radial_gate,
+        radial_p=radial_p,
+        radial_alpha_init=radial_alpha_init,
+        radial_per_channel=radial_per_channel,
+        fa_modules=fa_modules,
     )
-    return FMForeBackDeepKFreqXAttnDualDecoderResUNet(cfg)
+    return FMForeBackCondDeepKTriFFTDualDecoderResUNet(cfg)
 
 
-# -----------------------------
-# Sanity
-# -----------------------------
 if __name__ == "__main__":
     net = build_model(
         img_in_ch=1,
         xt_in_ch=4,
         base_ch=32,
         freq_attn_depth=2,
+        fa_modules=1,
         use_bottleneck_coupling=True,
-        use_attn_gated_skip=True,
         deep_supervision=True,
-        use_fa_module=True,
-        fa_low_ratio=0.25,  # compatibility, unused
-        bottleneck_gate_init=0.0,
     )
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)
