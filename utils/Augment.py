@@ -424,8 +424,8 @@ def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_root", type=str, default="./dataset/ACDC/SDF/train", help="Input root containing img.npy & sdf.npy")
-    ap.add_argument("--out_root", type=str, default="./dataset/ACDC/Aug/train", help="Output root; numeric folders 000000/")
+    ap.add_argument("--in_root", type=str, default="./dataset/DDMI/SDF/train", help="Input root containing img.npy & sdf.npy")
+    ap.add_argument("--out_root", type=str, default="./dataset/DDMI/Aug/train", help="Output root; numeric folders 000000/")
     ap.add_argument("--aug_per_sample", type=int, default=2, help="Number of augmented variants per base sample")
     ap.add_argument("--no_original", action="store_true", help="Do not save the original sample")
     ap.add_argument("--seed", type=int, default=42)
