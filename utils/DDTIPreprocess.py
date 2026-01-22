@@ -33,50 +33,36 @@ def _ensure_dirs(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def center_pad_or_crop_hw(x: np.ndarray, out_hw=(256, 256), pad_value=0):
+def resize_hw(x: np.ndarray, out_hw=(256, 256), is_mask: bool = False) -> np.ndarray:
     """
+    Resize to (out_h, out_w) using:
+      - bilinear for image (float/gray)
+      - nearest for mask/labels
+
     x: (H,W) or (H,W,1)
     return: (out_h,out_w)
     """
-    if x.ndim == 2:
-        x3 = x[:, :, None]
-        squeeze_back = True
-    elif x.ndim == 3 and x.shape[2] == 1:
-        x3 = x
-        squeeze_back = False
+    if x.ndim == 3 and x.shape[2] == 1:
+        x2 = x[:, :, 0]
+    elif x.ndim == 2:
+        x2 = x
     else:
         raise ValueError(f"Expected (H,W) or (H,W,1), got {x.shape}")
 
-    H, W, C = x3.shape
     out_h, out_w = out_hw
 
-    # pad
-    pad_h = max(0, out_h - H)
-    pad_w = max(0, out_w - W)
-    if pad_h > 0 or pad_w > 0:
-        pt = pad_h // 2
-        pb = pad_h - pt
-        pl = pad_w // 2
-        pr = pad_w - pl
-        x3 = np.pad(
-            x3,
-            ((pt, pb), (pl, pr), (0, 0)),
-            mode="constant",
-            constant_values=pad_value,
-        )
-        H, W, _ = x3.shape
-
-    # crop
-    if H > out_h:
-        top = (H - out_h) // 2
-        x3 = x3[top: top + out_h, :, :]
-    if W > out_w:
-        left = (W - out_w) // 2
-        x3 = x3[:, left: left + out_w, :]
-
-    if squeeze_back:
-        return x3[:, :, 0]
-    return x3
+    if is_mask:
+        # Ensure uint8 for stable nearest-neighbor
+        im = Image.fromarray(x2.astype(np.uint8, copy=False), mode="L")
+        im = im.resize((out_w, out_h), resample=Image.NEAREST)
+        y = np.asarray(im, dtype=np.uint8)
+        return y
+    else:
+        # Float32 grayscale: use mode "F" to preserve numeric range
+        im = Image.fromarray(x2.astype(np.float32, copy=False), mode="F")
+        im = im.resize((out_w, out_h), resample=Image.BILINEAR)
+        y = np.asarray(im, dtype=np.float32)
+        return y
 
 
 def minmax01_single(x: np.ndarray, eps=1e-8, clip_percentiles=(1.0, 99.0)) -> np.ndarray:
@@ -218,10 +204,6 @@ def read_image_gray_float(img_path: Path) -> np.ndarray:
         return np.asarray(im, dtype=np.float32)
 
 
-def list_case_ids(in_dir: Path) -> List[str]:
-    return sorted([p.stem for p in in_dir.glob("*.xml")])
-
-
 def list_images_for_case(in_dir: Path, case_id: str) -> List[Tuple[int, Path]]:
     """
     Return [(k, path)] for case_id_k.*
@@ -240,7 +222,7 @@ def list_images_for_case(in_dir: Path, case_id: str) -> List[Tuple[int, Path]]:
 
 
 # ============================================================
-# Split (NOW on samples: case_k)
+# Split (on samples: case_k)
 # ============================================================
 def list_sample_ids(in_dir: Path) -> List[str]:
     """
@@ -292,7 +274,7 @@ def save_split_json(out_path: Path, seed: int, train, val, test):
 
 
 # ============================================================
-# Processing (NOW each sample_id has its own folder)
+# Processing (each sample_id has its own folder)
 # ============================================================
 def process_one_sample(
     in_dir: Path,
@@ -359,10 +341,13 @@ def process_one_sample(
             clipped.append(poly2)
         mask = fill_polys(mask, clipped, value=1)
 
-    # resize by pad/crop
+    # ========================================================
+    # CHANGE HERE: resize instead of center pad/crop
+    # ========================================================
     out_hw = (size, size)
-    img2d = center_pad_or_crop_hw(img, out_hw=out_hw, pad_value=0.0)
-    mask2d = center_pad_or_crop_hw(mask, out_hw=out_hw, pad_value=0).astype(np.uint8)
+    img2d = resize_hw(img, out_hw=out_hw, is_mask=False)          # float, bilinear
+    mask2d = resize_hw(mask, out_hw=out_hw, is_mask=True)         # uint8, nearest
+    mask2d = (mask2d > 0).astype(np.uint8)                        # keep binary
 
     # normalize image [-1,1]
     img_norm = minmax01_single(img2d, clip_percentiles=(p_lo, p_hi))
@@ -447,7 +432,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", type=str, default="./DDTIdataset", help="包含 *.xml 和 case_k.jpg 的文件夹")
     ap.add_argument("--out_root", type=str, default="./dataset/DDTI/SDF", help="输出根目录：train/val/test + split.json")
-    ap.add_argument("--size", type=int, default=256, help="pad/crop 到固定尺寸 size x size")
+    ap.add_argument("--size", type=int, default=256, help="resize 到固定尺寸 size x size（不再裁剪/填充）")
     ap.add_argument("--p_lo", type=float, default=1.0, help="percentile clip low")
     ap.add_argument("--p_hi", type=float, default=99.0, help="percentile clip high")
     ap.add_argument("--clip", type=float, default=10.0, help="SDF clip 距离")
