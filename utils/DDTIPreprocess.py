@@ -445,8 +445,8 @@ def run(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_dir", type=str, default="./DDMIdataset", help="包含 *.xml 和 case_k.jpg 的文件夹")
-    ap.add_argument("--out_root", type=str, default="./dataset/DDMI/SDF", help="输出根目录：train/val/test + split.json")
+    ap.add_argument("--in_dir", type=str, default="./DDTIdataset", help="包含 *.xml 和 case_k.jpg 的文件夹")
+    ap.add_argument("--out_root", type=str, default="./dataset/DDTI/SDF", help="输出根目录：train/val/test + split.json")
     ap.add_argument("--size", type=int, default=256, help="pad/crop 到固定尺寸 size x size")
     ap.add_argument("--p_lo", type=float, default=1.0, help="percentile clip low")
     ap.add_argument("--p_hi", type=float, default=99.0, help="percentile clip high")
