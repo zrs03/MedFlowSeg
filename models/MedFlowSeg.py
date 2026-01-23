@@ -371,9 +371,10 @@ class BoundFAModule(nn.Module):
         cond: torch.Tensor,
         t_emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        f0, b0 = fore, back
         fore, back = self.step1(fore, back, cond, t_emb=t_emb)
         fore, back = self.step2(fore, back, cond, t_emb=t_emb)
-        return fore, back
+        return fore+f0, back+b0
 
 
 # -----------------------------
@@ -708,7 +709,7 @@ def build_model(
     img_in_ch: int = 1,
     xt_in_ch: int = 4,
     base_ch: int = 64,
-    ch_mult: Sequence[int] = (1, 2, 4, 8),
+    ch_mult: Sequence[int] = (1, 2, 4, 4, 8),
     num_res_blocks: int = 2,
     time_dim: int = 256,
     dropout: float = 0.0,

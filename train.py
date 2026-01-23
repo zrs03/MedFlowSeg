@@ -173,7 +173,7 @@ class LitMedFlowSeg(pl.LightningModule):
         self.save_hyperparameters()
 
         # Flow-matching model (expects x_t, image, t)
-        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=2)
+        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=3)
 
         self.num_classes = num_classes
         self.lr = lr
@@ -378,7 +378,7 @@ def main():
     parser.add_argument("--sample_steps", type=int, default=50)
 
     # -------- Optimization --------
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
