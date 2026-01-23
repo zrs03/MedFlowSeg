@@ -6,10 +6,12 @@
     - Step 1: TriFFT WITH the radial operator (time-conditioned gate)
     - Step 2: TriFFT WITHOUT the operator (pure attention update)
 
-✅ NEW: fa_modules (default=1) controls how many such bound FA modules to apply:
-    (fore, back, cond) -> [FA_Module]^M
+✅ NEW (your request): BoundFAModule stack count is now a hyperparameter.
+    - cfg.fa_stacks (default=2) controls how many BoundFAModule blocks to stack
+      at each original FA insertion position (encoder selected levels + bottleneck).
+    - (fore, back, cond) -> [BoundFAModule]^fa_stacks
 
-✅ CHANGE (your request): NO input-level concat(image, x_t).
+✅ CHANGE: NO input-level concat(image, x_t).
     - back encoder sees ONLY x_back
     - fore encoder sees ONLY x_fore
     - cond encoder sees ONLY image
@@ -165,6 +167,9 @@ class SpatialCrossAttention(nn.Module):
         self.norm_kv = GroupNorm32(kv_ch)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        # NOTE: in your current network, x and c at the same level share H,W.
+        # Keeping your original behavior (use x's H,W). If you want fully general
+        # cross-attn across different resolutions, change hk,wk = c.shape[-2:].
         b, _, h, w = x.shape
         x = self.norm_q(x)
         c = self.norm_kv(c)
@@ -374,7 +379,7 @@ class BoundFAModule(nn.Module):
         f0, b0 = fore, back
         fore, back = self.step1(fore, back, cond, t_emb=t_emb)
         fore, back = self.step2(fore, back, cond, t_emb=t_emb)
-        return fore+f0, back+b0
+        return fore + f0, back + b0
 
 
 # -----------------------------
@@ -507,8 +512,8 @@ class Config:
     radial_alpha_init: float = 0.0
     radial_per_channel: bool = False
 
-    # number of bound FA modules per location
-    fa_modules: int = 1
+    # ✅ NEW: number of BoundFAModule stacked per location (default=2)
+    fa_stacks: int = 2
 
 
 class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
@@ -520,16 +525,16 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
             raise ValueError("freq_attn_depth must be >= 1.")
         if not cfg.use_cond_add_to_skip:
             raise ValueError("This file implements Method A (use_cond_add_to_skip=True).")
-        if cfg.fa_modules < 1:
-            raise ValueError("fa_modules must be >= 1")
+        if cfg.fa_stacks < 1:
+            raise ValueError("fa_stacks must be >= 1")
 
         self.cfg = cfg
         self.time_mlp = TimeMLP(time_dim=cfg.time_dim, hidden_dim=cfg.time_dim)
 
-        # ✅ CHANGE: stems no longer take image concat
-        back_in_ch = 1                      # x_back only
-        fore_in_ch = cfg.xt_in_ch - 1        # x_fore only
-        cond_in_ch = cfg.img_in_ch           # image only
+        # ✅ stems: no image concat
+        back_in_ch = 1               # x_back only
+        fore_in_ch = cfg.xt_in_ch - 1  # x_fore only
+        cond_in_ch = cfg.img_in_ch   # image only
 
         self.back_stem = nn.Conv2d(back_in_ch, cfg.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(fore_in_ch, cfg.base_ch, 3, padding=1)
@@ -555,7 +560,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
         def make_bound_fa_list(ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
-            for _ in range(cfg.fa_modules):
+            for _ in range(cfg.fa_stacks):
                 mods.append(
                     BoundFAModule(
                         ch=ch,
@@ -570,10 +575,12 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                 )
             return mods
 
+        # encoder-level FA insertion (same original positions)
         self.couple_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
             self.couple_modules[str(i)] = make_bound_fa_list(self.chs[i])
 
+        # bottleneck FA insertion (same original position)
         self.bottleneck_coupler = make_bound_fa_list(self.chs[-1]) if cfg.use_bottleneck_coupling else None
 
         # decoders
@@ -648,7 +655,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         x_back = x_t[:, 0:1]
         x_fore = x_t[:, 1:]
 
-        # ✅ CHANGE: no input cat
+        # no input cat
         back = self.back_stem(x_back)
         fore = self.fore_stem(x_fore)
         cond = self.cond_stem(image)
@@ -726,7 +733,8 @@ def build_model(
     radial_p: float = 2.0,
     radial_alpha_init: float = 0.0,
     radial_per_channel: bool = False,
-    fa_modules: int = 1,
+    # ✅ NEW: BoundFAModule stack count (default=2)
+    fa_stacks: int = 2,
 ) -> FMForeBackCondDeepKTriFFTDualDecoderResUNet:
     cfg = Config(
         img_in_ch=img_in_ch,
@@ -749,7 +757,7 @@ def build_model(
         radial_p=radial_p,
         radial_alpha_init=radial_alpha_init,
         radial_per_channel=radial_per_channel,
-        fa_modules=fa_modules,
+        fa_stacks=fa_stacks,
     )
     return FMForeBackCondDeepKTriFFTDualDecoderResUNet(cfg)
 
@@ -760,7 +768,7 @@ if __name__ == "__main__":
         xt_in_ch=4,
         base_ch=32,
         freq_attn_depth=2,
-        fa_modules=1,
+        fa_stacks=2,  # ✅ default is 2; explicit here for clarity
         use_bottleneck_coupling=True,
         deep_supervision=True,
     )
