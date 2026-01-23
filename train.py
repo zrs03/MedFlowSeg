@@ -456,7 +456,6 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
-        strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
         callbacks=[ckpt_cb],
         logger=logger,
