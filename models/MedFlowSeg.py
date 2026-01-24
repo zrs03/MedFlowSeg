@@ -4,9 +4,11 @@
 
 ✅ NEW: FA is now a *bound pair* of two TriFFT blocks, treated as ONE FA module:
     - Step 1: TriFFT WITH the radial operator (time-conditioned gate)
+             ✅ CHANGED: step1 uses cond as Query (q=cond, kv=fore/back) to UPDATE cond only
     - Step 2: TriFFT WITHOUT the operator (pure attention update)
+             ✅ KEEP: step2 keeps original behavior: UPDATE fore/back (q=fore/back, kv=back/cond), cond as KV only
 
-✅ NEW (your request): BoundFAModule stack count is now a hyperparameter.
+✅ NEW: BoundFAModule stack count is a hyperparameter.
     - cfg.fa_stacks (default=2) controls how many BoundFAModule blocks to stack
       at each original FA insertion position (encoder selected levels + bottleneck).
     - (fore, back, cond) -> [BoundFAModule]^fa_stacks
@@ -167,9 +169,7 @@ class SpatialCrossAttention(nn.Module):
         self.norm_kv = GroupNorm32(kv_ch)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        # NOTE: in your current network, x and c at the same level share H,W.
-        # Keeping your original behavior (use x's H,W). If you want fully general
-        # cross-attn across different resolutions, change hk,wk = c.shape[-2:].
+        # NOTE: assumes x and c share H,W at the same level.
         b, _, h, w = x.shape
         x = self.norm_q(x)
         c = self.norm_kv(c)
@@ -239,7 +239,9 @@ class TimeRadialSpectralGate(nn.Module):
 
 # -----------------------------
 # Tri-FFT Cross Attention Module
-# (optionally uses sign(Δ) * max(|Δ|,|gΔ|))
+# - supports two update modes:
+#   (A) original: update fore/back (q=fore/back; kv=back/cond)
+#   (B) new:      update cond only  (q=cond; kv=fore/back)
 # -----------------------------
 class TriFFTCrossAttention(nn.Module):
     def __init__(
@@ -257,6 +259,7 @@ class TriFFTCrossAttention(nn.Module):
         self.ch = ch
         self.use_time_radial_gate = bool(use_time_radial_gate)
 
+        # original directions
         self.attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
         self.attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
         self.attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
@@ -265,6 +268,12 @@ class TriFFTCrossAttention(nn.Module):
         self.post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
         self.norm_f = GroupNorm32(2 * ch)
         self.norm_b = GroupNorm32(2 * ch)
+
+        # ✅ NEW: cond-update directions (q=cond; kv=fore/back)
+        self.attn_cf = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)  # q=C, kv=F
+        self.attn_cb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)  # q=C, kv=B
+        self.post_c = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.norm_c = GroupNorm32(2 * ch)
 
         if self.use_time_radial_gate:
             self.radial_gate = TimeRadialSpectralGate(
@@ -293,7 +302,7 @@ class TriFFTCrossAttention(nn.Module):
         _, _, h, w = delta_ri.shape
         g = self.radial_gate(t_emb, h, w)
         delta_g = delta_ri * g
-        return torch.sign(delta_ri) * torch.maximum(delta_ri.abs(), delta_g.abs())
+        return delta_ri * g
 
     def forward(
         self,
@@ -301,7 +310,9 @@ class TriFFTCrossAttention(nn.Module):
         back: torch.Tensor,
         cond: torch.Tensor,
         t_emb: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        update_fb: bool = True,
+        update_c: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1)), dim=(-2, -1))
         Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1)), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1)), dim=(-2, -1))
@@ -310,28 +321,44 @@ class TriFFTCrossAttention(nn.Module):
         Bri = self._to_ri(Bz)
         Cri = self._to_ri(Cz)
 
-        d_fb = self._apply_gate(self.attn_fb(Fri, Bri), t_emb)
-        d_fc = self._apply_gate(self.attn_fc(Fri, Cri), t_emb)
-        Fri2 = Fri + d_fb + d_fc
-        Fri2 = self.norm_f(self.post_f(Fri2))
+        # -------- update fore/back (original behavior) --------
+        if update_fb:
+            d_fb = self._apply_gate(self.attn_fb(Fri, Bri), t_emb)
+            d_fc = self._apply_gate(self.attn_fc(Fri, Cri), t_emb)
+            Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
 
-        d_bc = self._apply_gate(self.attn_bc(Bri, Cri), t_emb)
-        Bri2 = Bri + d_bc
-        Bri2 = self.norm_b(self.post_b(Bri2))
+            d_bc = self._apply_gate(self.attn_bc(Bri, Cri), t_emb)
+            Bri2 = self.norm_b(self.post_b(Bri + d_bc))
+        else:
+            Fri2, Bri2 = Fri, Bri
 
+        # -------- ✅ update cond (q=cond, kv=fore/back) --------
+        if update_c:
+            d_cf = self._apply_gate(self.attn_cf(Cri, Fri), t_emb)  # q=C, kv=F
+            d_cb = self._apply_gate(self.attn_cb(Cri, Bri), t_emb)  # q=C, kv=B
+            Cri2 = self.norm_c(self.post_c(Cri + d_cf + d_cb))
+        else:
+            Cri2 = Cri
+
+        # back to complex, ifft
         F2c = self._to_complex(Fri2)
         B2c = self._to_complex(Bri2)
+        C2c = self._to_complex(Cri2)
 
         F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
         B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
+        C2c = torch.fft.ifftshift(C2c, dim=(-2, -1))
 
         fore_out = torch.fft.ifft2(F2c, dim=(-2, -1)).real
         back_out = torch.fft.ifft2(B2c, dim=(-2, -1)).real
-        return fore_out, back_out
+        cond_out = torch.fft.ifft2(C2c, dim=(-2, -1)).real
+        return fore_out, back_out, cond_out
 
 
 # -----------------------------
-# Bound FA module = (op-on) then (op-off)
+# Bound FA module = (cond-update) then (fore/back-update)
+# - step1: WITH gate, update cond only (q=cond, kv=fore/back)
+# - step2: WITHOUT gate, keep original: update fore/back only (cond as KV)
 # -----------------------------
 class BoundFAModule(nn.Module):
     def __init__(
@@ -347,6 +374,7 @@ class BoundFAModule(nn.Module):
     ):
         super().__init__()
 
+        # step1: gate ON, update cond only
         self.step1 = TriFFTCrossAttention(
             ch=ch,
             time_ch=time_ch,
@@ -358,12 +386,13 @@ class BoundFAModule(nn.Module):
             radial_per_channel=radial_per_channel,
         )
 
+        # step2: gate OFF, keep original update fore/back
         self.step2 = TriFFTCrossAttention(
             ch=ch,
             time_ch=time_ch,
             heads=heads,
             head_dim=head_dim,
-            use_time_radial_gate=False,  # forced OFF
+            use_time_radial_gate=False,
             radial_p=radial_p,
             radial_alpha_init=radial_alpha_init,
             radial_per_channel=radial_per_channel,
@@ -375,11 +404,17 @@ class BoundFAModule(nn.Module):
         back: torch.Tensor,
         cond: torch.Tensor,
         t_emb: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        f0, b0 = fore, back
-        fore, back = self.step1(fore, back, cond, t_emb=t_emb)
-        fore, back = self.step2(fore, back, cond, t_emb=t_emb)
-        return fore + f0, back + b0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        f0, b0, c0 = fore, back, cond
+
+        # step1: update cond only (q=cond, kv=fore/back)
+        fore, back, cond = self.step1(fore, back, cond, t_emb=t_emb, update_fb=False, update_c=True)
+
+        # step2: keep original update for fore/back (cond only as KV)
+        fore, back, cond = self.step2(fore, back, cond, t_emb=t_emb, update_fb=True, update_c=False)
+
+        # outer residual (helps stability)
+        return fore + f0, back + b0, cond + c0
 
 
 # -----------------------------
@@ -506,13 +541,13 @@ class Config:
 
     deep_supervision: bool = False
 
-    # operator knobs (used by FA step1 only)
+    # operator knobs (used by step1 only)
     use_time_radial_gate: bool = True
     radial_p: float = 2.0
     radial_alpha_init: float = 0.0
     radial_per_channel: bool = False
 
-    # ✅ NEW: number of BoundFAModule stacked per location (default=2)
+    # number of BoundFAModule stacked per location
     fa_stacks: int = 2
 
 
@@ -531,10 +566,10 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         self.cfg = cfg
         self.time_mlp = TimeMLP(time_dim=cfg.time_dim, hidden_dim=cfg.time_dim)
 
-        # ✅ stems: no image concat
-        back_in_ch = 1               # x_back only
-        fore_in_ch = cfg.xt_in_ch - 1  # x_fore only
-        cond_in_ch = cfg.img_in_ch   # image only
+        # stems: no input concat
+        back_in_ch = 1
+        fore_in_ch = cfg.xt_in_ch - 1
+        cond_in_ch = cfg.img_in_ch
 
         self.back_stem = nn.Conv2d(back_in_ch, cfg.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(fore_in_ch, cfg.base_ch, 3, padding=1)
@@ -575,12 +610,10 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                 )
             return mods
 
-        # encoder-level FA insertion (same original positions)
         self.couple_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
             self.couple_modules[str(i)] = make_bound_fa_list(self.chs[i])
 
-        # bottleneck FA insertion (same original position)
         self.bottleneck_coupler = make_bound_fa_list(self.chs[-1]) if cfg.use_bottleneck_coupling else None
 
         # decoders
@@ -655,7 +688,6 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         x_back = x_t[:, 0:1]
         x_fore = x_t[:, 1:]
 
-        # no input cat
         back = self.back_stem(x_back)
         fore = self.fore_stem(x_fore)
         cond = self.cond_stem(image)
@@ -672,7 +704,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
             if level in self.attn_level_set:
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
-                    f_skip, b_skip = fa(f_skip, b_skip, c_skip, t_emb=t_emb)
+                    f_skip, b_skip, c_skip = fa(f_skip, b_skip, c_skip, t_emb=t_emb)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
@@ -680,7 +712,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
         if self.bottleneck_coupler is not None:
             for fa in self.bottleneck_coupler:
-                fore, back = fa(fore, back, cond, t_emb=t_emb)
+                fore, back, cond = fa(fore, back, cond, t_emb=t_emb)
 
         back_h = back
         fore_h = fore
@@ -733,7 +765,6 @@ def build_model(
     radial_p: float = 2.0,
     radial_alpha_init: float = 0.0,
     radial_per_channel: bool = False,
-    # ✅ NEW: BoundFAModule stack count (default=2)
     fa_stacks: int = 2,
 ) -> FMForeBackCondDeepKTriFFTDualDecoderResUNet:
     cfg = Config(
@@ -768,7 +799,7 @@ if __name__ == "__main__":
         xt_in_ch=4,
         base_ch=32,
         freq_attn_depth=2,
-        fa_stacks=2,  # ✅ default is 2; explicit here for clarity
+        fa_stacks=2,
         use_bottleneck_coupling=True,
         deep_supervision=True,
     )
