@@ -763,8 +763,9 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
         # bottleneck coupling (keeps original behavior: acts on main stream)
         if self.bottleneck_coupler is not None:
+            c_tmp = cond
             for fa in self.bottleneck_coupler:
-                fore, back, cond = fa(fore, back, cond, t_emb=t_emb)
+                fore, back, c_tmp = fa(fore, back, c_tmp, t_emb=t_emb)
 
         back_h = back
         fore_h = fore
