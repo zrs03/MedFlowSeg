@@ -1,16 +1,20 @@
 # ======================================================
-# test_medflowseg.py
+# test_medflowseg_staple_multiclass.py
 # Flow-Matching Medical Segmentation - Test / Inference
-# Threshold + Argmax decoding (SegDiff-style)
+# ✅ Multi-sample inference + One-vs-Rest STAPLE fusion (multi-class)
 #
-# ✅ EMA inference:
-# - If ckpt contains "ema_shadow" (saved by train script), load EMA weights by default.
-# - Fallback to normal "state_dict" weights if ema not found.
-# - You can force disable EMA with --no_ema
+# Notes:
+# - K times sampling per image (different noise seeds)
+# - Decode each sample to hard mask (your thresh+argmax)
+# - For each foreground class c: run binary STAPLE on (mask==c)
+# - Fuse by argmax over class-probabilities; set to background if max prob < bg_thresh
+#
+# ✅ EMA inference supported (ema_shadow preferred)
 # ======================================================
 
 import argparse
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,12 +35,13 @@ def sdf_to_mask_thresh_argmax_pred(sdf: torch.Tensor, thresh: float, fg_factor: 
     """
     Pred decoding: threshold + argmax (SegDiff-style).
     sdf: (B,C,H,W)
+    returns: (B,H,W) int64
     """
-    sdf_fg = sdf[:, 1:]
+    sdf_fg = sdf[:, 1:]  # (B,C-1,H,W)
     fg_bin = (sdf_fg <= (fg_factor * thresh)).to(torch.int8)
     bg = torch.zeros_like(fg_bin[:, :1])
-    m = torch.cat([bg, fg_bin], dim=1)
-    return torch.argmax(m, dim=1)
+    m = torch.cat([bg, fg_bin], dim=1)  # (B,C,H,W) in {0,1}
+    return torch.argmax(m, dim=1)       # (B,H,W)
 
 
 @torch.no_grad()
@@ -44,6 +49,7 @@ def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
     """
     GT decoding: signed distance => inside<=0.
     sdf_gt: (B,C,H,W)
+    returns: (B,H,W) int64
     """
     sdf_fg = sdf_gt[:, 1:]
     fg_bin = (sdf_fg <= 0.0).to(torch.int8)
@@ -53,10 +59,10 @@ def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int = 4) -> torch.Tensor:
+def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
     """
     Mean Dice over foreground classes only (1..num_classes-1).
-    pred, gt: (B,H,W)
+    pred, gt: (B,H,W) int
     """
     dices = []
     for c in range(1, num_classes):
@@ -69,10 +75,10 @@ def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int 
 
 
 @torch.no_grad()
-def mean_iou_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int = 4) -> torch.Tensor:
+def mean_iou_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
     """
     Mean IoU over foreground classes only (1..num_classes-1).
-    pred, gt: (B,H,W)
+    pred, gt: (B,H,W) int
     """
     ious = []
     for c in range(1, num_classes):
@@ -96,22 +102,130 @@ def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
 
 
 # ======================================================
+# STAPLE (Binary) + One-vs-Rest Multi-class Fusion
+# ======================================================
+@torch.no_grad()
+def staple_binary(
+    masks: torch.Tensor,
+    iters: int = 15,
+    eps: float = 1e-6,
+    init_s: float = 0.90,
+    init_t: float = 0.90,
+) -> torch.Tensor:
+    """
+    Binary STAPLE via EM (simplified, stable for K>=3).
+
+    masks: (K,H,W) float/bool/int in {0,1}
+    returns: p_fg (H,W) float in [0,1]
+    """
+    if masks.dim() != 3:
+        raise ValueError("masks must be (K,H,W)")
+    K, H, W = masks.shape
+    m = masks.reshape(K, -1).float()  # (K,N)
+    N = m.shape[1]
+
+    # init posterior with mean vote (better than 0.5 for imbalance)
+    p = m.mean(dim=0).clamp(eps, 1 - eps)  # (N,)
+    s = torch.full((K,), float(init_s), device=m.device)
+    t = torch.full((K,), float(init_t), device=m.device)
+
+    for _ in range(iters):
+        # E-step: compute p(z=1|m) per voxel
+        log_p1 = torch.zeros(N, device=m.device)
+        log_p0 = torch.zeros(N, device=m.device)
+
+        for i in range(K):
+            mi = m[i]
+            si = s[i].clamp(eps, 1 - eps)
+            ti = t[i].clamp(eps, 1 - eps)
+            # P(m|z=1): mi~Bernoulli(si)
+            log_p1 += mi * torch.log(si) + (1 - mi) * torch.log(1 - si)
+            # P(m|z=0): mi~Bernoulli(1-ti)  (because specificity ti = P(m=0|z=0))
+            log_p0 += mi * torch.log(1 - ti) + (1 - mi) * torch.log(ti)
+
+        log_prior1 = torch.log(p.clamp(eps, 1 - eps))
+        log_prior0 = torch.log((1 - p).clamp(eps, 1 - eps))
+
+        a = log_prior1 + log_p1
+        b = log_prior0 + log_p0
+        p_new = torch.sigmoid(a - b).clamp(eps, 1 - eps)
+
+        # M-step: update s_i, t_i
+        denom1 = p_new.sum().clamp_min(eps)
+        denom0 = (1 - p_new).sum().clamp_min(eps)
+
+        for i in range(K):
+            mi = m[i]
+            s[i] = ((p_new * mi).sum() / denom1).clamp(eps, 1 - eps)
+            t[i] = (((1 - p_new) * (1 - mi)).sum() / denom0).clamp(eps, 1 - eps)
+
+        p = p_new
+
+    return p.reshape(H, W)
+
+
+@torch.no_grad()
+def ovrr_staple_fuse_multiclass(
+    masks_k: torch.Tensor,
+    num_classes: int,
+    staple_iters: int = 15,
+    bg_thresh: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    One-vs-Rest STAPLE fusion for multi-class masks.
+
+    masks_k: (K,B,H,W) int in [0..C-1]
+    returns:
+      final_mask: (B,H,W) int
+      probs_fg: (B,C-1,H,W) float  # per-class (1..C-1) foreground probability
+    """
+    if masks_k.dim() != 4:
+        raise ValueError("masks_k must be (K,B,H,W)")
+    K, B, H, W = masks_k.shape
+    device = masks_k.device
+
+    probs = torch.zeros((B, num_classes - 1, H, W), device=device, dtype=torch.float32)
+
+    # for each fg class c: run binary STAPLE on K masks of (mask==c)
+    for c in range(1, num_classes):
+        # binary masks: (K,B,H,W) -> process per-sample B independently for simplicity
+        bin_k = (masks_k == c).to(torch.float32)
+
+        for b in range(B):
+            p_c = staple_binary(bin_k[:, b], iters=staple_iters)  # (H,W)
+            probs[b, c - 1] = p_c
+
+    # choose class by maximum probability among foreground classes
+    maxp, arg = probs.max(dim=1)         # (B,H,W), (B,H,W) in [0..C-2]
+    final = (arg + 1).to(torch.int64)    # map back to class id 1..C-1
+    final[maxp < bg_thresh] = 0          # background if no class is confident enough
+
+    return final, probs
+
+
+# ======================================================
 # Model wrapper (same network + sampling as train)
 # ======================================================
 class MedFlowSegTester(nn.Module):
-    def __init__(self, num_classes: int = 4, sample_steps: int = 10):
+    def __init__(self, num_classes: int = 4, sample_steps: int = 10, freq_attn_depth: int = 2):
         super().__init__()
         self.num_classes = num_classes
         self.sample_steps = sample_steps
-        self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=2)
+        self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth)
 
     @torch.no_grad()
-    def sample(self, image: torch.Tensor) -> torch.Tensor:
+    def sample(self, image: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
         """
         Euler integrate dx/dt = v_theta(x, image, t) from x(0)~N(0,I) to t=1.
         """
         B, _, H, W = image.shape
-        x = torch.randn(B, self.num_classes, H, W, device=image.device)
+
+        if seed is not None:
+            g = torch.Generator(device=image.device)
+            g.manual_seed(int(seed))
+            x = torch.randn(B, self.num_classes, H, W, device=image.device, generator=g)
+        else:
+            x = torch.randn(B, self.num_classes, H, W, device=image.device)
 
         dt = 1.0 / self.sample_steps
         for i in range(self.sample_steps):
@@ -122,9 +236,6 @@ class MedFlowSegTester(nn.Module):
 
 
 def _strip_prefixes(state: dict) -> dict:
-    """
-    Strip common Lightning prefixes to match model.net keys.
-    """
     new_state = {}
     for k, v in state.items():
         if k.startswith("model."):
@@ -137,22 +248,14 @@ def _strip_prefixes(state: dict) -> dict:
 
 
 def load_lightning_ckpt_into_model(model: MedFlowSegTester, ckpt_path: str, use_ema: bool = True) -> None:
-    """
-    Load Lightning .ckpt weights into our plain nn.Module wrapper.
-
-    ✅ If use_ema=True and ckpt contains "ema_shadow", load EMA weights.
-    ✅ Else fallback to ckpt["state_dict"].
-    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # 1) Try EMA
     if use_ema and isinstance(ckpt.get("ema_shadow", None), dict):
         ema_state = ckpt["ema_shadow"]
         state = _strip_prefixes(ema_state)
         missing, unexpected = model.net.load_state_dict(state, strict=False)
         print("[INFO] Loaded EMA weights from ckpt (ema_shadow).")
     else:
-        # 2) Fallback to normal weights
         state_raw = ckpt.get("state_dict", ckpt)
         state = _strip_prefixes(state_raw)
         missing, unexpected = model.net.load_state_dict(state, strict=False)
@@ -183,6 +286,12 @@ def run_test(
     fg_factor: float,
     max_vis: int,
     use_ema: bool,
+    # STAPLE
+    staple_k: int,
+    staple_iters: int,
+    bg_thresh: float,
+    base_seed: int,
+    freq_attn_depth: int,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
@@ -191,7 +300,6 @@ def run_test(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "vis").mkdir(parents=True, exist_ok=True)
 
-    # data
     loader = DataLoader(
         FolderDataset(data_root),
         batch_size=batch_size,
@@ -200,13 +308,16 @@ def run_test(
         pin_memory=True,
     )
 
-    # model
-    model = MedFlowSegTester(num_classes=num_classes, sample_steps=sample_steps).to(device)
+    model = MedFlowSegTester(
+        num_classes=num_classes,
+        sample_steps=sample_steps,
+        freq_attn_depth=freq_attn_depth,
+    ).to(device)
     load_lightning_ckpt_into_model(model, ckpt_path=ckpt, use_ema=use_ema)
     model.eval()
 
-    dices = []
-    ious = []
+    dices: List[float] = []
+    ious: List[float] = []
     vis_count = 0
 
     for bidx, batch in enumerate(loader):
@@ -214,17 +325,35 @@ def run_test(
         image = image.to(device, non_blocking=True)
         sdf_gt = sdf_gt.to(device, non_blocking=True)
 
-        sdf_pred = model.sample(image)
+        # ---------- K samples ----------
+        # collect K predicted hard masks for STAPLE
+        masks_k = []
+        for k in range(staple_k):
+            # different seed per (batch, k) for deterministic multi-sampling
+            seed = base_seed + (bidx * 1000) + k
+            sdf_pred_k = model.sample(image, seed=seed)  # (B,C,H,W)
+            mask_k = sdf_to_mask_thresh_argmax_pred(sdf_pred_k, thresh=thresh, fg_factor=fg_factor)  # (B,H,W)
+            masks_k.append(mask_k)
 
-        pred_mask = sdf_to_mask_thresh_argmax_pred(sdf_pred, thresh=thresh, fg_factor=fg_factor)
+        masks_k = torch.stack(masks_k, dim=0)  # (K,B,H,W)
+
+        # ---------- One-vs-Rest STAPLE fusion ----------
+        pred_mask, _probs = ovrr_staple_fuse_multiclass(
+            masks_k=masks_k,
+            num_classes=num_classes,
+            staple_iters=staple_iters,
+            bg_thresh=bg_thresh,
+        )
+
+        # GT
         gt_mask = sdf_to_mask_thresh_argmax_gt(sdf_gt)
 
         dice = mean_dice_foreground(pred_mask, gt_mask, num_classes=num_classes)
         iou = mean_iou_foreground(pred_mask, gt_mask, num_classes=num_classes)
-        dices.append(dice.item())
-        ious.append(iou.item())
+        dices.append(float(dice.item()))
+        ious.append(float(iou.item()))
 
-        # vis
+        # ---------- vis ----------
         if vis_count < max_vis:
             img_np = image.detach().cpu().numpy()[:, 0]
             pred_np = pred_mask.detach().cpu().numpy()
@@ -237,11 +366,11 @@ def run_test(
                 axs[0].axis("off")
 
                 axs[1].imshow(colorize_three_fg_else_black(gt_np[i]))
-                axs[1].set_title("GT (thresh+argmax)")
+                axs[1].set_title("GT")
                 axs[1].axis("off")
 
                 axs[2].imshow(colorize_three_fg_else_black(pred_np[i]))
-                axs[2].set_title("Pred (thresh+argmax)")
+                axs[2].set_title(f"Pred (OVR-STAPLE K={staple_k})")
                 axs[2].axis("off")
 
                 plt.tight_layout()
@@ -265,33 +394,38 @@ def run_test(
 
 
 def main():
-    parser = argparse.ArgumentParser("MedFlowSeg Test (Threshold+Argmax)")
+    parser = argparse.ArgumentParser("MedFlowSeg Test (Multi-sample + One-vs-Rest STAPLE)")
 
     parser.add_argument("--ckpt", type=str, required=True, help="path to lightning .ckpt")
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default="./dataset/ACDC/SDF/test",
-        help="e.g. ./dataset/ACDC/SDF/test or val",
-    )
-    parser.add_argument("--out_dir", type=str, default="./Outputs/MedFlowSeg_test")
+    parser.add_argument("--data_root", type=str, default="./dataset/REFUGE2/SDF/test")
+    parser.add_argument("--out_dir", type=str, default="./Outputs/MedFlowSeg_test_REFUGE2_STAPLE")
 
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--freq_attn_depth", type=int, default=2)
 
-    parser.add_argument("--thresh", type=float, default=0.01, help="pred threshold; sdf is normalized to [-1,1]")
-    parser.add_argument("--fg_factor", type=float, default=3.0, help="pred uses sdf <= fg_factor*thresh")
+    parser.add_argument("--thresh", type=float, default=0.01)
+    parser.add_argument("--fg_factor", type=float, default=3.0)
 
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
 
-    parser.add_argument("--max_vis", type=int, default=16, help="save at most N visualizations")
+    parser.add_argument("--max_vis", type=int, default=16)
 
-    # ✅ EMA: default ON, use --no_ema to disable
+    # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA inference (default: EMA on)")
+
+    # STAPLE
+    parser.add_argument("--staple_k", type=int, default=3, help="number of stochastic samples per image (>=3 recommended)")
+    parser.add_argument("--staple_iters", type=int, default=15, help="STAPLE EM iterations")
+    parser.add_argument("--bg_thresh", type=float, default=0.5, help="if max class prob < bg_thresh => background")
+    parser.add_argument("--base_seed", type=int, default=1234, help="base seed for deterministic multi-sampling")
 
     args = parser.parse_args()
     pl.seed_everything(42)
+
+    if args.staple_k < 2:
+        raise ValueError("--staple_k must be >= 2 (>=3 recommended for STAPLE stability)")
 
     run_test(
         ckpt=args.ckpt,
@@ -305,6 +439,11 @@ def main():
         fg_factor=args.fg_factor,
         max_vis=args.max_vis,
         use_ema=(not args.no_ema),
+        staple_k=args.staple_k,
+        staple_iters=args.staple_iters,
+        bg_thresh=args.bg_thresh,
+        base_seed=args.base_seed,
+        freq_attn_depth=args.freq_attn_depth,
     )
 
 
