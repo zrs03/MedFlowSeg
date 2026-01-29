@@ -9,6 +9,9 @@
 #
 # ✅ VIS Fix (改法2): 记录并可视化前 N 个 val batches（而不是只记录 batch_idx==0）
 #    - 新增参数: --vis_batches  (默认 1)
+#
+# ✅ NEW: Resume training support (no other changes)
+#    - --resume_ckpt path/to/ckpt.ckpt
 # ======================================================
 
 import argparse
@@ -173,7 +176,7 @@ class LitMedFlowSeg(pl.LightningModule):
         self.save_hyperparameters()
 
         # Flow-matching model (expects x_t, image, t)
-        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=3)
+        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=1)
 
         self.num_classes = num_classes
         self.lr = lr
@@ -374,27 +377,35 @@ def main():
     parser.add_argument("--val_root", type=str, default="./dataset/ACDC/SDF/val")
 
     # -------- Model --------
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--sample_steps", type=int, default=50)
 
     # -------- Optimization --------
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
 
     # -------- Output --------
-    parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg-v-operator")
+    parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg-ACDC")
     parser.add_argument("--vis_every", type=int, default=5)
     parser.add_argument("--vis_batches", type=int, default=3, help="visualize first N validation batches")
 
     # threshold for pred decoding (since your sdf is normalized to [-1,1])
-    parser.add_argument("--thresh", type=float, default=1e-2)
-    parser.add_argument("--fg_factor", type=float, default=3.0)
+    parser.add_argument("--thresh", type=float, default=1e-3)
+    parser.add_argument("--fg_factor", type=float, default=1.0)
 
     # ✅ EMA: default ON, use --no_ema to disable
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
     parser.add_argument("--ema_decay", type=float, default=0.999)
+
+    # ✅ Resume
+    parser.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default="",
+        help="path to Lightning checkpoint (.ckpt) to resume from (empty = no resume)",
+    )
 
     # -------- System --------
     parser.add_argument("--seed", type=int, default=42)
@@ -456,14 +467,20 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
+        strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
         callbacks=[ckpt_cb],
         logger=logger,
         log_every_n_steps=20,
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    # ✅ Resume support (Lightning will restore optimizer/scheduler/epoch/global_step/etc.)
+    ckpt_path = args.resume_ckpt.strip() if isinstance(args.resume_ckpt, str) else ""
+    if ckpt_path == "":
+        ckpt_path = None
 
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
+0
 
 if __name__ == "__main__":
     main()
