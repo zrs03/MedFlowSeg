@@ -9,10 +9,8 @@
     3) inject into fore/back by gated residual: x' = sigmoid(Conv1x1(c2)) * x + x
     4) downsample fore/back using injected x', and downsample cond using c1 (RAW)
 
-✅ Step1 cond FFT filter (Scheme-B UPDATED):
-    - Bases Br/Bi are generated FROM cond by conv (dynamic, per-sample), NO interpolation
-    - Mixing weights a are generated FROM BOTH (cond, t_emb)
-    - Compose Wr/Wi and complex-multiply on Cz (fftshift'ed)
+✅ Step1 cond FFT filter (Scheme-B) [REMOVED]:
+    - Modulator now applies on fore/back spectra (Fz/Bz), not on cond Cz.
 
 ✅ Change requested:
     - REMOVE last2_levels restriction
@@ -21,29 +19,34 @@
 
 ✅ Injection HP operator: Gaussian high-pass (FFT*g_hp -> IFFT), time-conditioned per-channel sigma
 
-✅ Decoder (NO concat):
+✅ Decoder (NO concat) original design:
     - g = sigmoid(Conv1x1(cond_skip)), skip' = skip * g
     - x = x + proj_skip(skip') + proj_cond(cond_skip)
     - then ResBlocks on x only
 
-✅ FAModule = step1(update cond only, optional cond FFT filter) + step2(update fore/back only, no filter)
+✅ FAModule = step1(update cond only) + step2(update fore/back only)
 
 ✅ Requested now:
     - 删除 cfg/Config，参数全部写在 build_model
 
 ✅ THIS CHANGE:
-    - 把原本删掉的 Norm 加回来：
-        * SpatialCrossAttention 的 norm_q / norm_kv
-        * FAModule 的 post+norm（post 用 GN+SiLU+Conv；再接一个 GN）
-    - 其他不改
+    - restore Norms:
+        * SpatialCrossAttention norm_q / norm_kv
+        * FAModule post+norm blocks
 
-✅ NEW CHANGE:
-    - CondTimeDynamicBasisComplexFreqModulator: a 由 (t_emb + u_cond + u_fore + u_back) 决定
-      * u_* 都是各自的 pool_net -> GAP 得到的全局向量
-      * 不直接 cat (B,C,H,W) 大特征，避免过强耦合/不稳定
+✅ NEW (LATEST):
+    - 把 fore/back 两套 modulator 参数合并到一个模块里：
+      DualForeBackTimeDynamicBasisComplexFreqModulator
+      apply(Fz,Bz,fore_feat,back_feat,t_emb) -> (Fz2,Bz2)
+      内部仍然是 fore/back 两套独立参数，不共享。
 
-✅ THIS REQUEST:
-    - 把所有 AttentionGate 全部删除（类 + decoder 使用处 + build_model 参数）
+✅ THIS REQUEST (NOW):
+    - decoder 改回 fore/back 分开两路 decoder
+      * encoder/FA/HP 仍然是 fore/back 两路
+      * decoder fore/back 两条：各自输入自己的 bottleneck feature
+      * skip 分开：fore 用 f_skip，back 用 b_skip
+      * cond skip 仍然是 RAW c1
+      * 输出 v = cat([v_back, v_fore])
 """
 
 from __future__ import annotations
@@ -190,7 +193,6 @@ class SpatialCrossAttention(nn.Module):
         self.out = nn.Conv2d(inner, q_ch, 1)
         self.scale = head_dim**-0.5
 
-        # ✅ restore original norms
         self.norm_q = GroupNorm32(q_ch)
         self.norm_kv = GroupNorm32(kv_ch)
 
@@ -211,7 +213,6 @@ class SpatialCrossAttention(nn.Module):
 
 # -----------------------------
 # Gaussian HP gate (time-conditioned per-channel sigma)
-# g_hp(r,t,c) = 1 - exp( -r^2 / (2*sigma(t,c)^2) )
 # -----------------------------
 class TimeGaussianHighPassGatePerChannel(nn.Module):
     def __init__(
@@ -252,20 +253,19 @@ class TimeGaussianHighPassGatePerChannel(nn.Module):
         yy, xx = torch.meshgrid(fy, fx, indexing="ij")
         r = torch.sqrt(xx * xx + yy * yy)
         r = r / (r.max().clamp_min(self.eps))
-        r = r[None, None, :, :]  # (1,1,H,W)
-
+        r = r[None, None, :, :]
         self._grid_cache[key] = r
         return r
 
     def forward(self, t_emb: torch.Tensor, h: int, w: int) -> torch.Tensor:
         b = t_emb.shape[0]
-        r = self._radius_grid(h, w, t_emb.device, t_emb.dtype)  # (1,1,H,W)
+        r = self._radius_grid(h, w, t_emb.device, t_emb.dtype)
 
-        sigma = torch.sigmoid(self.to_sigma(t_emb))  # (B,C)
+        sigma = torch.sigmoid(self.to_sigma(t_emb))
         sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * sigma
-        sigma = sigma.clamp_min(self.eps).view(b, self.ch, 1, 1)  # (B,C,1,1)
+        sigma = sigma.clamp_min(self.eps).view(b, self.ch, 1, 1)
 
-        g_hp = 1.0 - torch.exp(-(r * r) / (2.0 * sigma * sigma))  # (B,C,H,W)
+        g_hp = 1.0 - torch.exp(-(r * r) / (2.0 * sigma * sigma))
         return g_hp
 
 
@@ -296,7 +296,7 @@ class CondGaussianHighPassOperator(nn.Module):
             raise ValueError(f"CondGaussianHighPassOperator expected C={self.ch}, got {c}")
 
         Cz = torch.fft.fftshift(torch.fft.fft2(c1, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        g_hp = self.gate(t_emb, h, w).to(Cz.dtype)  # real -> complex dtype
+        g_hp = self.gate(t_emb, h, w).to(Cz.dtype)
         Cz = Cz * g_hp
         Cz = torch.fft.ifftshift(Cz, dim=(-2, -1))
         c2 = torch.fft.ifft2(Cz, dim=(-2, -1), norm="ortho").real
@@ -316,16 +316,19 @@ class CondGateResidual(nn.Module):
 
 
 # -----------------------------
-# Step1 Cond FFT Filter (Scheme-B)  ✅ a uses (cond + fore + back + t)
+# Step2 Fore/Back FFT Filter (Scheme-B) ✅ merged into ONE module (two independent param sets)
+# - bases depend on self feature only
+# - a depends on (t_emb, u_f, u_b)
+# - apply returns updated spectra (Fz2, Bz2)
 # -----------------------------
-class CondTimeDynamicBasisComplexFreqModulator(nn.Module):
+class DualForeBackTimeDynamicBasisComplexFreqModulator(nn.Module):
     def __init__(
         self,
         ch: int,
         time_ch: int,
         hw: Tuple[int, int],
         rank_r: int = 4,
-        cond_hidden: int = 64,
+        pool_hidden: int = 64,
         basis_hidden: int = 128,
     ):
         super().__init__()
@@ -338,105 +341,160 @@ class CondTimeDynamicBasisComplexFreqModulator(nn.Module):
         if self.rank_r < 1:
             raise ValueError("rank_r must be >= 1")
 
-        # Bases from cond only
-        self.basis_net = nn.Sequential(
+        a_hidden = max(32, 2 * self.rank_r)
+
+        # ---- fore params ----
+        self.fore_basis_net = nn.Sequential(
             nn.Conv2d(self.ch, basis_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
             nn.Conv2d(basis_hidden, basis_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
             nn.Conv2d(basis_hidden, 2 * self.rank_r * self.ch, 1, bias=True),
         )
-        nn.init.zeros_(self.basis_net[-1].weight)
-        nn.init.zeros_(self.basis_net[-1].bias)
+        nn.init.normal_(self.fore_basis_net[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.fore_basis_net[-1].bias)
 
-        # Pool nets for global summary (cond/fore/back)
-        self.cond_pool_net = nn.Sequential(
-            nn.Conv2d(self.ch, cond_hidden, 3, padding=1, bias=True),
+
+        self.fore_pool_f = nn.Sequential(
+            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
-            nn.Conv2d(cond_hidden, cond_hidden, 3, padding=1, bias=True),
+            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
         )
-        self.fore_pool_net = nn.Sequential(
-            nn.Conv2d(self.ch, cond_hidden, 3, padding=1, bias=True),
+        self.fore_pool_b = nn.Sequential(
+            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
-            nn.Conv2d(cond_hidden, cond_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-        )
-        self.back_pool_net = nn.Sequential(
-            nn.Conv2d(self.ch, cond_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(cond_hidden, cond_hidden, 3, padding=1, bias=True),
+            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
             nn.SiLU(),
         )
-
-        self.to_u = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1))
-
-        # a from (t_emb + u_cond + u_fore + u_back)
-        a_hidden = max(32, 2 * self.rank_r)
-        self.to_a = nn.Sequential(
+        self.fore_to_a = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_ch + 3 * cond_hidden, a_hidden),
+            nn.Linear(time_ch + 2 * pool_hidden, a_hidden),
             nn.SiLU(),
             nn.Linear(a_hidden, self.rank_r),
         )
-        nn.init.normal_(self.to_a[-1].weight, mean=0.0, std=1e-2)
-        nn.init.zeros_(self.to_a[-1].bias)
+        nn.init.normal_(self.fore_to_a[-1].weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.fore_to_a[-1].bias)
 
-    def apply(
-        self,
-        Cz: torch.Tensor,
-        cond_feat: torch.Tensor,
-        t_emb: Optional[torch.Tensor],
-        fore_feat: Optional[torch.Tensor] = None,
-        back_feat: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        b, c, h, w = Cz.shape
+        # ---- back params ----
+        self.back_basis_net = nn.Sequential(
+            nn.Conv2d(self.ch, basis_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(basis_hidden, basis_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(basis_hidden, 2 * self.rank_r * self.ch, 1, bias=True),
+        )
+        
+        nn.init.normal_(self.back_basis_net[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.back_basis_net[-1].bias)
+
+        self.back_pool_f = nn.Sequential(
+            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+        )
+        self.back_pool_b = nn.Sequential(
+            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
+            nn.SiLU(),
+        )
+        self.back_to_a = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_ch + 2 * pool_hidden, a_hidden),
+            nn.SiLU(),
+            nn.Linear(a_hidden, self.rank_r),
+        )
+        nn.init.normal_(self.back_to_a[-1].weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.back_to_a[-1].bias)
+
+        self.to_u = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1))
+
+    def _check_shapes(self, Z: torch.Tensor, feat: torch.Tensor, name: str):
+        b, c, h, w = Z.shape
         if c != self.ch:
-            raise ValueError(f"Modulator expected C={self.ch}, got {c}")
-        if h != self.h or w != self.w:
-            raise ValueError(
-                f"Modulator expected (H,W)=({self.h},{self.w}), got ({h},{w}). "
-                "NO interpolation; keep level resolution fixed."
-            )
-        if t_emb is None:
-            return Cz
-        if cond_feat.shape != (b, self.ch, self.h, self.w):
-            raise ValueError(f"cond_feat must be (B,{self.ch},{self.h},{self.w}), got {tuple(cond_feat.shape)}")
+            raise ValueError(f"{name}: expected C={self.ch}, got {c}")
+        if (h, w) != (self.h, self.w):
+            raise ValueError(f"{name}: expected (H,W)=({self.h},{self.w}), got ({h},{w}). NO interpolation.")
+        if feat.shape != (b, self.ch, self.h, self.w):
+            raise ValueError(f"{name}: feat must be (B,{self.ch},{self.h},{self.w}), got {tuple(feat.shape)}")
 
-        # bases from cond
-        bases = self.basis_net(cond_feat)  # (B, 2*R*C, H, W)
+    def _mod_one(
+        self,
+        Z: torch.Tensor,          # (B,C,H,W) complex, fftshift'ed
+        self_feat: torch.Tensor,  # (B,C,H,W) bases from this
+        fore_feat: torch.Tensor,
+        back_feat: torch.Tensor,
+        t_emb: torch.Tensor,
+        basis_net: nn.Module,
+        pool_f: nn.Module,
+        pool_b: nn.Module,
+        to_a: nn.Module,
+    ) -> torch.Tensor:
+        b, _, _, _ = Z.shape
+
+        bases = basis_net(self_feat)  # (B, 2*R*C, H, W)
         bases = bases.view(b, 2, self.rank_r, self.ch, self.h, self.w)
         Br = bases[:, 0]  # (B,R,C,H,W)
         Bi = bases[:, 1]  # (B,R,C,H,W)
 
-        # global summaries
-        u_c = self.to_u(self.cond_pool_net(cond_feat))  # (B,cond_hidden)
+        u_f = self.to_u(pool_f(fore_feat))
+        u_b = self.to_u(pool_b(back_feat))
 
-        if fore_feat is None:
-            u_f = torch.zeros_like(u_c)
-        else:
-            if fore_feat.shape != (b, self.ch, self.h, self.w):
-                raise ValueError(f"fore_feat must be (B,{self.ch},{self.h},{self.w}), got {tuple(fore_feat.shape)}")
-            u_f = self.to_u(self.fore_pool_net(fore_feat))  # (B,cond_hidden)
+        a = to_a(torch.cat([t_emb, u_f, u_b], dim=1))  # (B,R)
 
-        if back_feat is None:
-            u_b = torch.zeros_like(u_c)
-        else:
-            if back_feat.shape != (b, self.ch, self.h, self.w):
-                raise ValueError(f"back_feat must be (B,{self.ch},{self.h},{self.w}), got {tuple(back_feat.shape)}")
-            u_b = self.to_u(self.back_pool_net(back_feat))  # (B,cond_hidden)
-
-        # a from [t_emb, u_cond, u_fore, u_back]
-        a = self.to_a(torch.cat([t_emb, u_c, u_f, u_b], dim=1))  # (B,R)
         Cr = 1.0 + torch.einsum("br,brchw->bchw", a, Br)
         Ci = torch.einsum("br,brchw->bchw", a, Bi)
+        W = torch.complex(Cr, Ci)
 
-        # NOTE: keep behavior as your current code (returns complex weights)
-        return torch.complex(Cr, Ci)
+        # ✅ 正确：频域调制要作用在谱 Z 上
+        return Z * W
+
+    def apply(
+        self,
+        Fz: torch.Tensor,
+        Bz: torch.Tensor,
+        fore_feat: torch.Tensor,
+        back_feat: torch.Tensor,
+        t_emb: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if t_emb is None:
+            return Fz, Bz
+
+        self._check_shapes(Fz, fore_feat, "fore")
+        self._check_shapes(Bz, back_feat, "back")
+        if fore_feat.shape != back_feat.shape:
+            raise ValueError(f"fore_feat/back_feat mismatch: {tuple(fore_feat.shape)} vs {tuple(back_feat.shape)}")
+
+        Fz2 = self._mod_one(
+            Fz,
+            self_feat=fore_feat,
+            fore_feat=fore_feat,
+            back_feat=back_feat,
+            t_emb=t_emb,
+            basis_net=self.fore_basis_net,
+            pool_f=self.fore_pool_f,
+            pool_b=self.fore_pool_b,
+            to_a=self.fore_to_a,
+        )
+        Bz2 = self._mod_one(
+            Bz,
+            self_feat=back_feat,
+            fore_feat=fore_feat,
+            back_feat=back_feat,
+            t_emb=t_emb,
+            basis_net=self.back_basis_net,
+            pool_f=self.back_pool_f,
+            pool_b=self.back_pool_b,
+            to_a=self.back_to_a,
+        )
+        return Fz2, Bz2
 
 
 # -----------------------------
 # FA module  ✅ restore post+norm blocks
+# - fb_filter applies on spectra only when update_fb=True (step2)
 # -----------------------------
 class FAModule(nn.Module):
     def __init__(
@@ -445,11 +503,11 @@ class FAModule(nn.Module):
         time_ch: int,
         heads: int,
         head_dim: int,
-        cond_filter: Optional[nn.Module] = None,
+        fb_filter: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.ch = ch
-        self.cond_filter = cond_filter
+        self.fb_filter = fb_filter
 
         # step1
         self.s1_attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
@@ -491,19 +549,6 @@ class FAModule(nn.Module):
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
-    def _apply_cond_filter(
-        self,
-        Cz: torch.Tensor,
-        cond_feat: torch.Tensor,
-        fore_feat: torch.Tensor,
-        back_feat: torch.Tensor,
-        t_emb: Optional[torch.Tensor],
-        filt: Optional[nn.Module],
-    ) -> torch.Tensor:
-        if filt is None:
-            return Cz
-        return filt.apply(Cz, cond_feat, t_emb, fore_feat=fore_feat, back_feat=back_feat)
-
     def _tri_fft_pass(
         self,
         fore: torch.Tensor,
@@ -512,7 +557,6 @@ class FAModule(nn.Module):
         t_emb: Optional[torch.Tensor],
         update_fb: bool,
         update_c: bool,
-        cond_fft_filter: Optional[nn.Module],
         attn_fb: SpatialCrossAttention,
         attn_fc: SpatialCrossAttention,
         attn_bc: SpatialCrossAttention,
@@ -529,7 +573,8 @@ class FAModule(nn.Module):
         Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-        Cz = self._apply_cond_filter(Cz, cond, fore, back, t_emb, cond_fft_filter)
+        if update_fb and (self.fb_filter is not None):
+            Fz, Bz = self.fb_filter.apply(Fz, Bz, fore_feat=fore, back_feat=back, t_emb=t_emb)
 
         Fri = self._to_ri(Fz)
         Bri = self._to_ri(Bz)
@@ -572,7 +617,7 @@ class FAModule(nn.Module):
         cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # step1: update cond only (optional cond FFT filter)
+        # step1: update cond only
         fore, back, cond = self._tri_fft_pass(
             fore,
             back,
@@ -580,7 +625,6 @@ class FAModule(nn.Module):
             t_emb,
             update_fb=False,
             update_c=True,
-            cond_fft_filter=self.cond_filter,
             attn_fb=self.s1_attn_fb,
             attn_fc=self.s1_attn_fc,
             attn_bc=self.s1_attn_bc,
@@ -594,7 +638,7 @@ class FAModule(nn.Module):
             norm_c=self.s1_norm_c,
         )
 
-        # step2: update fore/back only (no filter)
+        # step2: update fore/back only (fb_filter applies here)
         fore, back, cond = self._tri_fft_pass(
             fore,
             back,
@@ -602,7 +646,6 @@ class FAModule(nn.Module):
             t_emb,
             update_fb=True,
             update_c=False,
-            cond_fft_filter=None,
             attn_fb=self.s2_attn_fb,
             attn_fc=self.s2_attn_fc,
             attn_bc=self.s2_attn_bc,
@@ -639,7 +682,7 @@ class EncoderStageFiLM(nn.Module):
 
 
 # -----------------------------
-# Decoder stage (NO concat, NO attention gate)  ✅ gate removed
+# Decoder stage (single-stream)  (for fore or back)
 # -----------------------------
 class DecoderStageCondAdd(nn.Module):
     def __init__(
@@ -656,7 +699,6 @@ class DecoderStageCondAdd(nn.Module):
         super().__init__()
         self.up = Upsample(in_ch) if up else None
 
-        # (AttentionGate removed) keep rest the same
         self.cond_to_skip_gate = nn.Conv2d(cond_ch, skip_ch, 1, bias=True)
 
         self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
@@ -673,8 +715,6 @@ class DecoderStageCondAdd(nn.Module):
         if self.up is not None:
             x = self.up(x)
 
-        # (AttentionGate removed) no gating by x/skip
-
         g = torch.sigmoid(self.cond_to_skip_gate(cond_skip))  # (B,skip_ch,H,W)
         skip_p = skip * g
 
@@ -686,7 +726,7 @@ class DecoderStageCondAdd(nn.Module):
 
 
 # -----------------------------
-# Main Network (NO cfg)
+# Main Network (NO cfg)  ✅ fore/back dual decoders
 # -----------------------------
 class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
     def __init__(
@@ -709,7 +749,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         hp_sigma_min: float,
         hp_sigma_max: float,
         hp_sigma_init: float,
-        use_step1_cond_freq_mod: bool,
+        use_step1_cond_freq_mod: bool,  # now means "use fb_filter at FA levels"
         freq_mod_rank_list: Optional[Tuple[int, ...]],
     ):
         super().__init__()
@@ -796,11 +836,16 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         def make_fa_list(level: int, ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
 
-            cond_filter = None
+            fb_filter = None
             rank_r = rank_for_fa_level(level)
             if rank_r is not None and rank_r > 0:
                 hL, wL = level_hw(level)
-                cond_filter = CondTimeDynamicBasisComplexFreqModulator(ch=ch, time_ch=self.time_dim, hw=(hL, wL), rank_r=rank_r)
+                fb_filter = DualForeBackTimeDynamicBasisComplexFreqModulator(
+                    ch=ch,
+                    time_ch=self.time_dim,
+                    hw=(hL, wL),
+                    rank_r=rank_r,
+                )
 
             for _ in range(self.fa_stacks):
                 mods.append(
@@ -809,7 +854,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                         time_ch=self.time_dim,
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
-                        cond_filter=cond_filter,
+                        fb_filter=fb_filter,
                     )
                 )
             return mods
@@ -839,17 +884,18 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
             self.cond_gate_fore[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
             self.cond_gate_back[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
 
-        # decoders
-        self.back_dec = nn.ModuleList()
-        self.fore_dec = nn.ModuleList()
+        # ✅ Dual decoders: fore and back separately (NO concat)
+        self.dec_fore = nn.ModuleList()
+        self.dec_back = nn.ModuleList()
         for i in reversed(range(n_levels)):
-            skip_ch = self.chs[i]
+            skip_ch = self.chs[i]    # fore/back skip is single-stream
             cond_ch = self.chs[i]
+
             in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
 
-            self.back_dec.append(
+            self.dec_fore.append(
                 DecoderStageCondAdd(
                     in_ch=in_ch,
                     skip_ch=skip_ch,
@@ -861,7 +907,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                     dropout=self.dropout,
                 )
             )
-            self.fore_dec.append(
+            self.dec_back.append(
                 DecoderStageCondAdd(
                     in_ch=in_ch,
                     skip_ch=skip_ch,
@@ -874,7 +920,9 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                 )
             )
 
-        self.out_conv = nn.Conv2d(self.base_ch * 2, self.xt_in_ch, 3, padding=1)
+        # heads
+        self.out_back = nn.Conv2d(self.base_ch, 1, 3, padding=1)
+        self.out_fore = nn.Conv2d(self.base_ch, self.xt_in_ch - 1, 3, padding=1)
 
     def forward(
         self,
@@ -898,8 +946,8 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         fore = self.fore_stem(x_fore)
         cond = self.cond_stem(image)
 
-        back_skips: List[torch.Tensor] = []
         fore_skips: List[torch.Tensor] = []
+        back_skips: List[torch.Tensor] = []
         cond_skips: List[torch.Tensor] = []
 
         for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
@@ -913,7 +961,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
             b_main, f_main, c_main = b_skip, f_skip, c1
 
-            # FA
+            # FA (updates f_main/b_main; internal c_tmp updated but we keep RAW c1 for skip/down)
             if level in self.attn_level_set:
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 c_tmp = c_main
@@ -941,23 +989,30 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                 fore, back, c_tmp = fa(fore, back, c_tmp, t_emb=t_emb)
             cond = c_tmp
 
-        # Decoder
-        back_h = back
-        fore_h = fore
-        for dec_b, dec_f, b_skip, f_skip, c_skip in zip(
-            self.back_dec, self.fore_dec, reversed(back_skips), reversed(fore_skips), reversed(cond_skips)
+        # dual decoders
+        h_f = fore
+        h_b = back
+        for dec_f, dec_b, f_skip, b_skip, c_skip in zip(
+            self.dec_fore,
+            self.dec_back,
+            reversed(fore_skips),
+            reversed(back_skips),
+            reversed(cond_skips),
         ):
-            back_h = dec_b(back_h, b_skip, c_skip, t_emb)
-            fore_h = dec_f(fore_h, f_skip, c_skip, t_emb)
+            h_f = dec_f(h_f, f_skip, c_skip, t_emb)
+            h_b = dec_b(h_b, b_skip, c_skip, t_emb)
 
-        h = torch.cat([fore_h, back_h], dim=1)
-        h = F.silu(h)
-        v = self.out_conv(h)
+        h_f = F.silu(h_f)
+        h_b = F.silu(h_b)
+
+        v_fore = self.out_fore(h_f)
+        v_back = self.out_back(h_b)
+        v = torch.cat([v_back, v_fore], dim=1)
         return v
 
 
 # -----------------------------
-# Factory (all params here)  ✅ removed use_attn_gated_skip
+# Factory (all params here)
 # -----------------------------
 def build_model(
     image_hw: Tuple[int, int] = (256, 256),
@@ -978,7 +1033,7 @@ def build_model(
     hp_sigma_max: float = 0.50,
     hp_sigma_init: float = 0.15,
     use_step1_cond_freq_mod: bool = True,
-    freq_mod_rank_list: Optional[Sequence[int]] = (64,),
+    freq_mod_rank_list: Optional[Sequence[int]] = (8,),
 ) -> FMForeBackCondDeepKTriFFTDualDecoderResUNet:
     return FMForeBackCondDeepKTriFFTDualDecoderResUNet(
         image_hw=tuple(image_hw),
