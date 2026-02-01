@@ -4,30 +4,18 @@
 ✅ REMOVE Modulator entirely (NO rank / NO basis decomposition)
 ✅ Keep frequency-domain attention ops:
     - (CHANGED,方案B) 直接从 f_in/b_in 预测更新后的 Fri/Bri（不再做 mask 乘法）
-    - TriFFT attention updates fore/back using cond as KV (cond not updated)
+    - TriFFT attention updates fore/back using cond as KV
 
-✅ HP inject: unchanged
-✅ NEW: add a Cond Decoder (U-Net style)
-    - Cond decoder connects to cond encoder via skip connections
-    - Shared decoder NO LONGER uses cond encoder skips
-    - Shared decoder now uses cond decoder features (per-level)
-
+✅ REMOVE (requested): CondGaussianHighPassOperator + TimeGaussianHighPassGatePerChannel + CondGateResidual
+    - 删除所有 HP inject 相关代码与参数
+✅ Cond Decoder: unchanged
 ✅ Decoder: concat(back, fore) -> single decoder -> output v directly
-✅ Decoder stage: direct add cond_skip (no gate)   (now cond_skip comes from cond decoder)
-
-(方案B说明)
-- 去掉 Mf/Mb mask 分支（sigmoid mask + apply_mask_to_complex）
-- 改为：
-    Fri,Bri,Cri = to_ri(Fz),to_ri(Bz),to_ri(Cz)
-    f_in = cat([Fri,Cri]) -> Head_f -> Fri_new   (B,2C,H,W)
-    b_in = cat([Bri,Cri]) -> Head_b -> Bri_new   (B,2C,H,W)
-  然后进入三角交互 (fb/fc/bc) 不变
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -189,109 +177,6 @@ class SpatialCrossAttention(nn.Module):
 
 
 # -----------------------------
-# Gaussian HP gate (time-conditioned per-channel sigma)
-# -----------------------------
-class TimeGaussianHighPassGatePerChannel(nn.Module):
-    def __init__(
-        self,
-        ch: int,
-        time_ch: int,
-        sigma_min: float = 0.05,
-        sigma_max: float = 0.50,
-        sigma_init: float = 0.15,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.ch = int(ch)
-        self.sigma_min = float(sigma_min)
-        self.sigma_max = float(sigma_max)
-        self.eps = float(eps)
-
-        self.to_sigma = nn.Linear(time_ch, self.ch)
-
-        sigma_init = min(max(sigma_init, sigma_min + 1e-6), sigma_max - 1e-6)
-        s = (sigma_init - sigma_min) / (sigma_max - sigma_min)
-        bias = math.log(s / (1.0 - s))
-        nn.init.constant_(self.to_sigma.weight, 0.0)
-        nn.init.constant_(self.to_sigma.bias, bias)
-
-        self._grid_cache: Dict[Tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
-
-    def _radius_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        key = (h, w, device, dtype)
-        if key in self._grid_cache:
-            return self._grid_cache[key]
-
-        fy = torch.fft.fftfreq(h, d=1.0, device=device, dtype=dtype)
-        fx = torch.fft.fftfreq(w, d=1.0, device=device, dtype=dtype)
-        fy = torch.fft.fftshift(fy)
-        fx = torch.fft.fftshift(fx)
-
-        yy, xx = torch.meshgrid(fy, fx, indexing="ij")
-        r = torch.sqrt(xx * xx + yy * yy)
-        r = r / (r.max().clamp_min(self.eps))
-        r = r[None, None, :, :]
-        self._grid_cache[key] = r
-        return r
-
-    def forward(self, t_emb: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        r = self._radius_grid(h, w, t_emb.device, t_emb.dtype)
-
-        sigma = torch.sigmoid(self.to_sigma(t_emb))
-        sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * sigma
-        sigma = sigma.clamp_min(self.eps).view(t_emb.shape[0], self.ch, 1, 1)
-
-        g_hp = 1.0 - torch.exp(-(r * r) / (2.0 * sigma * sigma))
-        return g_hp
-
-
-class CondGaussianHighPassOperator(nn.Module):
-    """Injection HP: c2 = IFFT( FFT(c1) * g_hp ).real"""
-
-    def __init__(
-        self,
-        ch: int,
-        time_ch: int,
-        sigma_min: float = 0.05,
-        sigma_max: float = 0.50,
-        sigma_init: float = 0.15,
-    ):
-        super().__init__()
-        self.ch = int(ch)
-        self.gate = TimeGaussianHighPassGatePerChannel(
-            ch=self.ch,
-            time_ch=time_ch,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            sigma_init=sigma_init,
-        )
-
-    def forward(self, c1: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = c1.shape
-        if c != self.ch:
-            raise ValueError(f"CondGaussianHighPassOperator expected C={self.ch}, got {c}")
-
-        Cz = torch.fft.fftshift(torch.fft.fft2(c1, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        g_hp = self.gate(t_emb, h, w).to(Cz.dtype)
-        Cz = Cz * g_hp
-        Cz = torch.fft.ifftshift(Cz, dim=(-2, -1))
-        c2 = torch.fft.ifft2(Cz, dim=(-2, -1), norm="ortho").real
-        return c2
-
-
-class CondGateResidual(nn.Module):
-    """x' = sigmoid(Conv1x1(cond_hp))*x + x"""
-
-    def __init__(self, x_ch: int, cond_ch: int):
-        super().__init__()
-        self.proj = nn.Conv2d(cond_ch, x_ch, 1, bias=True)
-
-    def forward(self, x: torch.Tensor, cond_hp: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.proj(cond_hp))
-        return gate * x + x
-
-
-# -----------------------------
 # (方案B) Frequency-domain direct head: from (Fri,Cri)->Fri'  (FiLM conditioned on time)
 # 输入: (B,4C,H,W) 输出: (B,2C,H,W)
 # -----------------------------
@@ -301,20 +186,15 @@ class FreqDirectHeadFiLM(nn.Module):
         self.ch = int(ch)
         hid = int(hidden_mult * ch)
 
-        # in: 4C  -> hid
         self.in_norm = GroupNorm32(4 * ch)
         self.conv_in = nn.Conv2d(4 * ch, hid, 3, padding=1)
 
-        # FiLM on hid
         self.hid_norm = GroupNorm32(hid)
         self.to_film = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * hid))
 
         self.conv_mid = nn.Conv2d(hid, hid, 3, padding=1)
-
-        # out: hid -> 2C (直接预测新的 Fri/Bri)
         self.conv_out = nn.Conv2d(hid, 2 * ch, 1)
 
-        # 小初始化：避免一上来把频谱打爆
         nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.conv_out.bias)
 
@@ -334,6 +214,7 @@ class FreqDirectHeadFiLM(nn.Module):
 
 # -----------------------------
 # FA module (one-pass) + (方案B) direct freq update
+# (cond not updated here; it is used as KV only)
 # -----------------------------
 class FAModule(nn.Module):
     def __init__(
@@ -342,7 +223,7 @@ class FAModule(nn.Module):
         time_ch: int,
         heads: int,
         head_dim: int,
-        noise_strength: float = 1.0,  # 兼容保留，但方案B不再使用
+        noise_strength: float = 1.0,  # kept for compatibility, unused in方案B
     ):
         super().__init__()
         self.ch = int(ch)
@@ -357,7 +238,6 @@ class FAModule(nn.Module):
         self.norm_f = GroupNorm32(2 * ch)
         self.norm_b = GroupNorm32(2 * ch)
 
-        # (方案B) 直接预测新的 Fri/Bri
         self.direct_head_f = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
         self.direct_head_b = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
 
@@ -414,7 +294,7 @@ class FAModule(nn.Module):
         fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
         back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
 
-        # cond 不更新
+        # cond stays unchanged
         return fore_out, back_out, cond
 
 
@@ -538,10 +418,6 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         freq_attn_depth: int,
         use_bottleneck_coupling: bool,
         fa_stacks: int,
-        hp_inject_depth: int,
-        hp_sigma_min: float,
-        hp_sigma_max: float,
-        hp_sigma_init: float,
         noise_strength: float = 1.0,
     ):
         super().__init__()
@@ -566,10 +442,6 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.freq_attn_depth = int(freq_attn_depth)
         self.use_bottleneck_coupling = bool(use_bottleneck_coupling)
         self.fa_stacks = int(fa_stacks)
-        self.hp_inject_depth = int(hp_inject_depth)
-        self.hp_sigma_min = float(hp_sigma_min)
-        self.hp_sigma_max = float(hp_sigma_max)
-        self.hp_sigma_init = float(hp_sigma_init)
         self.noise_strength = float(noise_strength)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
@@ -620,25 +492,6 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
             self.couple_modules[str(i)] = make_fa_list(self.chs[i])
 
         self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
-
-        # HP inject levels
-        K_hp = min(self.hp_inject_depth, n_levels)
-        self.hp_level_set = set(range(0, K_hp))
-
-        self.cond_hp_ops = nn.ModuleDict()
-        self.cond_gate_fore = nn.ModuleDict()
-        self.cond_gate_back = nn.ModuleDict()
-        for i in sorted(self.hp_level_set):
-            ch = self.chs[i]
-            self.cond_hp_ops[str(i)] = CondGaussianHighPassOperator(
-                ch=ch,
-                time_ch=self.time_dim,
-                sigma_min=self.hp_sigma_min,
-                sigma_max=self.hp_sigma_max,
-                sigma_init=self.hp_sigma_init,
-            )
-            self.cond_gate_fore[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
-            self.cond_gate_back[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
 
         # cond decoder (mirror of cond encoder)
         self.cond_dec = nn.ModuleList()
@@ -730,16 +583,6 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
                 for fa in fa_list:
                     f_main, b_main, _ = fa(f_main, b_main, c_main, t_emb=t_emb)
 
-            # HP inject (uses RAW c1)
-            if level in self.hp_level_set:
-                hp_op = self.cond_hp_ops[str(level)]
-                gate_f = self.cond_gate_fore[str(level)]
-                gate_b = self.cond_gate_back[str(level)]
-
-                c2 = hp_op(c1, t_emb)
-                f_main = gate_f(f_main, c2)
-                b_main = gate_b(b_main, c2)
-
             back = enc_b.down(b_main) if enc_b.down is not None else b_main
             fore = enc_f.down(f_main) if enc_f.down is not None else f_main
             cond = enc_c.down(c_main) if enc_c.down is not None else c_main
@@ -794,10 +637,6 @@ def build_model(
     freq_attn_depth: int = 1,
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 1,
-    hp_inject_depth: int = 1,
-    hp_sigma_min: float = 0.05,
-    hp_sigma_max: float = 0.50,
-    hp_sigma_init: float = 0.15,
     noise_strength: float = 1.0,
 ) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet:
     return FMForeBackCondDeepKTriFFTSingleDecoderResUNet(
@@ -814,10 +653,6 @@ def build_model(
         freq_attn_depth=freq_attn_depth,
         use_bottleneck_coupling=use_bottleneck_coupling,
         fa_stacks=fa_stacks,
-        hp_inject_depth=hp_inject_depth,
-        hp_sigma_min=hp_sigma_min,
-        hp_sigma_max=hp_sigma_max,
-        hp_sigma_init=hp_sigma_init,
         noise_strength=noise_strength,
     )
 
@@ -832,7 +667,6 @@ if __name__ == "__main__":
         freq_attn_depth=2,
         fa_stacks=2,
         use_bottleneck_coupling=True,
-        hp_inject_depth=1,
         noise_strength=1.0,
     )
 
