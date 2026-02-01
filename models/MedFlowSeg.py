@@ -1,58 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-✅ Keep TriFFT attention (frequency-domain cross-attention) for FA.
-✅ REMOVE original high-frequency gate inside TriFFT attention.
+✅ FA: one-pass (no step1), fore/back updated using cond as KV
+✅ REMOVE Modulator entirely (NO rank / NO basis decomposition)
+✅ Keep frequency-domain attention ops:
+    - (CHANGED,方案B) 直接从 f_in/b_in 预测更新后的 Fri/Bri（不再做 mask 乘法）
+    - TriFFT attention updates fore/back using cond as KV (cond not updated)
 
-✅ Keep: Per-level Cond High-pass + Gated Residual Injection (NO concat)
-    1) cond encoder produces c1 (RAW, used for skip)
-    2) c1 -> HP operator -> c2 (per-level params, NOT shared)
-    3) inject into fore/back by gated residual: x' = sigmoid(Conv1x1(c2)) * x + x
-    4) downsample fore/back using injected x', and downsample cond using c1 (RAW)
+✅ HP inject: unchanged
+✅ NEW: add a Cond Decoder (U-Net style)
+    - Cond decoder connects to cond encoder via skip connections
+    - Shared decoder NO LONGER uses cond encoder skips
+    - Shared decoder now uses cond decoder features (per-level)
 
-✅ Step1 cond FFT filter (Scheme-B) [REMOVED]:
-    - Modulator now applies on fore/back spectra (Fz/Bz), not on cond Cz.
+✅ Decoder: concat(back, fore) -> single decoder -> output v directly
+✅ Decoder stage: direct add cond_skip (no gate)   (now cond_skip comes from cond decoder)
 
-✅ Change requested:
-    - REMOVE last2_levels restriction
-    - If a level has FA module, it may use modulator
-    - Use freq_mod_rank_list instead of single freq_mod_rank
-
-✅ Injection HP operator: Gaussian high-pass (FFT*g_hp -> IFFT), time-conditioned per-channel sigma
-
-✅ Decoder (NO concat) original design:
-    - g = sigmoid(Conv1x1(cond_skip)), skip' = skip * g
-    - x = x + proj_skip(skip') + proj_cond(cond_skip)
-    - then ResBlocks on x only
-
-✅ FAModule = step1(update cond only) + step2(update fore/back only)
-
-✅ Requested now:
-    - 删除 cfg/Config，参数全部写在 build_model
-
-✅ THIS CHANGE:
-    - restore Norms:
-        * SpatialCrossAttention norm_q / norm_kv
-        * FAModule post+norm blocks
-
-✅ NEW (LATEST):
-    - 把 fore/back 两套 modulator 参数合并到一个模块里：
-      DualForeBackTimeDynamicBasisComplexFreqModulator
-      apply(Fz,Bz,fore_feat,back_feat,t_emb) -> (Fz2,Bz2)
-      内部仍然是 fore/back 两套独立参数，不共享。
-
-✅ THIS REQUEST (NOW):
-    - decoder 改回 fore/back 分开两路 decoder
-      * encoder/FA/HP 仍然是 fore/back 两路
-      * decoder fore/back 两条：各自输入自己的 bottleneck feature
-      * skip 分开：fore 用 f_skip，back 用 b_skip
-      * cond skip 仍然是 RAW c1
-      * 输出 v = cat([v_back, v_fore])
+(方案B说明)
+- 去掉 Mf/Mb mask 分支（sigmoid mask + apply_mask_to_complex）
+- 改为：
+    Fri,Bri,Cri = to_ri(Fz),to_ri(Bz),to_ri(Cz)
+    f_in = cat([Fri,Cri]) -> Head_f -> Fri_new   (B,2C,H,W)
+    b_in = cat([Bri,Cri]) -> Head_b -> Bri_new   (B,2C,H,W)
+  然后进入三角交互 (fb/fc/bc) 不变
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -207,7 +182,9 @@ class SpatialCrossAttention(nn.Module):
         v = self.to_v(c).view(b, self.heads, self.head_dim, h * w)
 
         attn = torch.einsum("bhdi,bhdj->bhij", q * self.scale, k).softmax(dim=-1)
-        out = torch.einsum("bhij,bhdj->bhdi", attn, v).reshape(b, self.heads * self.head_dim, h, w)
+        out = torch.einsum("bhij,bhdj->bhdi", attn, v).reshape(
+            b, self.heads * self.head_dim, h, w
+        )
         return self.out(out)
 
 
@@ -258,12 +235,11 @@ class TimeGaussianHighPassGatePerChannel(nn.Module):
         return r
 
     def forward(self, t_emb: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        b = t_emb.shape[0]
         r = self._radius_grid(h, w, t_emb.device, t_emb.dtype)
 
         sigma = torch.sigmoid(self.to_sigma(t_emb))
         sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * sigma
-        sigma = sigma.clamp_min(self.eps).view(b, self.ch, 1, 1)
+        sigma = sigma.clamp_min(self.eps).view(t_emb.shape[0], self.ch, 1, 1)
 
         g_hp = 1.0 - torch.exp(-(r * r) / (2.0 * sigma * sigma))
         return g_hp
@@ -316,185 +292,48 @@ class CondGateResidual(nn.Module):
 
 
 # -----------------------------
-# Step2 Fore/Back FFT Filter (Scheme-B) ✅ merged into ONE module (two independent param sets)
-# - bases depend on self feature only
-# - a depends on (t_emb, u_f, u_b)
-# - apply returns updated spectra (Fz2, Bz2)
+# (方案B) Frequency-domain direct head: from (Fri,Cri)->Fri'  (FiLM conditioned on time)
+# 输入: (B,4C,H,W) 输出: (B,2C,H,W)
 # -----------------------------
-class DualForeBackTimeDynamicBasisComplexFreqModulator(nn.Module):
-    def __init__(
-        self,
-        ch: int,
-        time_ch: int,
-        hw: Tuple[int, int],
-        rank_r: int = 4,
-        pool_hidden: int = 64,
-        basis_hidden: int = 128,
-    ):
+class FreqDirectHeadFiLM(nn.Module):
+    def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
         super().__init__()
         self.ch = int(ch)
-        self.h, self.w = int(hw[0]), int(hw[1])
-        self.rank_r = int(rank_r)
+        hid = int(hidden_mult * ch)
 
-        if self.h < 2 or self.w < 2:
-            raise ValueError("hw must be >= (2,2)")
-        if self.rank_r < 1:
-            raise ValueError("rank_r must be >= 1")
+        # in: 4C  -> hid
+        self.in_norm = GroupNorm32(4 * ch)
+        self.conv_in = nn.Conv2d(4 * ch, hid, 3, padding=1)
 
-        a_hidden = max(32, 2 * self.rank_r)
+        # FiLM on hid
+        self.hid_norm = GroupNorm32(hid)
+        self.to_film = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * hid))
 
-        # ---- fore params ----
-        self.fore_basis_net = nn.Sequential(
-            nn.Conv2d(self.ch, basis_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(basis_hidden, basis_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(basis_hidden, 2 * self.rank_r * self.ch, 1, bias=True),
-        )
-        nn.init.normal_(self.fore_basis_net[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.fore_basis_net[-1].bias)
+        self.conv_mid = nn.Conv2d(hid, hid, 3, padding=1)
 
+        # out: hid -> 2C (直接预测新的 Fri/Bri)
+        self.conv_out = nn.Conv2d(hid, 2 * ch, 1)
 
-        self.fore_pool_f = nn.Sequential(
-            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-        )
-        self.fore_pool_b = nn.Sequential(
-            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-        )
-        self.fore_to_a = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_ch + 2 * pool_hidden, a_hidden),
-            nn.SiLU(),
-            nn.Linear(a_hidden, self.rank_r),
-        )
-        nn.init.normal_(self.fore_to_a[-1].weight, mean=0.0, std=1e-2)
-        nn.init.zeros_(self.fore_to_a[-1].bias)
+        # 小初始化：避免一上来把频谱打爆
+        nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.conv_out.bias)
 
-        # ---- back params ----
-        self.back_basis_net = nn.Sequential(
-            nn.Conv2d(self.ch, basis_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(basis_hidden, basis_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(basis_hidden, 2 * self.rank_r * self.ch, 1, bias=True),
-        )
-        
-        nn.init.normal_(self.back_basis_net[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.back_basis_net[-1].bias)
+    def forward(self, x_ri4c: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv_in(F.silu(self.in_norm(x_ri4c)))
 
-        self.back_pool_f = nn.Sequential(
-            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-        )
-        self.back_pool_b = nn.Sequential(
-            nn.Conv2d(self.ch, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(pool_hidden, pool_hidden, 3, padding=1, bias=True),
-            nn.SiLU(),
-        )
-        self.back_to_a = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_ch + 2 * pool_hidden, a_hidden),
-            nn.SiLU(),
-            nn.Linear(a_hidden, self.rank_r),
-        )
-        nn.init.normal_(self.back_to_a[-1].weight, mean=0.0, std=1e-2)
-        nn.init.zeros_(self.back_to_a[-1].bias)
+        h = self.hid_norm(h)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
+        h = (1.0 + gamma) * h + beta
 
-        self.to_u = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1))
-
-    def _check_shapes(self, Z: torch.Tensor, feat: torch.Tensor, name: str):
-        b, c, h, w = Z.shape
-        if c != self.ch:
-            raise ValueError(f"{name}: expected C={self.ch}, got {c}")
-        if (h, w) != (self.h, self.w):
-            raise ValueError(f"{name}: expected (H,W)=({self.h},{self.w}), got ({h},{w}). NO interpolation.")
-        if feat.shape != (b, self.ch, self.h, self.w):
-            raise ValueError(f"{name}: feat must be (B,{self.ch},{self.h},{self.w}), got {tuple(feat.shape)}")
-
-    def _mod_one(
-        self,
-        Z: torch.Tensor,          # (B,C,H,W) complex, fftshift'ed
-        self_feat: torch.Tensor,  # (B,C,H,W) bases from this
-        fore_feat: torch.Tensor,
-        back_feat: torch.Tensor,
-        t_emb: torch.Tensor,
-        basis_net: nn.Module,
-        pool_f: nn.Module,
-        pool_b: nn.Module,
-        to_a: nn.Module,
-    ) -> torch.Tensor:
-        b, _, _, _ = Z.shape
-
-        bases = basis_net(self_feat)  # (B, 2*R*C, H, W)
-        bases = bases.view(b, 2, self.rank_r, self.ch, self.h, self.w)
-        Br = bases[:, 0]  # (B,R,C,H,W)
-        Bi = bases[:, 1]  # (B,R,C,H,W)
-
-        u_f = self.to_u(pool_f(fore_feat))
-        u_b = self.to_u(pool_b(back_feat))
-
-        a = to_a(torch.cat([t_emb, u_f, u_b], dim=1))  # (B,R)
-
-        Cr = 1.0 + torch.einsum("br,brchw->bchw", a, Br)
-        Ci = torch.einsum("br,brchw->bchw", a, Bi)
-        W = torch.complex(Cr, Ci)
-
-        # ✅ 正确：频域调制要作用在谱 Z 上
-        return Z * W
-
-    def apply(
-        self,
-        Fz: torch.Tensor,
-        Bz: torch.Tensor,
-        fore_feat: torch.Tensor,
-        back_feat: torch.Tensor,
-        t_emb: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if t_emb is None:
-            return Fz, Bz
-
-        self._check_shapes(Fz, fore_feat, "fore")
-        self._check_shapes(Bz, back_feat, "back")
-        if fore_feat.shape != back_feat.shape:
-            raise ValueError(f"fore_feat/back_feat mismatch: {tuple(fore_feat.shape)} vs {tuple(back_feat.shape)}")
-
-        Fz2 = self._mod_one(
-            Fz,
-            self_feat=fore_feat,
-            fore_feat=fore_feat,
-            back_feat=back_feat,
-            t_emb=t_emb,
-            basis_net=self.fore_basis_net,
-            pool_f=self.fore_pool_f,
-            pool_b=self.fore_pool_b,
-            to_a=self.fore_to_a,
-        )
-        Bz2 = self._mod_one(
-            Bz,
-            self_feat=back_feat,
-            fore_feat=fore_feat,
-            back_feat=back_feat,
-            t_emb=t_emb,
-            basis_net=self.back_basis_net,
-            pool_f=self.back_pool_f,
-            pool_b=self.back_pool_b,
-            to_a=self.back_to_a,
-        )
-        return Fz2, Bz2
+        h = F.silu(self.conv_mid(F.silu(h)))
+        out = self.conv_out(h)
+        return out  # (B,2C,H,W)
 
 
 # -----------------------------
-# FA module  ✅ restore post+norm blocks
-# - fb_filter applies on spectra only when update_fb=True (step2)
+# FA module (one-pass) + (方案B) direct freq update
 # -----------------------------
 class FAModule(nn.Module):
     def __init__(
@@ -503,41 +342,24 @@ class FAModule(nn.Module):
         time_ch: int,
         heads: int,
         head_dim: int,
-        fb_filter: Optional[nn.Module] = None,
+        noise_strength: float = 1.0,  # 兼容保留，但方案B不再使用
     ):
         super().__init__()
-        self.ch = ch
-        self.fb_filter = fb_filter
+        self.ch = int(ch)
+        self.noise_strength = float(noise_strength)
 
-        # step1
-        self.s1_attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s1_attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s1_attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
 
-        self.s1_post_f = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s1_post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s1_norm_f = GroupNorm32(2 * ch)
-        self.s1_norm_b = GroupNorm32(2 * ch)
+        self.post_f = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.norm_f = GroupNorm32(2 * ch)
+        self.norm_b = GroupNorm32(2 * ch)
 
-        self.s1_attn_cf = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s1_attn_cb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s1_post_c = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s1_norm_c = GroupNorm32(2 * ch)
-
-        # step2
-        self.s2_attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s2_attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s2_attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-
-        self.s2_post_f = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s2_post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s2_norm_f = GroupNorm32(2 * ch)
-        self.s2_norm_b = GroupNorm32(2 * ch)
-
-        self.s2_attn_cf = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s2_attn_cb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
-        self.s2_post_c = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
-        self.s2_norm_c = GroupNorm32(2 * ch)
+        # (方案B) 直接预测新的 Fri/Bri
+        self.direct_head_f = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
+        self.direct_head_b = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -549,67 +371,6 @@ class FAModule(nn.Module):
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
-    def _tri_fft_pass(
-        self,
-        fore: torch.Tensor,
-        back: torch.Tensor,
-        cond: torch.Tensor,
-        t_emb: Optional[torch.Tensor],
-        update_fb: bool,
-        update_c: bool,
-        attn_fb: SpatialCrossAttention,
-        attn_fc: SpatialCrossAttention,
-        attn_bc: SpatialCrossAttention,
-        post_f: nn.Module,
-        post_b: nn.Module,
-        norm_f: nn.Module,
-        norm_b: nn.Module,
-        attn_cf: SpatialCrossAttention,
-        attn_cb: SpatialCrossAttention,
-        post_c: nn.Module,
-        norm_c: nn.Module,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-
-        if update_fb and (self.fb_filter is not None):
-            Fz, Bz = self.fb_filter.apply(Fz, Bz, fore_feat=fore, back_feat=back, t_emb=t_emb)
-
-        Fri = self._to_ri(Fz)
-        Bri = self._to_ri(Bz)
-        Cri = self._to_ri(Cz)
-
-        if update_fb:
-            d_fb = attn_fb(Fri, Bri)
-            d_fc = attn_fc(Fri, Cri)
-            Fri2 = norm_f(post_f(Fri + d_fb + d_fc))
-
-            d_bc = attn_bc(Bri, Cri)
-            Bri2 = norm_b(post_b(Bri + d_bc))
-        else:
-            Fri2, Bri2 = Fri, Bri
-
-        if update_c:
-            d_cf = attn_cf(Cri, Fri2 if update_fb else Fri)
-            d_cb = attn_cb(Cri, Bri2 if update_fb else Bri)
-            Cri2 = norm_c(post_c(Cri + d_cf + d_cb))
-        else:
-            Cri2 = Cri
-
-        F2c = self._to_complex(Fri2)
-        B2c = self._to_complex(Bri2)
-        C2c = self._to_complex(Cri2)
-
-        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
-        B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
-        C2c = torch.fft.ifftshift(C2c, dim=(-2, -1))
-
-        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
-        back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
-        cond_out = torch.fft.ifft2(C2c, dim=(-2, -1), norm="ortho").real
-        return fore_out, back_out, cond_out
-
     def forward(
         self,
         fore: torch.Tensor,
@@ -617,48 +378,44 @@ class FAModule(nn.Module):
         cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # step1: update cond only
-        fore, back, cond = self._tri_fft_pass(
-            fore,
-            back,
-            cond,
-            t_emb,
-            update_fb=False,
-            update_c=True,
-            attn_fb=self.s1_attn_fb,
-            attn_fc=self.s1_attn_fc,
-            attn_bc=self.s1_attn_bc,
-            post_f=self.s1_post_f,
-            post_b=self.s1_post_b,
-            norm_f=self.s1_norm_f,
-            norm_b=self.s1_norm_b,
-            attn_cf=self.s1_attn_cf,
-            attn_cb=self.s1_attn_cb,
-            post_c=self.s1_post_c,
-            norm_c=self.s1_norm_c,
-        )
+        # 1) FFT -> complex
+        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-        # step2: update fore/back only (fb_filter applies here)
-        fore, back, cond = self._tri_fft_pass(
-            fore,
-            back,
-            cond,
-            t_emb,
-            update_fb=True,
-            update_c=False,
-            attn_fb=self.s2_attn_fb,
-            attn_fc=self.s2_attn_fc,
-            attn_bc=self.s2_attn_bc,
-            post_f=self.s2_post_f,
-            post_b=self.s2_post_b,
-            norm_f=self.s2_norm_f,
-            norm_b=self.s2_norm_b,
-            attn_cf=self.s2_attn_cf,
-            attn_cb=self.s2_attn_cb,
-            post_c=self.s2_post_c,
-            norm_c=self.s2_norm_c,
-        )
-        return fore, back, cond
+        # 2) complex -> ri
+        Fri = self._to_ri(Fz)  # (B,2C,H,W)
+        Bri = self._to_ri(Bz)
+        Cri = self._to_ri(Cz)
+
+        # 3) concat with cond as KV signal
+        f_in = torch.cat([Fri, Cri], dim=1)  # (B,4C,H,W)
+        b_in = torch.cat([Bri, Cri], dim=1)
+
+        # 4) (方案B) 直接得到新的 Fri/Bri（不再mask乘法）
+        Fri = self.direct_head_f(f_in, t_emb)  # (B,2C,H,W)
+        Bri = self.direct_head_b(b_in, t_emb)  # (B,2C,H,W)
+
+        # 5) Tri attention interaction (fb, fc, bc)
+        d_fb = self.attn_fb(Fri, Bri)
+        d_fc = self.attn_fc(Fri, Cri)
+        Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
+
+        d_bc = self.attn_bc(Bri, Cri)
+        Bri2 = self.norm_b(self.post_b(Bri + d_bc))
+
+        # 6) ri -> complex -> IFFT back to spatial
+        F2c = self._to_complex(Fri2)
+        B2c = self._to_complex(Bri2)
+
+        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
+        B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
+
+        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
+        back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
+
+        # cond 不更新
+        return fore_out, back_out, cond
 
 
 class EncoderStageFiLM(nn.Module):
@@ -682,9 +439,47 @@ class EncoderStageFiLM(nn.Module):
 
 
 # -----------------------------
-# Decoder stage (single-stream)  (for fore or back)
+# Cond decoder stage (U-Net style)
 # -----------------------------
-class DecoderStageCondAdd(nn.Module):
+class CondDecoderStage(nn.Module):
+    """
+    cond decoder stage:
+    upsample -> add cond encoder skip -> ResBlocksFiLM
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+        time_ch: int,
+        num_blocks: int,
+        up: bool,
+        dropout: float,
+    ):
+        super().__init__()
+        self.up = Upsample(in_ch) if up else None
+        self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
+
+        blocks: List[nn.Module] = []
+        ch = in_ch
+        for _ in range(num_blocks):
+            blocks.append(ResBlockFiLM(ch, out_ch, time_ch=time_ch, dropout=dropout))
+            ch = out_ch
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        if self.up is not None:
+            x = self.up(x)
+        x = x + self.skip_to_x(skip)
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        return x
+
+
+# -----------------------------
+# Decoder stage: direct add skip_fb + cond_feat (from cond decoder)
+# -----------------------------
+class DecoderStageCondAddDirect(nn.Module):
     def __init__(
         self,
         in_ch: int,
@@ -699,8 +494,6 @@ class DecoderStageCondAdd(nn.Module):
         super().__init__()
         self.up = Upsample(in_ch) if up else None
 
-        self.cond_to_skip_gate = nn.Conv2d(cond_ch, skip_ch, 1, bias=True)
-
         self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
         self.cond_to_x = nn.Identity() if cond_ch == in_ch else nn.Conv2d(cond_ch, in_ch, 1, bias=True)
 
@@ -711,14 +504,14 @@ class DecoderStageCondAdd(nn.Module):
             ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
+        self.fuse_norm = GroupNorm32(in_ch)
+
     def forward(self, x: torch.Tensor, skip: torch.Tensor, cond_skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         if self.up is not None:
             x = self.up(x)
 
-        g = torch.sigmoid(self.cond_to_skip_gate(cond_skip))  # (B,skip_ch,H,W)
-        skip_p = skip * g
-
-        x = x + self.skip_to_x(skip_p) + self.cond_to_x(cond_skip)
+        x = x + self.skip_to_x(skip) + self.cond_to_x(cond_skip)
+        x = F.silu(self.fuse_norm(x))
 
         for blk in self.blocks:
             x = blk(x, t_emb)
@@ -726,9 +519,9 @@ class DecoderStageCondAdd(nn.Module):
 
 
 # -----------------------------
-# Main Network (NO cfg)  ✅ fore/back dual decoders
+# Main Network
 # -----------------------------
-class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
+class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
     def __init__(
         self,
         *,
@@ -749,8 +542,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         hp_sigma_min: float,
         hp_sigma_max: float,
         hp_sigma_init: float,
-        use_step1_cond_freq_mod: bool,  # now means "use fb_filter at FA levels"
-        freq_mod_rank_list: Optional[Tuple[int, ...]],
+        noise_strength: float = 1.0,
     ):
         super().__init__()
 
@@ -778,8 +570,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         self.hp_sigma_min = float(hp_sigma_min)
         self.hp_sigma_max = float(hp_sigma_max)
         self.hp_sigma_init = float(hp_sigma_init)
-        self.use_step1_cond_freq_mod = bool(use_step1_cond_freq_mod)
-        self.freq_mod_rank_list = None if freq_mod_rank_list is None else tuple(int(x) for x in freq_mod_rank_list)
+        self.noise_strength = float(noise_strength)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
@@ -809,44 +600,9 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         # FA levels: last K
         K = min(self.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K, n_levels))
-        fa_levels_sorted = sorted(self.attn_level_set)
 
-        H0, W0 = self.image_hw
-
-        def level_hw(level: int) -> Tuple[int, int]:
-            h = H0 // (2**level)
-            w = W0 // (2**level)
-            if h < 2 or w < 2:
-                raise ValueError(f"level_hw too small at level={level}: ({h},{w}) from image_hw={self.image_hw}")
-            return (h, w)
-
-        def rank_for_fa_level(level: int) -> Optional[int]:
-            if not self.use_step1_cond_freq_mod:
-                return None
-            if self.freq_mod_rank_list is None:
-                return None
-            ranks = list(self.freq_mod_rank_list)
-            if len(ranks) == 0:
-                return None
-            idx = fa_levels_sorted.index(level)
-            if idx >= len(ranks):
-                return int(ranks[-1])
-            return int(ranks[idx])
-
-        def make_fa_list(level: int, ch: int) -> nn.ModuleList:
+        def make_fa_list(ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
-
-            fb_filter = None
-            rank_r = rank_for_fa_level(level)
-            if rank_r is not None and rank_r > 0:
-                hL, wL = level_hw(level)
-                fb_filter = DualForeBackTimeDynamicBasisComplexFreqModulator(
-                    ch=ch,
-                    time_ch=self.time_dim,
-                    hw=(hL, wL),
-                    rank_r=rank_r,
-                )
-
             for _ in range(self.fa_stacks):
                 mods.append(
                     FAModule(
@@ -854,18 +610,18 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                         time_ch=self.time_dim,
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
-                        fb_filter=fb_filter,
+                        noise_strength=self.noise_strength,
                     )
                 )
             return mods
 
         self.couple_modules = nn.ModuleDict()
-        for i in fa_levels_sorted:
-            self.couple_modules[str(i)] = make_fa_list(i, self.chs[i])
+        for i in sorted(self.attn_level_set):
+            self.couple_modules[str(i)] = make_fa_list(self.chs[i])
 
-        self.bottleneck_coupler = make_fa_list(n_levels - 1, self.chs[-1]) if self.use_bottleneck_coupling else None
+        self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
 
-        # HP inject levels: first K_hp levels
+        # HP inject levels
         K_hp = min(self.hp_inject_depth, n_levels)
         self.hp_level_set = set(range(0, K_hp))
 
@@ -884,31 +640,37 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
             self.cond_gate_fore[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
             self.cond_gate_back[str(i)] = CondGateResidual(x_ch=ch, cond_ch=ch)
 
-        # ✅ Dual decoders: fore and back separately (NO concat)
-        self.dec_fore = nn.ModuleList()
-        self.dec_back = nn.ModuleList()
+        # cond decoder (mirror of cond encoder)
+        self.cond_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
-            skip_ch = self.chs[i]    # fore/back skip is single-stream
+            in_ch = self.chs[i] if i == (n_levels - 1) else self.chs[i + 1]
+            out_ch = self.chs[i]
+            skip_ch = self.chs[i]
+            up = i < (n_levels - 1)
+            self.cond_dec.append(
+                CondDecoderStage(
+                    in_ch=in_ch,
+                    skip_ch=skip_ch,
+                    out_ch=out_ch,
+                    time_ch=self.time_dim,
+                    num_blocks=self.num_res_blocks,
+                    up=up,
+                    dropout=self.dropout,
+                )
+            )
+
+        # SINGLE shared decoder after concat(back, fore)
+        self.dec = nn.ModuleList()
+        for i in reversed(range(n_levels)):
+            skip_ch = 2 * self.chs[i]
             cond_ch = self.chs[i]
 
-            in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
-            out_ch = self.chs[i]
+            in_ch = (2 * self.chs[i + 1]) if i < (n_levels - 1) else (2 * self.chs[i])
+            out_ch = 2 * self.chs[i]
             up = i < (n_levels - 1)
 
-            self.dec_fore.append(
-                DecoderStageCondAdd(
-                    in_ch=in_ch,
-                    skip_ch=skip_ch,
-                    cond_ch=cond_ch,
-                    out_ch=out_ch,
-                    time_ch=self.time_dim,
-                    num_blocks=self.num_res_blocks,
-                    up=up,
-                    dropout=self.dropout,
-                )
-            )
-            self.dec_back.append(
-                DecoderStageCondAdd(
+            self.dec.append(
+                DecoderStageCondAddDirect(
                     in_ch=in_ch,
                     skip_ch=skip_ch,
                     cond_ch=cond_ch,
@@ -920,9 +682,7 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
                 )
             )
 
-        # heads
-        self.out_back = nn.Conv2d(self.base_ch, 1, 3, padding=1)
-        self.out_fore = nn.Conv2d(self.base_ch, self.xt_in_ch - 1, 3, padding=1)
+        self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
 
     def forward(
         self,
@@ -950,10 +710,13 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
         back_skips: List[torch.Tensor] = []
         cond_skips: List[torch.Tensor] = []
 
+        # -----------------------------
+        # Encoder (3 branches)
+        # -----------------------------
         for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
             back, b_skip = enc_b(back, t_emb)
             fore, f_skip = enc_f(fore, t_emb)
-            cond, c1 = enc_c(cond, t_emb)  # RAW cond skip
+            cond, c1 = enc_c(cond, t_emb)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
@@ -961,14 +724,13 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
             b_main, f_main, c_main = b_skip, f_skip, c1
 
-            # FA (updates f_main/b_main; internal c_tmp updated but we keep RAW c1 for skip/down)
+            # FA uses cond encoder skip as KV (cond not updated)
             if level in self.attn_level_set:
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
-                c_tmp = c_main
                 for fa in fa_list:
-                    f_main, b_main, c_tmp = fa(f_main, b_main, c_tmp, t_emb=t_emb)
+                    f_main, b_main, _ = fa(f_main, b_main, c_main, t_emb=t_emb)
 
-            # HP inject
+            # HP inject (uses RAW c1)
             if level in self.hp_level_set:
                 hp_op = self.cond_hp_ops[str(level)]
                 gate_f = self.cond_gate_fore[str(level)]
@@ -984,35 +746,39 @@ class FMForeBackCondDeepKTriFFTDualDecoderResUNet(nn.Module):
 
         # bottleneck coupling
         if self.bottleneck_coupler is not None:
-            c_tmp = cond
             for fa in self.bottleneck_coupler:
-                fore, back, c_tmp = fa(fore, back, c_tmp, t_emb=t_emb)
-            cond = c_tmp
+                fore, back, _ = fa(fore, back, cond, t_emb=t_emb)
 
-        # dual decoders
-        h_f = fore
-        h_b = back
-        for dec_f, dec_b, f_skip, b_skip, c_skip in zip(
-            self.dec_fore,
-            self.dec_back,
+        # -----------------------------
+        # Cond Decoder (mirror U-Net)
+        # -----------------------------
+        cond_dec_feats: List[torch.Tensor] = []
+        h_cond = cond
+        for dec_c, c_skip in zip(self.cond_dec, reversed(cond_skips)):
+            h_cond = dec_c(h_cond, c_skip, t_emb)
+            cond_dec_feats.append(h_cond)
+
+        # -----------------------------
+        # Shared Decoder (uses cond_dec_feats)
+        # -----------------------------
+        h = torch.cat([back, fore], dim=1)
+
+        for dec, f_skip, b_skip, c_dec in zip(
+            self.dec,
             reversed(fore_skips),
             reversed(back_skips),
-            reversed(cond_skips),
+            cond_dec_feats,
         ):
-            h_f = dec_f(h_f, f_skip, c_skip, t_emb)
-            h_b = dec_b(h_b, b_skip, c_skip, t_emb)
+            skip_fb = torch.cat([b_skip, f_skip], dim=1)
+            h = dec(h, skip_fb, c_dec, t_emb)
 
-        h_f = F.silu(h_f)
-        h_b = F.silu(h_b)
-
-        v_fore = self.out_fore(h_f)
-        v_back = self.out_back(h_b)
-        v = torch.cat([v_back, v_fore], dim=1)
+        h = F.silu(h)
+        v = self.out_v(h)
         return v
 
 
 # -----------------------------
-# Factory (all params here)
+# Factory
 # -----------------------------
 def build_model(
     image_hw: Tuple[int, int] = (256, 256),
@@ -1032,10 +798,9 @@ def build_model(
     hp_sigma_min: float = 0.05,
     hp_sigma_max: float = 0.50,
     hp_sigma_init: float = 0.15,
-    use_step1_cond_freq_mod: bool = True,
-    freq_mod_rank_list: Optional[Sequence[int]] = (8,),
-) -> FMForeBackCondDeepKTriFFTDualDecoderResUNet:
-    return FMForeBackCondDeepKTriFFTDualDecoderResUNet(
+    noise_strength: float = 1.0,
+) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet:
+    return FMForeBackCondDeepKTriFFTSingleDecoderResUNet(
         image_hw=tuple(image_hw),
         img_in_ch=img_in_ch,
         xt_in_ch=xt_in_ch,
@@ -1053,8 +818,7 @@ def build_model(
         hp_sigma_min=hp_sigma_min,
         hp_sigma_max=hp_sigma_max,
         hp_sigma_init=hp_sigma_init,
-        use_step1_cond_freq_mod=use_step1_cond_freq_mod,
-        freq_mod_rank_list=None if freq_mod_rank_list is None else tuple(int(x) for x in freq_mod_rank_list),
+        noise_strength=noise_strength,
     )
 
 
@@ -1069,12 +833,12 @@ if __name__ == "__main__":
         fa_stacks=2,
         use_bottleneck_coupling=True,
         hp_inject_depth=1,
-        use_step1_cond_freq_mod=True,
-        freq_mod_rank_list=(4, 8),
+        noise_strength=1.0,
     )
+
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)
     t = torch.rand(2)
 
     v = net(x_t, img, t)
-    print("v:", v.shape)
+    print("v:", v.shape)  # (2, 4, 256, 256)
