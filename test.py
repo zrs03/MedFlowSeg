@@ -10,6 +10,8 @@
 # - Fuse by argmax over class-probabilities; set to background if max prob < bg_thresh
 #
 # ✅ EMA inference supported (ema_shadow preferred)
+# ✅ NEW: SDF visualization (GT + Pred SDF panels)
+#   - Pred SDF is visualized from k=0 sample (since STAPLE fuses hard masks only)
 # ======================================================
 
 import argparse
@@ -101,6 +103,43 @@ def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def sdf_to_vis_rgb(sdf_hw: np.ndarray, clip: float = 0.1) -> np.ndarray:
+    """
+    sdf_hw: (H,W) float, signed distance
+    clip: visualize range [-clip, +clip] (outside will saturate)
+    returns: (H,W,3) uint8 using a diverging colormap
+    """
+    sdf_hw = np.clip(sdf_hw, -clip, clip)
+    norm = (sdf_hw + clip) / (2 * clip)  # -> [0,1]
+    cmap = plt.get_cmap("seismic")       # blue<0, red>0
+    rgb = (cmap(norm)[..., :3] * 255.0).astype(np.uint8)
+    return rgb
+
+
+def plot_sdf_panels(
+    axs,
+    sdf_chw: np.ndarray,
+    title_prefix: str,
+    max_fg_classes: int = 3,
+    clip: float = 0.1,
+):
+    """
+    axs: list/np-array of axes length=max_fg_classes
+    sdf_chw: (C,H,W) float (channel0 bg, 1.. fg)
+    """
+    C = sdf_chw.shape[0]
+    for j in range(max_fg_classes):
+        c = j + 1
+        ax = axs[j]
+        if c < C:
+            ax.imshow(sdf_to_vis_rgb(sdf_chw[c], clip=clip))
+            ax.set_title(f"{title_prefix} SDF c={c}")
+        else:
+            ax.imshow(np.zeros((sdf_chw.shape[1], sdf_chw.shape[2], 3), dtype=np.uint8))
+            ax.set_title(f"{title_prefix} SDF c={c} (N/A)")
+        ax.axis("off")
+
+
 # ======================================================
 # STAPLE (Binary) + One-vs-Rest Multi-class Fusion
 # ======================================================
@@ -140,7 +179,7 @@ def staple_binary(
             ti = t[i].clamp(eps, 1 - eps)
             # P(m|z=1): mi~Bernoulli(si)
             log_p1 += mi * torch.log(si) + (1 - mi) * torch.log(1 - si)
-            # P(m|z=0): mi~Bernoulli(1-ti)  (because specificity ti = P(m=0|z=0))
+            # P(m|z=0): mi~Bernoulli(1-ti) (specificity ti = P(m=0|z=0))
             log_p0 += mi * torch.log(1 - ti) + (1 - mi) * torch.log(ti)
 
         log_prior1 = torch.log(p.clamp(eps, 1 - eps))
@@ -188,17 +227,14 @@ def ovrr_staple_fuse_multiclass(
 
     # for each fg class c: run binary STAPLE on K masks of (mask==c)
     for c in range(1, num_classes):
-        # binary masks: (K,B,H,W) -> process per-sample B independently for simplicity
-        bin_k = (masks_k == c).to(torch.float32)
-
+        bin_k = (masks_k == c).to(torch.float32)  # (K,B,H,W)
         for b in range(B):
             p_c = staple_binary(bin_k[:, b], iters=staple_iters)  # (H,W)
             probs[b, c - 1] = p_c
 
-    # choose class by maximum probability among foreground classes
-    maxp, arg = probs.max(dim=1)         # (B,H,W), (B,H,W) in [0..C-2]
-    final = (arg + 1).to(torch.int64)    # map back to class id 1..C-1
-    final[maxp < bg_thresh] = 0          # background if no class is confident enough
+    maxp, arg = probs.max(dim=1)      # (B,H,W), (B,H,W) in [0..C-2]
+    final = (arg + 1).to(torch.int64) # -> class id 1..C-1
+    final[maxp < bg_thresh] = 0       # bg if no class confident enough
 
     return final, probs
 
@@ -207,7 +243,7 @@ def ovrr_staple_fuse_multiclass(
 # Model wrapper (same network + sampling as train)
 # ======================================================
 class MedFlowSegTester(nn.Module):
-    def __init__(self, num_classes: int = 4, sample_steps: int = 10, freq_attn_depth: int = 2):
+    def __init__(self, num_classes: int = 4, sample_steps: int = 10, freq_attn_depth: int = 1):
         super().__init__()
         self.num_classes = num_classes
         self.sample_steps = sample_steps
@@ -292,6 +328,10 @@ def run_test(
     bg_thresh: float,
     base_seed: int,
     freq_attn_depth: int,
+    # NEW: SDF visualization params
+    sdf_vis_clip: float = 0.1,
+    sdf_vis_fg_max: int = 3,
+    pred_sdf_mode: str = "k0",  # "k0" or "mean"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
@@ -326,14 +366,27 @@ def run_test(
         sdf_gt = sdf_gt.to(device, non_blocking=True)
 
         # ---------- K samples ----------
-        # collect K predicted hard masks for STAPLE
         masks_k = []
+        sdf_pred_vis = None  # (B,C,H,W) for visualization only
+
+        sdf_sum = None
         for k in range(staple_k):
-            # different seed per (batch, k) for deterministic multi-sampling
             seed = base_seed + (bidx * 1000) + k
             sdf_pred_k = model.sample(image, seed=seed)  # (B,C,H,W)
-            mask_k = sdf_to_mask_thresh_argmax_pred(sdf_pred_k, thresh=thresh, fg_factor=fg_factor)  # (B,H,W)
+
+            if pred_sdf_mode == "k0":
+                if k == 0:
+                    sdf_pred_vis = sdf_pred_k
+            elif pred_sdf_mode == "mean":
+                sdf_sum = sdf_pred_k if sdf_sum is None else (sdf_sum + sdf_pred_k)
+            else:
+                raise ValueError("pred_sdf_mode must be 'k0' or 'mean'")
+
+            mask_k = sdf_to_mask_thresh_argmax_pred(sdf_pred_k, thresh=thresh, fg_factor=fg_factor)
             masks_k.append(mask_k)
+
+        if pred_sdf_mode == "mean":
+            sdf_pred_vis = sdf_sum / float(staple_k)
 
         masks_k = torch.stack(masks_k, dim=0)  # (K,B,H,W)
 
@@ -355,23 +408,61 @@ def run_test(
 
         # ---------- vis ----------
         if vis_count < max_vis:
-            img_np = image.detach().cpu().numpy()[:, 0]
-            pred_np = pred_mask.detach().cpu().numpy()
-            gt_np = gt_mask.detach().cpu().numpy()
+            img_np = image.detach().cpu().numpy()[:, 0]  # (B,H,W)
+            pred_np = pred_mask.detach().cpu().numpy()   # (B,H,W)
+            gt_np = gt_mask.detach().cpu().numpy()       # (B,H,W)
+
+            sdf_gt_np = sdf_gt.detach().cpu().numpy()         # (B,C,H,W)
+            sdf_pred_np = sdf_pred_vis.detach().cpu().numpy() # (B,C,H,W)
 
             for i in range(min(image.shape[0], max_vis - vis_count)):
-                fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-                axs[0].imshow(img_np[i], cmap="gray")
-                axs[0].set_title("Image")
-                axs[0].axis("off")
+                # Layout:
+                # row0: image | GT mask | Pred mask
+                # row1: GT  SDF c=1..N
+                # row2: Pred SDF c=1..N
+                cols = max(3, sdf_vis_fg_max)
+                fig, axs = plt.subplots(3, cols, figsize=(4 * cols, 12))
 
-                axs[1].imshow(colorize_three_fg_else_black(gt_np[i]))
-                axs[1].set_title("GT")
-                axs[1].axis("off")
+                # If cols > 3, fill extra slots with black on row0
+                for j in range(cols):
+                    axs[0, j].axis("off")
 
-                axs[2].imshow(colorize_three_fg_else_black(pred_np[i]))
-                axs[2].set_title(f"Pred (OVR-STAPLE K={staple_k})")
-                axs[2].axis("off")
+                axs[0, 0].imshow(img_np[i], cmap="gray")
+                axs[0, 0].set_title("Image")
+                axs[0, 0].axis("off")
+
+                axs[0, 1].imshow(colorize_three_fg_else_black(gt_np[i]))
+                axs[0, 1].set_title("GT Mask")
+                axs[0, 1].axis("off")
+
+                axs[0, 2].imshow(colorize_three_fg_else_black(pred_np[i]))
+                axs[0, 2].set_title(f"Pred Mask (OVR-STAPLE K={staple_k})")
+                axs[0, 2].axis("off")
+
+                # row1 & row2: SDF panels
+                plot_sdf_panels(
+                    axs=axs[1, :sdf_vis_fg_max],
+                    sdf_chw=sdf_gt_np[i],
+                    title_prefix="GT",
+                    max_fg_classes=sdf_vis_fg_max,
+                    clip=sdf_vis_clip,
+                )
+                plot_sdf_panels(
+                    axs=axs[2, :sdf_vis_fg_max],
+                    sdf_chw=sdf_pred_np[i],
+                    title_prefix=f"Pred({pred_sdf_mode})",
+                    max_fg_classes=sdf_vis_fg_max,
+                    clip=sdf_vis_clip,
+                )
+
+                # If cols > sdf_vis_fg_max, blank the rest in rows 1&2
+                for j in range(sdf_vis_fg_max, cols):
+                    axs[1, j].imshow(np.zeros((img_np[i].shape[0], img_np[i].shape[1], 3), dtype=np.uint8))
+                    axs[1, j].set_title("N/A")
+                    axs[1, j].axis("off")
+                    axs[2, j].imshow(np.zeros((img_np[i].shape[0], img_np[i].shape[1], 3), dtype=np.uint8))
+                    axs[2, j].set_title("N/A")
+                    axs[2, j].axis("off")
 
                 plt.tight_layout()
                 plt.savefig(out_dir / "vis" / f"sample_{vis_count:04d}.png", dpi=200)
@@ -402,13 +493,13 @@ def main():
 
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--sample_steps", type=int, default=50)
-    parser.add_argument("--freq_attn_depth", type=int, default=2)
+    parser.add_argument("--freq_attn_depth", type=int, default=1)
 
     parser.add_argument("--thresh", type=float, default=0.01)
-    parser.add_argument("--fg_factor", type=float, default=3.0)
+    parser.add_argument("--fg_factor", type=float, default=1.0)
 
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=28)
 
     parser.add_argument("--max_vis", type=int, default=16)
 
@@ -416,10 +507,21 @@ def main():
     parser.add_argument("--no_ema", action="store_true", help="disable EMA inference (default: EMA on)")
 
     # STAPLE
-    parser.add_argument("--staple_k", type=int, default=3, help="number of stochastic samples per image (>=3 recommended)")
+    parser.add_argument("--staple_k", type=int, default=10, help="number of stochastic samples per image (>=3 recommended)")
     parser.add_argument("--staple_iters", type=int, default=15, help="STAPLE EM iterations")
     parser.add_argument("--bg_thresh", type=float, default=0.5, help="if max class prob < bg_thresh => background")
-    parser.add_argument("--base_seed", type=int, default=1234, help="base seed for deterministic multi-sampling")
+    parser.add_argument("--base_seed", type=int, default=42, help="base seed for deterministic multi-sampling")
+
+    # NEW: SDF visualization
+    parser.add_argument("--sdf_vis_clip", type=float, default=0.1, help="clip SDF to [-clip, +clip] for visualization")
+    parser.add_argument("--sdf_vis_fg_max", type=int, default=3, help="visualize at most N foreground SDF channels (c=1..N)")
+    parser.add_argument(
+        "--pred_sdf_mode",
+        type=str,
+        default="k0",
+        choices=["k0", "mean"],
+        help="which predicted SDF to visualize: k0 (first sample) or mean (average over K samples)",
+    )
 
     args = parser.parse_args()
     pl.seed_everything(42)
@@ -444,6 +546,9 @@ def main():
         bg_thresh=args.bg_thresh,
         base_seed=args.base_seed,
         freq_attn_depth=args.freq_attn_depth,
+        sdf_vis_clip=args.sdf_vis_clip,
+        sdf_vis_fg_max=args.sdf_vis_fg_max,
+        pred_sdf_mode=args.pred_sdf_mode,
     )
 
 

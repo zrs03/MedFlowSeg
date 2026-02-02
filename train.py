@@ -176,7 +176,7 @@ class LitMedFlowSeg(pl.LightningModule):
         self.save_hyperparameters()
 
         # Flow-matching model (expects x_t, image, t)
-        self.model = build_model(xt_in_ch=num_classes, freq_attn_depth=1)
+        self.model = build_model(xt_in_ch=num_classes)
 
         self.num_classes = num_classes
         self.lr = lr
@@ -397,7 +397,7 @@ def main():
 
     # ✅ EMA: default ON, use --no_ema to disable
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
-    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_decay", type=float, default=0.99)
 
     # ✅ Resume
     parser.add_argument(
@@ -480,7 +480,7 @@ def main():
         ckpt_path = None
 
     trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
-0
+
 
 if __name__ == "__main__":
     main()

@@ -3,11 +3,22 @@
 ✅ FA: one-pass (no step1), fore/back updated using cond as KV
 ✅ REMOVE Modulator entirely (NO rank / NO basis decomposition)
 ✅ Keep frequency-domain attention ops:
-    - (CHANGED,方案B) 直接从 f_in/b_in 预测更新后的 Fri/Bri（不再做 mask 乘法）
+    - (方案B) direct heads predict new Fri/Bri (no mask multiply)
     - TriFFT attention updates fore/back using cond as KV
 
-✅ REMOVE (requested): CondGaussianHighPassOperator + TimeGaussianHighPassGatePerChannel + CondGateResidual
-    - 删除所有 HP inject 相关代码与参数
+✅ REMOVE: all HP inject related code/params
+
+✅ NEW: Scheme-1 HOG interaction (DIRECT use, no hog encoder, no hog->FA injection)
+    - Compute dense freq-HOG on raw split x_back/x_fore:
+        FFT -> phase(phi) + magnitude(mag)
+        soft-bin phase into hog_bins -> p: (B,C,H,W,K)
+        (optional) magnitude weighting; then normalize across K to get distribution
+    - Compute similarity sim(h,w) between fore/back HOG distributions (averaged over fore channels)
+    - Use sim as routing strength alpha in frequency domain BEFORE stems/encoders:
+        Fore: F' = (1-alpha)*F + alpha*0.5*(F + B_broadcast_to_fore_channels)
+        Back: B' = (1-alpha)*B + alpha*0.5*(B + mean(F_channels))
+    - IFFT back to spatial -> x_back2/x_fore2 -> then proceed as usual
+
 ✅ Cond Decoder: unchanged
 ✅ Decoder: concat(back, fore) -> single decoder -> output v directly
 """
@@ -28,7 +39,7 @@ import torch.nn.functional as F
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         if t.dim() == 0:
@@ -79,7 +90,6 @@ class GroupNorm32(nn.Module):
 
 class ResBlockFiLM(nn.Module):
     """ResBlock with FiLM time conditioning: (1+gamma)*h + beta."""
-
     def __init__(
         self,
         in_ch: int,
@@ -140,21 +150,21 @@ class Upsample(nn.Module):
 
 
 # -----------------------------
-# Spatial Cross Attention (multi-head)  ✅ with Norm
+# Spatial Cross Attention (multi-head) ✅ with Norm
 # -----------------------------
 class SpatialCrossAttention(nn.Module):
     def __init__(self, q_ch: int, kv_ch: int, heads: int = 4, head_dim: int = 32):
         super().__init__()
-        self.heads = heads
-        self.head_dim = head_dim
-        inner = heads * head_dim
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        inner = self.heads * self.head_dim
 
         self.to_q = nn.Conv2d(q_ch, inner, 1, bias=False)
         self.to_k = nn.Conv2d(kv_ch, inner, 1, bias=False)
         self.to_v = nn.Conv2d(kv_ch, inner, 1, bias=False)
 
         self.out = nn.Conv2d(inner, q_ch, 1)
-        self.scale = head_dim**-0.5
+        self.scale = self.head_dim**-0.5
 
         self.norm_q = GroupNorm32(q_ch)
         self.norm_kv = GroupNorm32(kv_ch)
@@ -174,6 +184,55 @@ class SpatialCrossAttention(nn.Module):
             b, self.heads * self.head_dim, h, w
         )
         return self.out(out)
+
+
+# -----------------------------
+# Dense frequency-domain "HOG" (NO gradient direction) + magnitude
+# We return hog_map for compatibility, but we will reshape it back to (B,C,H,W,K).
+# -----------------------------
+def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
+    return (x + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class FreqDenseHOG(nn.Module):
+    def __init__(self, hog_bins: int = 8, hog_tau: float = 0.35, eps: float = 1e-8, mag_weight: bool = True):
+        super().__init__()
+        if hog_bins < 2:
+            raise ValueError("hog_bins must be >= 2")
+        self.hog_bins = int(hog_bins)
+        self.hog_tau = float(hog_tau)
+        self.eps = float(eps)
+        self.mag_weight = bool(mag_weight)
+
+        k = torch.arange(self.hog_bins).float()
+        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)  # (K,)
+        self.register_buffer("theta", theta, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, H, W) real
+        return: hog_map (B, C*hog_bins, H, W)
+        """
+        b, c, h, w = x.shape
+
+        X = torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        mag = X.abs().clamp_min(self.eps)  # (B,C,H,W)
+        phi = torch.angle(X)               # (B,C,H,W)
+
+        theta = self.theta.view(1, 1, 1, 1, self.hog_bins).to(device=x.device, dtype=phi.dtype)
+        delta = _wrap_pi(phi.unsqueeze(-1) - theta)  # (B,C,H,W,K)
+
+        logits = torch.cos(delta) / max(self.hog_tau, 1e-6)
+        p = F.softmax(logits, dim=-1)  # (B,C,H,W,K) probabilities
+
+        if self.mag_weight:
+            # magnitude vote (still nonnegative)
+            p = p * mag.unsqueeze(-1)
+
+        # reshape to dense feature map
+        p = p.permute(0, 1, 4, 2, 3).contiguous()     # (B,C,K,H,W)
+        hog_map = p.view(b, c * self.hog_bins, h, w)  # (B,C*K,H,W)
+        return hog_map
 
 
 # -----------------------------
@@ -258,25 +317,20 @@ class FAModule(nn.Module):
         cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1) FFT -> complex
         Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-        # 2) complex -> ri
         Fri = self._to_ri(Fz)  # (B,2C,H,W)
         Bri = self._to_ri(Bz)
         Cri = self._to_ri(Cz)
 
-        # 3) concat with cond as KV signal
         f_in = torch.cat([Fri, Cri], dim=1)  # (B,4C,H,W)
         b_in = torch.cat([Bri, Cri], dim=1)
 
-        # 4) (方案B) 直接得到新的 Fri/Bri（不再mask乘法）
         Fri = self.direct_head_f(f_in, t_emb)  # (B,2C,H,W)
         Bri = self.direct_head_b(b_in, t_emb)  # (B,2C,H,W)
 
-        # 5) Tri attention interaction (fb, fc, bc)
         d_fb = self.attn_fb(Fri, Bri)
         d_fc = self.attn_fc(Fri, Cri)
         Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
@@ -284,7 +338,6 @@ class FAModule(nn.Module):
         d_bc = self.attn_bc(Bri, Cri)
         Bri2 = self.norm_b(self.post_b(Bri + d_bc))
 
-        # 6) ri -> complex -> IFFT back to spatial
         F2c = self._to_complex(Fri2)
         B2c = self._to_complex(Bri2)
 
@@ -294,7 +347,6 @@ class FAModule(nn.Module):
         fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
         back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
 
-        # cond stays unchanged
         return fore_out, back_out, cond
 
 
@@ -419,6 +471,11 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         use_bottleneck_coupling: bool,
         fa_stacks: int,
         noise_strength: float = 1.0,
+        # --- HOG routing params ---
+        hog_bins: int = 8,
+        hog_tau: float = 0.35,
+        hog_mag_weight: bool = True,
+        hog_eps: float = 1e-8,
     ):
         super().__init__()
 
@@ -444,6 +501,11 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.fa_stacks = int(fa_stacks)
         self.noise_strength = float(noise_strength)
 
+        # HOG routing config
+        self.hog_bins = int(hog_bins)
+        self.hog_tau = float(hog_tau)
+        self.hog_eps = float(hog_eps)
+
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
         back_in_ch = 1
@@ -453,6 +515,18 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.back_stem = nn.Conv2d(back_in_ch, self.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(fore_in_ch, self.base_ch, 3, padding=1)
         self.cond_stem = nn.Conv2d(cond_in_ch, self.base_ch, 3, padding=1)
+
+        # ✅ HOG extractor used DIRECTLY (no hog encoder)
+        self.freq_hog = FreqDenseHOG(
+            hog_bins=self.hog_bins,
+            hog_tau=self.hog_tau,
+            eps=self.hog_eps,
+            mag_weight=hog_mag_weight,
+        )
+
+        # ✅ routing strength (learnable; init small so it won't wreck baseline)
+        # sigmoid(-6) ≈ 0.0025  (almost off at start, then can learn to turn on)
+        self.hog_route_logit = nn.Parameter(torch.tensor(-6.0))
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
@@ -537,6 +611,63 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
 
         self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
 
+    # -----------------------------
+    # Scheme-1 HOG routing: direct fore/back interaction BEFORE stems
+    # -----------------------------
+    def _hog_routing_fuse(self, x_back: torch.Tensor, x_fore: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x_back: (B,1,H,W)  real
+        x_fore: (B,Cf,H,W) real
+        return: (x_back2, x_fore2) after frequency-domain selective sharing
+        """
+        b, cf, h, w = x_fore.shape
+        k = self.hog_bins
+        eps = self.hog_eps
+
+        # 1) HOG maps
+        hog_back_map = self.freq_hog(x_back)  # (B, 1*K, H, W)
+        hog_fore_map = self.freq_hog(x_fore)  # (B, Cf*K, H, W)
+
+        # 2) reshape back to (B,C,H,W,K)
+        pb = hog_back_map.view(b, 1, k, h, w).permute(0, 1, 3, 4, 2).contiguous()   # (B,1,H,W,K)
+        pf = hog_fore_map.view(b, cf, k, h, w).permute(0, 1, 3, 4, 2).contiguous()  # (B,Cf,H,W,K)
+
+        # 3) normalize across K to make distributions (because hog_map may be mag-weighted)
+        pb = pb / (pb.sum(dim=-1, keepdim=True) + eps)
+        pf = pf / (pf.sum(dim=-1, keepdim=True) + eps)
+
+        # 4) compute similarity sim(h,w) between fore/back distributions
+        #    back has 1 channel; fore has Cf channels -> average fore distribution across channels
+        pf_mean = pf.mean(dim=1, keepdim=True)  # (B,1,H,W,K)
+        sim = (pf_mean * pb).sum(dim=-1)        # (B,1,H,W) in [0,1] approximately
+
+        # 5) routing strength
+        route = torch.sigmoid(self.hog_route_logit)        # scalar in (0,1)
+        alpha = torch.clamp(route * sim, 0.0, 1.0)         # (B,1,H,W)
+
+        # 6) frequency-domain selective sharing
+        Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,Cf,H,W) complex
+        Bz = torch.fft.fftshift(torch.fft.fft2(x_back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,1,H,W) complex
+
+        # broadcast back to fore channels
+        B_bc = Bz.expand(-1, cf, -1, -1)  # (B,Cf,H,W)
+        F_mean = Fz.mean(dim=1, keepdim=True)  # (B,1,H,W)
+
+        F_shared = 0.5 * (Fz + B_bc)
+        B_shared = 0.5 * (Bz + F_mean)
+
+        alpha_f = alpha.expand(-1, cf, -1, -1)  # (B,Cf,H,W)
+        Fz2 = (1.0 - alpha_f) * Fz + alpha_f * F_shared
+        Bz2 = (1.0 - alpha) * Bz + alpha * B_shared
+
+        # 7) IFFT back to spatial
+        Fz2 = torch.fft.ifftshift(Fz2, dim=(-2, -1))
+        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))
+        x_fore2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real
+        x_back2 = torch.fft.ifft2(Bz2, dim=(-2, -1), norm="ortho").real
+
+        return x_back2, x_fore2
+
     def forward(
         self,
         x_t: torch.Tensor,
@@ -552,9 +683,14 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
 
         t_emb = self.time_mlp(t)
 
-        x_back = x_t[:, 0:1]
-        x_fore = x_t[:, 1:]
+        # split raw inputs
+        x_back = x_t[:, 0:1]   # (B,1,H,W)
+        x_fore = x_t[:, 1:]    # (B,xt_in_ch-1,H,W)
 
+        # ✅ Scheme-1 HOG routing BEFORE stems/encoders
+        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore)
+
+        # stems
         back = self.back_stem(x_back)
         fore = self.fore_stem(x_fore)
         cond = self.cond_stem(image)
@@ -569,13 +705,13 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
             back, b_skip = enc_b(back, t_emb)
             fore, f_skip = enc_f(fore, t_emb)
-            cond, c1 = enc_c(cond, t_emb)
+            cond, c_skip = enc_c(cond, t_emb)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
-            cond_skips.append(c1)
+            cond_skips.append(c_skip)
 
-            b_main, f_main, c_main = b_skip, f_skip, c1
+            b_main, f_main, c_main = b_skip, f_skip, c_skip
 
             # FA uses cond encoder skip as KV (cond not updated)
             if level in self.attn_level_set:
@@ -638,6 +774,10 @@ def build_model(
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 1,
     noise_strength: float = 1.0,
+    # HOG routing
+    hog_bins: int = 8,
+    hog_tau: float = 0.35,
+    hog_mag_weight: bool = True,
 ) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet:
     return FMForeBackCondDeepKTriFFTSingleDecoderResUNet(
         image_hw=tuple(image_hw),
@@ -654,6 +794,9 @@ def build_model(
         use_bottleneck_coupling=use_bottleneck_coupling,
         fa_stacks=fa_stacks,
         noise_strength=noise_strength,
+        hog_bins=hog_bins,
+        hog_tau=hog_tau,
+        hog_mag_weight=hog_mag_weight,
     )
 
 
@@ -668,6 +811,9 @@ if __name__ == "__main__":
         fa_stacks=2,
         use_bottleneck_coupling=True,
         noise_strength=1.0,
+        hog_bins=8,
+        hog_tau=0.35,
+        hog_mag_weight=True,
     )
 
     x_t = torch.randn(2, 4, 256, 256)
