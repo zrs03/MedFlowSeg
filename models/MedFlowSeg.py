@@ -22,8 +22,10 @@
     - Use alpha_c for per-fore-channel routing; use alpha_back for back routing
     - IFFT back to spatial -> x_back2/x_fore2 -> then proceed as usual
 
-✅ Cond Decoder: unchanged
-✅ Decoder: concat(back, fore) -> single decoder -> output v directly
+✅ 方案E（逐通道）: 用 t_emb 给每个 fore 通道的每个 bin 一个权重 w_{c,k}(t)
+    - wk = softmax_k( Linear(t_emb) -> (B, Cf*K) -> reshape (B,Cf,K) )
+    - sim_c = sum_k pf_c * pb * wk_{c,k}
+    - 后续 routing 不变
 """
 
 from __future__ import annotations
@@ -198,7 +200,13 @@ def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
 
 
 class FreqDenseHOG(nn.Module):
-    def __init__(self, hog_bins: int = 8, hog_tau: float = 0.35, eps: float = 1e-8, mag_weight: bool = True):
+    def __init__(
+        self,
+        hog_bins: int = 8,
+        hog_tau: float = 0.35,
+        eps: float = 1e-8,
+        mag_weight: bool = True,
+    ):
         super().__init__()
         if hog_bins < 2:
             raise ValueError("hog_bins must be >= 2")
@@ -474,6 +482,8 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
         hog_softmax_tau: float = 0.10,  # ✅ softmax 温度：小更尖(像max)，大更平(像mean)
+        # --- 方案E: bin 权重 head ---
+        hog_bin_weight_hidden: int = 0,  # 0 表示直接 linear；>0 表示 MLP hidden
     ):
         super().__init__()
 
@@ -508,11 +518,11 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
         back_in_ch = 1
-        fore_in_ch = self.xt_in_ch - 1
+        self.fore_in_ch = self.xt_in_ch - 1  # ✅ 保存 fore 通道数
         cond_in_ch = self.img_in_ch
 
         self.back_stem = nn.Conv2d(back_in_ch, self.base_ch, 3, padding=1)
-        self.fore_stem = nn.Conv2d(fore_in_ch, self.base_ch, 3, padding=1)
+        self.fore_stem = nn.Conv2d(self.fore_in_ch, self.base_ch, 3, padding=1)
         self.cond_stem = nn.Conv2d(cond_in_ch, self.base_ch, 3, padding=1)
 
         # ✅ HOG extractor used DIRECTLY (no hog encoder)
@@ -522,6 +532,22 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
             eps=self.hog_eps,
             mag_weight=hog_mag_weight,
         )
+
+        # ✅ 方案E（逐通道）: 用 t_emb 生成每个 fore 通道的 bin 权重 wk_{c,k}(t)
+        # 输出维度：Cf * K
+        out_dim = self.fore_in_ch * self.hog_bins
+        if hog_bin_weight_hidden and hog_bin_weight_hidden > 0:
+            self.hog_bin_weight_head = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.time_dim, int(hog_bin_weight_hidden)),
+                nn.SiLU(),
+                nn.Linear(int(hog_bin_weight_hidden), out_dim),
+            )
+        else:
+            self.hog_bin_weight_head = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.time_dim, out_dim),
+            )
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
@@ -609,17 +635,23 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
     # -----------------------------
     # Scheme-1 HOG routing: direct fore/back interaction BEFORE stems
     # -----------------------------
-    def _hog_routing_fuse(self, x_back: torch.Tensor, x_fore: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _hog_routing_fuse(self, x_back: torch.Tensor, x_fore: torch.Tensor, t_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x_back: (B,1,H,W)  real
         x_fore: (B,Cf,H,W) real
+        t_emb : (B,time_dim)
         return: (x_back2, x_fore2) after frequency-domain selective sharing
 
-        ✅ key change: fore->back aggregation uses SOFTMAX weights (no topk)
+        ✅ 方案E（逐通道）:
+            wk_{c,k}(t) = softmax over K for each fore channel c
+            sim_c = sum_k pf_c * pb * wk_{c,k}
         """
         b, cf, h, w = x_fore.shape
         k = self.hog_bins
         eps = self.hog_eps
+
+        if cf != self.fore_in_ch:
+            raise ValueError(f"Unexpected fore channel count: got {cf}, expected {self.fore_in_ch}")
 
         # 1) HOG maps
         hog_back_map = self.freq_hog(x_back)  # (B, 1*K, H, W)
@@ -633,25 +665,31 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         pb = pb / (pb.sum(dim=-1, keepdim=True) + eps)
         pf = pf / (pf.sum(dim=-1, keepdim=True) + eps)
 
-        # 4) per-fore-channel similarity with back: sim_c (B,Cf,H,W)
-        #    sim_c = <pf_c, pb>
-        sim_c = (pf * pb).sum(dim=-1)  # pb broadcast along Cf
+        # 4) ✅ 方案E：逐通道 bin 权重 wk_{c,k}(t)
+        # logits: (B, Cf*K) -> (B,Cf,K) -> softmax over K
+        wk_logits = self.hog_bin_weight_head(t_emb).view(b, cf, k)  # (B,Cf,K)
+        wk = torch.softmax(wk_logits, dim=-1).view(b, cf, 1, 1, k)  # (B,Cf,1,1,K)
 
-        # 5) per-channel alpha
+        # 5) per-fore-channel similarity with back: sim_c (B,Cf,H,W)
+        #    sim_c = sum_k pf_c * pb * wk_{c,k}
+        # pb broadcasts from (B,1,H,W,K) to (B,Cf,H,W,K)
+        sim_c = (pf * pb * wk).sum(dim=-1)  # (B,Cf,H,W)
+
+        # 6) per-channel alpha
         alpha_c = torch.clamp(sim_c, 0.0, 1.0)   # (B,Cf,H,W)
 
-        # 6) frequency-domain selective sharing
+        # 7) frequency-domain selective sharing
         Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,Cf,H,W) complex
         Bz = torch.fft.fftshift(torch.fft.fft2(x_back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,1,H,W) complex
 
         # broadcast back to fore channels
         B_bc = Bz.expand(-1, cf, -1, -1)  # (B,Cf,H,W)
 
-        # ---- ✅ softmax aggregation over fore channels (NO topk) ----
+        # ---- channel aggregation over fore channels (NO topk) ----
         tau = max(self.hog_softmax_tau, 1e-6)
         w_ch = torch.softmax(alpha_c / tau, dim=1)  # (B,Cf,H,W), sum over Cf = 1
 
-        # back 的 alpha：用 “softmax 加权期望” 汇总
+        # back 的 alpha：softmax 加权期望 汇总
         alpha_back = torch.clamp((w_ch * alpha_c).sum(dim=1, keepdim=True), 0.0, 1.0)  # (B,1,H,W)
 
         # fore->back 的频谱摘要：F_mix = sum_c w_c * Fz_c
@@ -667,7 +705,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         # back: aggregated alpha_back
         Bz2 = (1.0 - alpha_back).to(Bz.dtype) * Bz + alpha_back.to(Bz.dtype) * B_shared
 
-        # 7) IFFT back to spatial
+        # 8) IFFT back to spatial
         Fz2 = torch.fft.ifftshift(Fz2, dim=(-2, -1))
         Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))
         x_fore2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real
@@ -694,8 +732,8 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         x_back = x_t[:, 0:1]   # (B,1,H,W)
         x_fore = x_t[:, 1:]    # (B,Cf,H,W)
 
-        # ✅ Scheme-1 HOG routing BEFORE stems/encoders
-        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore)
+        # ✅ Scheme-1 HOG routing BEFORE stems/encoders (with per-channel bin weights from t_emb)
+        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore, t_emb=t_emb)
 
         # stems
         back = self.back_stem(x_back)
@@ -786,6 +824,8 @@ def build_model(
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
     hog_softmax_tau: float = 0.10,
+    # 方案E
+    hog_bin_weight_hidden: int = 0,
 ) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet:
     return FMForeBackCondDeepKTriFFTSingleDecoderResUNet(
         image_hw=tuple(image_hw),
@@ -806,6 +846,7 @@ def build_model(
         hog_tau=hog_tau,
         hog_mag_weight=hog_mag_weight,
         hog_softmax_tau=hog_softmax_tau,
+        hog_bin_weight_hidden=hog_bin_weight_hidden,
     )
 
 
@@ -824,6 +865,7 @@ if __name__ == "__main__":
         hog_tau=0.35,
         hog_mag_weight=True,
         hog_softmax_tau=0.10,
+        hog_bin_weight_hidden=0,  # 0: 直接 linear；>0: MLP hidden
     )
 
     x_t = torch.randn(2, 4, 256, 256)
