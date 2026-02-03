@@ -523,9 +523,6 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
             mag_weight=hog_mag_weight,
         )
 
-        # ✅ routing strength (learnable; init small so baseline not wrecked)
-        self.hog_route_logit = nn.Parameter(torch.tensor(-6.0))  # sigmoid(-6)≈0.0025
-
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
@@ -640,9 +637,8 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         #    sim_c = <pf_c, pb>
         sim_c = (pf * pb).sum(dim=-1)  # pb broadcast along Cf
 
-        # 5) routing strength (scalar) + per-channel alpha
-        route = torch.sigmoid(self.hog_route_logit)      # scalar in (0,1)
-        alpha_c = torch.clamp(route * sim_c, 0.0, 1.0)   # (B,Cf,H,W)
+        # 5) per-channel alpha
+        alpha_c = torch.clamp(sim_c, 0.0, 1.0)   # (B,Cf,H,W)
 
         # 6) frequency-domain selective sharing
         Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,Cf,H,W) complex
