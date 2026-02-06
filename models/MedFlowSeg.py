@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+"""
+✅ ControlNet-style 改法（在你这份网络基础上）：
+
+新增：每个 level 的 c_skip 后面加 1~2 个 ResBlockFiLM（可选参数，默认 1）
+- 参数：control_resblocks_per_level (int) 默认 1
+- 若设为 0：等价于不加（Identity）
+
+其余保持：
+- FA one-pass，cond 作为 KV（来自 control 分支特征）
+- 方案B direct head
+- HOG routing（方案E：ctx 只用 t_emb）
+- ControlNet ZeroConv 注入（encoder/decoder/bottleneck 可开关）
+
+✅ 本次修改：HOG share 时“只对 back 做 share”，fore 保持不变
+- 即：只用 (alpha_back) 去更新 Bz；Fz 不做任何 shared 混合（保持原样）
+"""
+
 from __future__ import annotations
 
 import math
@@ -756,7 +774,7 @@ def build_model(
     img_in_ch: int = 1,
     xt_in_ch: int = 4,
     base_ch: int = 64,
-    ch_mult: Sequence[int] = (1, 2, 4, 8),
+    ch_mult: Sequence[int] = (1, 2, 4, 4),
     num_res_blocks: int = 2,
     time_dim: int = 256,
     dropout: float = 0.0,
@@ -764,7 +782,7 @@ def build_model(
     attn_head_dim: int = 32,
     freq_attn_depth: int = 1,
     use_bottleneck_coupling: bool = True,
-    fa_stacks: int = 1,
+    fa_stacks: int = 2,
     noise_strength: float = 1.0,
     hog_bins: int = 8,
     hog_tau: float = 0.35,
@@ -774,7 +792,7 @@ def build_model(
     control_inject_to_encoder: bool = True,
     control_inject_to_decoder: bool = True,
     control_inject_to_bottleneck: bool = True,
-    control_resblocks_per_level: int = 1,
+    control_resblocks_per_level: int = 2,
 ) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet:
     return FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(
         image_hw=tuple(image_hw),
