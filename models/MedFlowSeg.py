@@ -1,35 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-✅ FA: one-pass (no step1), fore/back updated using cond as KV
-✅ REMOVE Modulator entirely (NO rank / NO basis decomposition)
-✅ Keep frequency-domain attention ops:
-    - (方案B) direct heads predict new Fri/Bri (no mask multiply)
-    - TriFFT attention updates fore/back using cond as KV
-
-✅ REMOVE: all HP inject related code/params
-
-✅ NEW: Scheme-1 HOG interaction (DIRECT use, no hog encoder, no hog->FA injection)
-    - Compute dense freq-HOG on raw split x_back/x_fore:
-        FFT -> phase(phi) + magnitude(mag)
-        soft-bin phase into hog_bins -> p: (B,C,H,W,K)
-        (optional) magnitude weighting; then normalize across K to get distribution
-    - Compute similarity sim_c(h,w) between each fore-channel HOG distribution and back HOG distribution
-        sim_c: (B,Cf,H,W)
-    - Use SOFTMAX over channels to aggregate fore->back (NO topk):
-        w = softmax(sim_c / tau)  over channel dim
-        alpha_back = sum_c w_c * alpha_c
-        F_mix = sum_c w_c * Fz_c
-    - Use alpha_c for per-fore-channel routing; use alpha_back for back routing
-    - IFFT back to spatial -> x_back2/x_fore2 -> then proceed as usual
-
-✅ 方案E+（逐通道、cond+t）:
-    - 用 t_emb + cond_emb 生成每个 fore 通道的每个 bin 权重 w_{c,k}(t,cond)
-    - cond_emb 来自 raw image 的轻量 summary（Conv -> GAP -> (B,time_dim)）
-    - wk = softmax_k( Linear([t_emb,cond_emb]) -> (B, Cf*K) -> reshape (B,Cf,K) )
-    - sim_c = sum_k pf_c * pb * wk_{c,k}
-    - 后续 routing 不变
-"""
-
 from __future__ import annotations
 
 import math
@@ -157,6 +125,41 @@ class Upsample(nn.Module):
 
 
 # -----------------------------
+# ZeroConv (ControlNet 核心)
+# -----------------------------
+class ZeroConv2d(nn.Module):
+    """1x1 conv with ZERO init (weight/bias = 0)."""
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+# -----------------------------
+# Control feature processor: N x ResBlockFiLM per level
+# -----------------------------
+class ControlResProc(nn.Module):
+    def __init__(self, ch: int, time_ch: int, num_blocks: int, dropout: float):
+        super().__init__()
+        self.num_blocks = int(num_blocks)
+        if self.num_blocks <= 0:
+            self.blocks = nn.ModuleList([])
+        else:
+            self.blocks = nn.ModuleList(
+                [ResBlockFiLM(ch, ch, time_ch=time_ch, dropout=dropout) for _ in range(self.num_blocks)]
+            )
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        return x
+
+
+# -----------------------------
 # Spatial Cross Attention (multi-head) ✅ with Norm
 # -----------------------------
 class SpatialCrossAttention(nn.Module):
@@ -194,8 +197,7 @@ class SpatialCrossAttention(nn.Module):
 
 
 # -----------------------------
-# Dense frequency-domain "HOG" (NO gradient direction) + magnitude
-# We return hog_map (B, C*K, H, W); later we reshape back to (B,C,H,W,K).
+# Dense frequency-domain "HOG" + magnitude
 # -----------------------------
 def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
     return (x + math.pi) % (2.0 * math.pi) - math.pi
@@ -222,33 +224,28 @@ class FreqDenseHOG(nn.Module):
         self.register_buffer("theta", theta, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W) real
-        return: hog_map (B, C*hog_bins, H, W)
-        """
         b, c, h, w = x.shape
 
         X = torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        mag = X.abs().clamp_min(self.eps)  # (B,C,H,W)
-        phi = torch.angle(X)               # (B,C,H,W)
+        mag = X.abs().clamp_min(self.eps)
+        phi = torch.angle(X)
 
         theta = self.theta.view(1, 1, 1, 1, self.hog_bins).to(device=x.device, dtype=phi.dtype)
-        delta = _wrap_pi(phi.unsqueeze(-1) - theta)  # (B,C,H,W,K)
+        delta = _wrap_pi(phi.unsqueeze(-1) - theta)
 
         logits = torch.cos(delta) / max(self.hog_tau, 1e-6)
-        p = F.softmax(logits, dim=-1)  # (B,C,H,W,K)
+        p = F.softmax(logits, dim=-1)
 
         if self.mag_weight:
             p = p * mag.unsqueeze(-1)
 
-        p = p.permute(0, 1, 4, 2, 3).contiguous()     # (B,C,K,H,W)
-        hog_map = p.view(b, c * self.hog_bins, h, w)  # (B,C*K,H,W)
+        p = p.permute(0, 1, 4, 2, 3).contiguous()
+        hog_map = p.view(b, c * self.hog_bins, h, w)
         return hog_map
 
 
 # -----------------------------
-# (方案B) Frequency-domain direct head: from (Fri,Cri)->Fri'  (FiLM conditioned on time)
-# 输入: (B,4C,H,W) 输出: (B,2C,H,W)
+# (方案B) Frequency-domain direct head
 # -----------------------------
 class FreqDirectHeadFiLM(nn.Module):
     def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
@@ -279,12 +276,12 @@ class FreqDirectHeadFiLM(nn.Module):
 
         h = F.silu(self.conv_mid(F.silu(h)))
         out = self.conv_out(h)
-        return out  # (B,2C,H,W)
+        return out
 
 
 # -----------------------------
-# FA module (one-pass) + (方案B) direct freq update
-# (cond not updated here; it is used as KV only)
+# FA module (one-pass) + direct freq update
+# cond: as KV only
 # -----------------------------
 class FAModule(nn.Module):
     def __init__(
@@ -293,7 +290,7 @@ class FAModule(nn.Module):
         time_ch: int,
         heads: int,
         head_dim: int,
-        noise_strength: float = 1.0,  # kept for compatibility, unused in方案B
+        noise_strength: float = 1.0,
     ):
         super().__init__()
         self.ch = int(ch)
@@ -321,13 +318,7 @@ class FAModule(nn.Module):
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
-    def forward(
-        self,
-        fore: torch.Tensor,
-        back: torch.Tensor,
-        cond: torch.Tensor,
-        t_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, fore: torch.Tensor, back: torch.Tensor, cond: torch.Tensor, t_emb: torch.Tensor):
         Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
@@ -339,8 +330,8 @@ class FAModule(nn.Module):
         f_in = torch.cat([Fri, Cri], dim=1)
         b_in = torch.cat([Bri, Cri], dim=1)
 
-        Fri = self.direct_head_f(f_in, t_emb)
-        Bri = self.direct_head_b(b_in, t_emb)
+        Fri += self.direct_head_f(f_in, t_emb)
+        Bri += self.direct_head_b(b_in, t_emb)
 
         d_fb = self.attn_fb(Fri, Bri)
         d_fc = self.attn_fc(Fri, Cri)
@@ -358,10 +349,17 @@ class FAModule(nn.Module):
         fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
         back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
 
-        return fore_out, back_out, cond
+        return fore_out, back_out
 
 
+# -----------------------------
+# Encoder stage (blocks only; downsample handled outside) ✅
+# -----------------------------
 class EncoderStageFiLM(nn.Module):
+    """
+    ✅ 只负责 ResBlocks，返回 skip（同分辨率特征）
+    ✅ downsample 放到外层做：x = stage.down(skip)
+    """
     def __init__(self, in_ch: int, out_ch: int, time_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
@@ -372,19 +370,16 @@ class EncoderStageFiLM(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.down = Downsample(out_ch) if down else None
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
             x = blk(x, t_emb)
-        skip = x
-        if self.down is not None:
-            x = self.down(x)
-        return x, skip
+        return x  # skip (same resolution)
 
 
 # -----------------------------
-# Cond decoder stage (U-Net style)
+# Decoder stage (NO cond direct add; ControlNet uses zero-injection instead)
 # -----------------------------
-class CondDecoderStage(nn.Module):
+class DecoderStageDirect(nn.Module):
     def __init__(
         self,
         in_ch: int,
@@ -398,43 +393,6 @@ class CondDecoderStage(nn.Module):
         super().__init__()
         self.up = Upsample(in_ch) if up else None
         self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
-
-        blocks: List[nn.Module] = []
-        ch = in_ch
-        for _ in range(num_blocks):
-            blocks.append(ResBlockFiLM(ch, out_ch, time_ch=time_ch, dropout=dropout))
-            ch = out_ch
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        if self.up is not None:
-            x = self.up(x)
-        x = x + self.skip_to_x(skip)
-        for blk in self.blocks:
-            x = blk(x, t_emb)
-        return x
-
-
-# -----------------------------
-# Decoder stage: direct add skip_fb + cond_feat (from cond decoder)
-# -----------------------------
-class DecoderStageCondAddDirect(nn.Module):
-    def __init__(
-        self,
-        in_ch: int,
-        skip_ch: int,
-        cond_ch: int,
-        out_ch: int,
-        time_ch: int,
-        num_blocks: int,
-        up: bool,
-        dropout: float,
-    ):
-        super().__init__()
-        self.up = Upsample(in_ch) if up else None
-
-        self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
-        self.cond_to_x = nn.Identity() if cond_ch == in_ch else nn.Conv2d(cond_ch, in_ch, 1, bias=True)
 
         blocks: List[nn.Module] = []
         ch = in_ch
@@ -445,11 +403,11 @@ class DecoderStageCondAddDirect(nn.Module):
 
         self.fuse_norm = GroupNorm32(in_ch)
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, cond_skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         if self.up is not None:
             x = self.up(x)
 
-        x = x + self.skip_to_x(skip) + self.cond_to_x(cond_skip)
+        x = x + self.skip_to_x(skip)
         x = F.silu(self.fuse_norm(x))
 
         for blk in self.blocks:
@@ -458,9 +416,9 @@ class DecoderStageCondAddDirect(nn.Module):
 
 
 # -----------------------------
-# Main Network
+# Main Network (ControlNet style injection + optional per-level control ResBlocks)
 # -----------------------------
-class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
+class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
     def __init__(
         self,
         *,
@@ -483,11 +441,15 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         hog_tau: float = 0.35,
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
-        hog_softmax_tau: float = 0.10,  # softmax 温度：小更尖(像max)，大更平(像mean)
-        # --- E+ head ---
-        hog_bin_weight_hidden: int = 0,  # 0=linear; >0=MLP
-        # --- optional: init wk uniform ---
-        init_wk_uniform: bool = True,
+        hog_softmax_tau: float = 0.10,
+        # --- 方案E: bin 权重 head ---
+        hog_bin_weight_hidden: int = 0,
+        # --- ControlNet injections ---
+        control_inject_to_encoder: bool = True,
+        control_inject_to_decoder: bool = True,
+        control_inject_to_bottleneck: bool = True,
+        # --- NEW: per-level control processing depth ---
+        control_resblocks_per_level: int = 1,
     ):
         super().__init__()
 
@@ -513,6 +475,11 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.fa_stacks = int(fa_stacks)
         self.noise_strength = float(noise_strength)
 
+        self.control_inject_to_encoder = bool(control_inject_to_encoder)
+        self.control_inject_to_decoder = bool(control_inject_to_decoder)
+        self.control_inject_to_bottleneck = bool(control_inject_to_bottleneck)
+        self.control_resblocks_per_level = int(control_resblocks_per_level)
+
         # HOG routing config
         self.hog_bins = int(hog_bins)
         self.hog_tau = float(hog_tau)
@@ -525,11 +492,14 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         self.fore_in_ch = self.xt_in_ch - 1
         cond_in_ch = self.img_in_ch
 
+        # stems (主干)
         self.back_stem = nn.Conv2d(back_in_ch, self.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(self.fore_in_ch, self.base_ch, 3, padding=1)
+
+        # control stem
         self.cond_stem = nn.Conv2d(cond_in_ch, self.base_ch, 3, padding=1)
 
-        # ✅ HOG extractor used DIRECTLY (no hog encoder)
+        # HOG extractor
         self.freq_hog = FreqDenseHOG(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
@@ -537,41 +507,25 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
             mag_weight=hog_mag_weight,
         )
 
-        # ✅ E+: cond summary (from raw image) -> (B,time_dim)
-        self.cond_summary = nn.Sequential(
-            nn.Conv2d(self.img_in_ch, self.time_dim, 3, padding=1),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),  # (B,time_dim)
-        )
-
-        # ✅ E+: per-fore-channel per-bin weights from [t_emb, cond_emb]
+        # 方案E：ctx只用 t_emb -> wk
         out_dim = self.fore_in_ch * self.hog_bins
-        in_dim = 2 * self.time_dim
         if hog_bin_weight_hidden and hog_bin_weight_hidden > 0:
             self.hog_bin_weight_head = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(in_dim, int(hog_bin_weight_hidden)),
+                nn.Linear(self.time_dim, int(hog_bin_weight_hidden)),
                 nn.SiLU(),
                 nn.Linear(int(hog_bin_weight_hidden), out_dim),
             )
         else:
             self.hog_bin_weight_head = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(in_dim, out_dim),
+                nn.Linear(self.time_dim, out_dim),
             )
-
-        # optional: start from uniform wk (stable)
-        if init_wk_uniform:
-            last = self.hog_bin_weight_head[-1]
-            if isinstance(last, nn.Linear):
-                nn.init.zeros_(last.weight)
-                nn.init.zeros_(last.bias)
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
-        # encoders
+        # encoders: 主干 back/fore + Control cond
         self.back_enc = nn.ModuleList()
         self.fore_enc = nn.ModuleList()
         self.cond_enc = nn.ModuleList()
@@ -607,40 +561,17 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
 
         self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
 
-        # cond decoder (mirror of cond encoder)
-        self.cond_dec = nn.ModuleList()
-        for i in reversed(range(n_levels)):
-            in_ch = self.chs[i] if i == (n_levels - 1) else self.chs[i + 1]
-            out_ch = self.chs[i]
-            skip_ch = self.chs[i]
-            up = i < (n_levels - 1)
-            self.cond_dec.append(
-                CondDecoderStage(
-                    in_ch=in_ch,
-                    skip_ch=skip_ch,
-                    out_ch=out_ch,
-                    time_ch=self.time_dim,
-                    num_blocks=self.num_res_blocks,
-                    up=up,
-                    dropout=self.dropout,
-                )
-            )
-
-        # SINGLE shared decoder after concat(back, fore)
+        # decoder (shared, only skip_fb)
         self.dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = 2 * self.chs[i]
-            cond_ch = self.chs[i]
-
             in_ch = (2 * self.chs[i + 1]) if i < (n_levels - 1) else (2 * self.chs[i])
             out_ch = 2 * self.chs[i]
             up = i < (n_levels - 1)
-
             self.dec.append(
-                DecoderStageCondAddDirect(
+                DecoderStageDirect(
                     in_ch=in_ch,
                     skip_ch=skip_ch,
-                    cond_ch=cond_ch,
                     out_ch=out_ch,
                     time_ch=self.time_dim,
                     num_blocks=self.num_res_blocks,
@@ -651,26 +582,39 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
 
         self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
 
-    # -----------------------------
-    # Scheme-1 HOG routing: direct fore/back interaction BEFORE stems
-    # -----------------------------
-    def _hog_routing_fuse(
-        self,
-        x_back: torch.Tensor,
-        x_fore: torch.Tensor,
-        t_emb: torch.Tensor,
-        cond_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x_back: (B,1,H,W)  real
-        x_fore: (B,Cf,H,W) real
-        t_emb : (B,time_dim)
-        cond_emb: (B,time_dim) from raw image summary
+        # per-level c_skip processing (ResBlockFiLM x N)
+        self.ctrl_proc_levels = nn.ModuleList(
+            [
+                ControlResProc(
+                    self.chs[i],
+                    time_ch=self.time_dim,
+                    num_blocks=self.control_resblocks_per_level,
+                    dropout=self.dropout,
+                )
+                for i in range(n_levels)
+            ]
+        )
+        self.ctrl_proc_mid = ControlResProc(
+            self.chs[-1],
+            time_ch=self.time_dim,
+            num_blocks=self.control_resblocks_per_level,
+            dropout=self.dropout,
+        )
 
-        E+:
-            wk_{c,k}(t,cond) = softmax over K for each fore channel c
-            sim_c = sum_k pf_c * pb * wk_{c,k}(t,cond)
-        """
+        # ControlNet ZeroConv injections
+        self.ctrl_zero_b_enc = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
+        self.ctrl_zero_f_enc = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
+
+        self.ctrl_zero_b_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
+        self.ctrl_zero_f_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
+
+        self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], 2 * self.chs[i]) for i in range(n_levels)])
+
+    # -----------------------------
+    # Scheme-1 HOG routing (方案E: ctx只用 t_emb)
+    # ✅ 修改：只对 back 做 share，fore 不变
+    # -----------------------------
+    def _hog_routing_fuse(self, x_back: torch.Tensor, x_fore: torch.Tensor, t_emb: torch.Tensor):
         b, cf, h, w = x_fore.shape
         k = self.hog_bins
         eps = self.hog_eps
@@ -678,70 +622,58 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         if cf != self.fore_in_ch:
             raise ValueError(f"Unexpected fore channel count: got {cf}, expected {self.fore_in_ch}")
 
-        # 1) HOG maps
-        hog_back_map = self.freq_hog(x_back)  # (B, 1*K, H, W)
-        hog_fore_map = self.freq_hog(x_fore)  # (B, Cf*K, H, W)
+        hog_back_map = self.freq_hog(x_back)
+        hog_fore_map = self.freq_hog(x_fore)
 
-        # 2) reshape to (B,C,H,W,K)
-        pb = hog_back_map.view(b, 1, k, h, w).permute(0, 1, 3, 4, 2).contiguous()   # (B,1,H,W,K)
-        pf = hog_fore_map.view(b, cf, k, h, w).permute(0, 1, 3, 4, 2).contiguous()  # (B,Cf,H,W,K)
+        pb = hog_back_map.view(b, 1, k, h, w).permute(0, 1, 3, 4, 2).contiguous()
+        pf = hog_fore_map.view(b, cf, k, h, w).permute(0, 1, 3, 4, 2).contiguous()
 
-        # 3) normalize across K -> distributions
         pb = pb / (pb.sum(dim=-1, keepdim=True) + eps)
         pf = pf / (pf.sum(dim=-1, keepdim=True) + eps)
 
-        # 4) E+：逐通道 bin 权重 wk_{c,k}(t,cond)
-        ctx = torch.cat([t_emb, cond_emb], dim=1)          # (B, 2*time_dim)
-        wk_logits = self.hog_bin_weight_head(ctx).view(b, cf, k)  # (B,Cf,K)
-        wk = torch.softmax(wk_logits, dim=-1).view(b, cf, 1, 1, k)  # (B,Cf,1,1,K)
+        wk_logits = self.hog_bin_weight_head(t_emb).view(b, cf, k)
+        wk = torch.softmax(wk_logits, dim=-1).view(b, cf, 1, 1, k)
 
-        # 5) per-fore-channel similarity with back: sim_c (B,Cf,H,W)
-        sim_c = (pf * pb * wk).sum(dim=-1)  # (B,Cf,H,W)
+        sim_c = (pf * pb * wk).sum(dim=-1)
+        alpha_c = torch.clamp(sim_c, 0.0, 1.0)
 
-        # 6) per-channel alpha
-        alpha_c = torch.clamp(sim_c, 0.0, 1.0)   # (B,Cf,H,W)
+        # FFT
+        Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(x_back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-        # 7) frequency-domain selective sharing
-        Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,Cf,H,W) complex
-        Bz = torch.fft.fftshift(torch.fft.fft2(x_back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))  # (B,1,H,W) complex
-
-        # broadcast back to fore channels
-        B_bc = Bz.expand(-1, cf, -1, -1)  # (B,Cf,H,W)
-
-        # ---- channel aggregation over fore channels (NO topk) ----
+        # channel weight for background share strength
         tau = max(self.hog_softmax_tau, 1e-6)
-        w_ch = torch.softmax(alpha_c / tau, dim=1)  # (B,Cf,H,W), sum over Cf = 1
+        w_ch = torch.softmax(alpha_c / tau, dim=1)
+        alpha_back = torch.clamp((w_ch * alpha_c).sum(dim=1, keepdim=True), 0.0, 1.0)
 
-        # back 的 alpha：softmax 加权期望 汇总
-        alpha_back = torch.clamp((w_ch * alpha_c).sum(dim=1, keepdim=True), 0.0, 1.0)  # (B,1,H,W)
-
-        # fore->back 的频谱摘要：F_mix = sum_c w_c * Fz_c
-        F_mix = (w_ch.to(Fz.dtype) * Fz).sum(dim=1, keepdim=True)  # (B,1,H,W) complex
-
-        # ---- apply mixing ----
-        F_shared = 0.5 * (Fz + B_bc)          # (B,Cf,H,W)
-        B_shared = 0.5 * (Bz + F_mix)         # (B,1,H,W)
-
-        # fore: per-channel alpha_c
-        Fz2 = (1.0 - alpha_c).to(Fz.dtype) * Fz + alpha_c.to(Fz.dtype) * F_shared
-
-        # back: aggregated alpha_back
+        # ✅ 只更新背景频域：B 共享一部分来自 F_mix；F 完全保持不变
+        F_mix = (w_ch.to(Fz.dtype) * Fz).sum(dim=1, keepdim=True)  # (B,1,H,W)
+        B_shared = 0.5 * (Bz + F_mix)  # (B,1,H,W)
         Bz2 = (1.0 - alpha_back).to(Bz.dtype) * Bz + alpha_back.to(Bz.dtype) * B_shared
 
-        # 8) IFFT back to spatial
-        Fz2 = torch.fft.ifftshift(Fz2, dim=(-2, -1))
-        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))
+        # iFFT
+        Fz2 = torch.fft.ifftshift(Fz, dim=(-2, -1))          # fore unchanged
+        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))         # back updated
+
         x_fore2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real
         x_back2 = torch.fft.ifft2(Bz2, dim=(-2, -1), norm="ortho").real
-
         return x_back2, x_fore2
 
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        image: torch.Tensor,
-        t: Union[torch.Tensor, float],
-    ) -> torch.Tensor:
+    def freeze_base(self):
+        base_modules = [
+            self.back_stem, self.fore_stem,
+            self.back_enc, self.fore_enc,
+            self.dec, self.out_v,
+            self.couple_modules,
+            self.bottleneck_coupler,
+        ]
+        for m in base_modules:
+            if m is None:
+                continue
+            for p in m.parameters():
+                p.requires_grad = False
+
+    def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
         if isinstance(t, float):
             t = torch.tensor(t, device=x_t.device)
         if isinstance(t, torch.Tensor) and t.dim() == 0:
@@ -749,85 +681,76 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet(nn.Module):
         elif isinstance(t, torch.Tensor) and t.dim() == 1 and t.shape[0] == 1 and x_t.shape[0] > 1:
             t = t.expand(x_t.shape[0])
 
-        t_emb = self.time_mlp(t)                 # (B,time_dim)
-        cond_emb = self.cond_summary(image)      # (B,time_dim)
+        t_emb = self.time_mlp(t)
 
-        # split raw inputs
-        x_back = x_t[:, 0:1]   # (B,1,H,W)
-        x_fore = x_t[:, 1:]    # (B,Cf,H,W)
+        x_back = x_t[:, 0:1]
+        x_fore = x_t[:, 1:]
 
-        # ✅ Scheme-1 HOG routing BEFORE stems/encoders (E+: uses cond+t)
-        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore, t_emb=t_emb, cond_emb=cond_emb)
+        # HOG routing (fore unchanged; back updated)
+        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore, t_emb=t_emb)
 
-        # stems
         back = self.back_stem(x_back)
         fore = self.fore_stem(x_fore)
+
         cond = self.cond_stem(image)
 
         fore_skips: List[torch.Tensor] = []
         back_skips: List[torch.Tensor] = []
         cond_skips: List[torch.Tensor] = []
 
-        # -----------------------------
-        # Encoder (3 branches)
-        # -----------------------------
         for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
-            back, b_skip = enc_b(back, t_emb)
-            fore, f_skip = enc_f(fore, t_emb)
-            cond, c_skip = enc_c(cond, t_emb)
+            b_skip = enc_b(back, t_emb)
+            f_skip = enc_f(fore, t_emb)
+            c_skip = enc_c(cond, t_emb)
+
+            c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
+
+            if self.control_inject_to_encoder:
+                b_skip = b_skip + self.ctrl_zero_b_enc[level](c_skip_proc)
+                f_skip = f_skip + self.ctrl_zero_f_enc[level](c_skip_proc)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
-            cond_skips.append(c_skip)
+            cond_skips.append(c_skip_proc)
 
-            b_main, f_main, c_main = b_skip, f_skip, c_skip
+            b_main, f_main, c_main = b_skip, f_skip, c_skip_proc
 
-            # FA uses cond encoder skip as KV (cond not updated)
             if level in self.attn_level_set:
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
-                    f_main, b_main, _ = fa(f_main, b_main, c_main, t_emb=t_emb)
+                    f_main, b_main = fa(f_main, b_main, c_main, t_emb=t_emb)
 
             back = enc_b.down(b_main) if enc_b.down is not None else b_main
             fore = enc_f.down(f_main) if enc_f.down is not None else f_main
             cond = enc_c.down(c_main) if enc_c.down is not None else c_main
 
-        # bottleneck coupling
+        cond_mid = self.ctrl_proc_mid(cond, t_emb)
+
+        if self.control_inject_to_bottleneck:
+            back = back + self.ctrl_zero_b_mid(cond_mid)
+            fore = fore + self.ctrl_zero_f_mid(cond_mid)
+
         if self.bottleneck_coupler is not None:
             for fa in self.bottleneck_coupler:
-                fore, back, _ = fa(fore, back, cond, t_emb=t_emb)
+                fore, back = fa(fore, back, cond_mid, t_emb=t_emb)
 
-        # -----------------------------
-        # Cond Decoder (mirror U-Net)
-        # -----------------------------
-        cond_dec_feats: List[torch.Tensor] = []
-        h_cond = cond
-        for dec_c, c_skip in zip(self.cond_dec, reversed(cond_skips)):
-            h_cond = dec_c(h_cond, c_skip, t_emb)
-            cond_dec_feats.append(h_cond)
-
-        # -----------------------------
-        # Shared Decoder (uses cond_dec_feats)
-        # -----------------------------
         h = torch.cat([back, fore], dim=1)
 
-        for dec, f_skip, b_skip, c_dec in zip(
-            self.dec,
-            reversed(fore_skips),
-            reversed(back_skips),
-            cond_dec_feats,
+        for dec_idx, (dec, f_skip, b_skip, c_skip_proc) in enumerate(
+            zip(self.dec, reversed(fore_skips), reversed(back_skips), reversed(cond_skips))
         ):
             skip_fb = torch.cat([b_skip, f_skip], dim=1)
-            h = dec(h, skip_fb, c_dec, t_emb)
+            h = dec(h, skip_fb, t_emb)
+
+            if self.control_inject_to_decoder:
+                level = (len(self.chs) - 1) - dec_idx
+                h = h + self.ctrl_zero_dec[level](c_skip_proc)
 
         h = F.silu(h)
         v = self.out_v(h)
         return v
 
 
-# -----------------------------
-# Factory
-# -----------------------------
 def build_model(
     image_hw: Tuple[int, int] = (256, 256),
     img_in_ch: int = 1,
@@ -843,16 +766,17 @@ def build_model(
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 1,
     noise_strength: float = 1.0,
-    # HOG routing
     hog_bins: int = 8,
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
     hog_softmax_tau: float = 0.10,
-    # E+
     hog_bin_weight_hidden: int = 0,
-    init_wk_uniform: bool = True,
-) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet:
-    return FMForeBackCondDeepKTriFFTSingleDecoderResUNet(
+    control_inject_to_encoder: bool = True,
+    control_inject_to_decoder: bool = True,
+    control_inject_to_bottleneck: bool = True,
+    control_resblocks_per_level: int = 1,
+) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet:
+    return FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(
         image_hw=tuple(image_hw),
         img_in_ch=img_in_ch,
         xt_in_ch=xt_in_ch,
@@ -870,9 +794,13 @@ def build_model(
         hog_bins=hog_bins,
         hog_tau=hog_tau,
         hog_mag_weight=hog_mag_weight,
+        hog_eps=1e-8,
         hog_softmax_tau=hog_softmax_tau,
         hog_bin_weight_hidden=hog_bin_weight_hidden,
-        init_wk_uniform=init_wk_uniform,
+        control_inject_to_encoder=control_inject_to_encoder,
+        control_inject_to_decoder=control_inject_to_decoder,
+        control_inject_to_bottleneck=control_inject_to_bottleneck,
+        control_resblocks_per_level=control_resblocks_per_level,
     )
 
 
@@ -891,8 +819,11 @@ if __name__ == "__main__":
         hog_tau=0.35,
         hog_mag_weight=True,
         hog_softmax_tau=0.10,
-        hog_bin_weight_hidden=0,   # 0: linear; >0: MLP
-        init_wk_uniform=True,      # True: 让 wk 初始接近均匀（更稳）
+        hog_bin_weight_hidden=0,
+        control_inject_to_encoder=True,
+        control_inject_to_decoder=True,
+        control_inject_to_bottleneck=True,
+        control_resblocks_per_level=1,
     )
 
     x_t = torch.randn(2, 4, 256, 256)
@@ -900,4 +831,4 @@ if __name__ == "__main__":
     t = torch.rand(2)
 
     v = net(x_t, img, t)
-    print("v:", v.shape)  # (2, 4, 256, 256)
+    print("v:", v.shape)
