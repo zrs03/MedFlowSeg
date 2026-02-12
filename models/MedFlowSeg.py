@@ -1,21 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-✅ 修改目标（你指定的：token 频域 + 方案A + “自token+自hog token”拼接，并按三条边做 cross-attn）
-PatchEmbed → token-grid FFT →（频域特征上做 cross-attn）→ iFFT → MLP → Unpatch
+✅ 修改目标：在你这版 “token 频域 + 方案A + 自token+自hog token拼接 + 三条边 cross-attn” 的基础上
+只加入【t_emb 的 Token-Time-FiLM 调制】——并且 feature patchify 与 hog patchify 两边都加。
 
-关键点：
-1) token 频域：FFT/iFFT 在 token-grid (Hp,Wp) 上做
-2) 方案A：计算 hog_fore / hog_back / hog_cond（dense HOG），并做 log1p + GN
-3) 拼接规则：谁当 Q/KV，就只拼接 “自己的 feature tokens + 自己的 hog tokens”
-   - FQ = [Ff_tok, Hf2_tok]
-   - BK = [Bf_tok, Hb2_tok]
-   - CK = [Cf_tok, Hc2_tok]
-4) 三条 cross-attn 边：
-   • d_fb = attn(FQ <- BK)
-   • d_fc = attn(FQ <- CK)
-   • d_bc = attn(BK <- CK)
-5) 回写频谱时只取前 N（feature RI tokens），hog tokens 仅作为条件不回写
-6) 其余结构（ControlNet、UNet 主干等）保持不变
+其余逻辑（拼接规则、三条边、只回写前N、ControlNet/UNet 主干）完全不变。
 """
 
 from __future__ import annotations
@@ -234,6 +222,31 @@ class Unpatch2D(nn.Module):
 
 
 # =========================================================
+# ✅ Token Time-FiLM (PatchEmbed 后对 tokens 做调制)
+# =========================================================
+class TokenTimeFiLM(nn.Module):
+    """
+    对 tokens 做 time conditioning:
+      x: (B,N,D)
+      t_emb: (B,time_ch)
+      out = (1+gamma)*x + beta
+    """
+    def __init__(self, dim: int, time_ch: int):
+        super().__init__()
+        self.dim = int(dim)
+        self.to_gb = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * self.dim))
+        # ✅ identity init
+        nn.init.zeros_(self.to_gb[-1].weight)
+        nn.init.zeros_(self.to_gb[-1].bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.to_gb(t_emb).chunk(2, dim=1)  # (B,D)
+        gamma = gamma[:, None, :]
+        beta  = beta[:, None, :]
+        return (1.0 + gamma) * x + beta
+
+
+# =========================================================
 # ✅ Token Cross-Attention (ViT-style)
 # =========================================================
 class TokenCrossAttention(nn.Module):
@@ -316,6 +329,7 @@ class FreqDenseHOG(nn.Module):
 # ✅ FA module: PatchEmbed → FFT → (freq cross-attn) → iFFT → MLP → Unpatch
 #   + 方案A：hog_fore / hog_back / hog_cond
 #   + 你指定的拼接与三条 cross-attn 边
+#   + ✅ 新增：feature tokens + hog tokens 都加 t 的 Token-Time-FiLM
 # =========================================================
 class FAModule(nn.Module):
     """
@@ -323,7 +337,7 @@ class FAModule(nn.Module):
       fore/back/cond: (B, C, H, W)
       hog_fore/hog_back/hog_cond: (B, C*K, H, W)
 
-    ✅ 关键：
+    关键：
       - attention 在频域：FFT 后转 RI tokens (B,N,2D) 做 cross-attn
       - iFFT 后再做 MLP：在空间 tokens (B,N,D) 上做 FFN
       - HOG（方案A）：HOG patchify 得 (B,N,D)，再 Linear 投到 (B,N,2D)
@@ -337,7 +351,7 @@ class FAModule(nn.Module):
     def __init__(
         self,
         ch: int,
-        time_ch: int,          # 保留接口（外部创建时传了 time_ch），本模块内部不使用 t_emb
+        time_ch: int,
         heads: int,
         head_dim: int,
         hog_bins: int,
@@ -370,7 +384,17 @@ class FAModule(nn.Module):
         self.patch_hb = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
         self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
 
-        # 3) HOG tokens -> RI tokens (2D)（可以共享也可以分开；这里分开更自由）
+        # ✅ 新增：Time-FiLM on patch tokens (feature)
+        self.time_film_f = TokenTimeFiLM(D, time_ch)
+        self.time_film_b = TokenTimeFiLM(D, time_ch)
+        self.time_film_c = TokenTimeFiLM(D, time_ch)
+
+        # ✅ 新增：Time-FiLM on patch tokens (hog)
+        self.time_film_hf = TokenTimeFiLM(D, time_ch)
+        self.time_film_hb = TokenTimeFiLM(D, time_ch)
+        self.time_film_hc = TokenTimeFiLM(D, time_ch)
+
+        # 3) HOG tokens -> RI tokens (2D)
         self.hog_to_ri_f = nn.Linear(D, 2 * D, bias=True)
         self.hog_to_ri_b = nn.Linear(D, 2 * D, bias=True)
         self.hog_to_ri_c = nn.Linear(D, 2 * D, bias=True)
@@ -434,7 +458,7 @@ class FAModule(nn.Module):
         hog_fore: torch.Tensor,
         hog_back: torch.Tensor,
         hog_cond: torch.Tensor,
-        t_emb: torch.Tensor,  # 保留接口（外部会传），当前逻辑不使用
+        t_emb: torch.Tensor,
     ):
         # ----------------------------
         # 1) PatchEmbed: (B,C,H,W) -> (B,N,D)
@@ -442,6 +466,11 @@ class FAModule(nn.Module):
         F_tok, hw_p = self.patch_f(fore)
         B_tok, _    = self.patch_b(back)
         C_tok, _    = self.patch_c(cond)
+
+        # ✅ 新增：Time-FiLM on feature tokens
+        F_tok = self.time_film_f(F_tok, t_emb)
+        B_tok = self.time_film_b(B_tok, t_emb)
+        C_tok = self.time_film_c(C_tok, t_emb)
 
         Hp, Wp = hw_p
         N = F_tok.shape[1]
@@ -472,27 +501,27 @@ class FAModule(nn.Module):
         Hb_tok, _ = self.patch_hb(hog_back)  # (B,N,D)
         Hc_tok, _ = self.patch_hc(hog_cond)  # (B,N,D)
 
+        # ✅ 新增：Time-FiLM on hog tokens
+        Hf_tok = self.time_film_hf(Hf_tok, t_emb)
+        Hb_tok = self.time_film_hb(Hb_tok, t_emb)
+        Hc_tok = self.time_film_hc(Hc_tok, t_emb)
+
         Hf2_tok = self.hog_to_ri_f(Hf_tok)   # (B,N,2D)
         Hb2_tok = self.hog_to_ri_b(Hb_tok)   # (B,N,2D)
         Hc2_tok = self.hog_to_ri_c(Hc_tok)   # (B,N,2D)
 
         # ----------------------------
-        # 5) ✅ 拼接规则：只拼接 “自己 feature + 自己 hog”
+        # 5) 拼接规则：只拼接 “自己 feature + 自己 hog”
         #    并按三条边做 cross-attn
         # ----------------------------
         FQ = torch.cat([Ff_tok, Hf2_tok], dim=1)  # (B,2N,2D)
         BK = torch.cat([Bf_tok, Hb2_tok], dim=1)  # (B,2N,2D)
         CK = torch.cat([Cf_tok, Hc2_tok], dim=1)  # (B,2N,2D)
 
-        # • d_fb = attn(Fri <- Bri)
         d_fb = self.attn_f_freq(FQ, BK)  # (B,2N,2D)
-
-        # • d_fc = attn(Fri <- Cri)
         d_fc = self.attn_f_freq(FQ, CK)  # (B,2N,2D)
-
         FQ2 = FQ + d_fb + d_fc
 
-        # • d_bc = attn(Bri <- Cri)
         d_bc = self.attn_b_freq(BK, CK)  # (B,2N,2D)
         BK2 = BK + d_bc
 
@@ -517,7 +546,7 @@ class FAModule(nn.Module):
         B_tok2 = self._map_to_tok(B_map2)
 
         # ----------------------------
-        # 7) ✅ MLP 在 iFFT 后： (B,N,D) -> (B,N,D)
+        # 7) MLP 在 iFFT 后： (B,N,D) -> (B,N,D)
         # ----------------------------
         F_tok2 = F_tok2 + self.mlp_f(F_tok2)
         B_tok2 = B_tok2 + self.mlp_b(B_tok2)
@@ -717,7 +746,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
                 mods.append(
                     FAModule(
                         ch=ch,
-                        time_ch=self.time_dim,  # 仅保持接口一致
+                        time_ch=self.time_dim,
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
                         hog_bins=self.hog_bins,
@@ -822,15 +851,15 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
 
             b_main, f_main, c_main = b_skip, f_skip, c_skip_proc
 
-            # ✅ 在进入 FA 前：dense HOG + log1p + GN（方案A：fore/back/cond 都算）
+            # ✅ 在进入 FA 前：dense HOG + GN（
             if level in self.attn_level_set:
                 hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
                 hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
                 hog_c = self.freq_hog(c_main)  # (B, C*K, H, W)
 
-                hog_f = self.hog_norm_levels[level](torch.log1p(hog_f))
-                hog_b = self.hog_norm_levels[level](torch.log1p(hog_b))
-                hog_c = self.hog_norm_levels[level](torch.log1p(hog_c))
+                hog_f = self.hog_norm_levels[level](hog_f)
+                hog_b = self.hog_norm_levels[level](hog_b)
+                hog_c = self.hog_norm_levels[level](hog_c)
 
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
