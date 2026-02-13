@@ -885,9 +885,9 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             hog_b = self.freq_hog(back)
             hog_c = self.freq_hog(cond_mid)
 
-            hog_f = self.hog_norm_mid(torch.log1p(hog_f))
-            hog_b = self.hog_norm_mid(torch.log1p(hog_b))
-            hog_c = self.hog_norm_mid(torch.log1p(hog_c))
+            hog_f = self.hog_norm_mid(hog_f)
+            hog_b = self.hog_norm_mid(hog_b)
+            hog_c = self.hog_norm_mid(hog_c)
 
             for fa in self.bottleneck_coupler:
                 fore, back = fa(
