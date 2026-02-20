@@ -91,15 +91,56 @@ def mean_iou_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) 
         ious.append((inter / union).mean())
     return torch.stack(ious).mean()
 
+@torch.no_grad()
+def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int):
+    """
+    Return dice for each class INCLUDING background.
+    pred, gt: (B,H,W)
+    """
+    dices = []
+    for c in range(num_classes):
+        p = (pred == c).float()
+        g = (gt == c).float()
+        inter = (p * g).sum(dim=(1, 2))
+        denom = p.sum(dim=(1, 2)) + g.sum(dim=(1, 2)) + 1e-6
+        dices.append((2 * inter / denom).mean())
+    return torch.stack(dices)  # (C,)
 
-def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
+
+@torch.no_grad()
+def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes: int):
     """
-    Only color class 1/2/3; everything else (including background 0) is pure black.
+    Return IoU for each class INCLUDING background.
+    pred, gt: (B,H,W)
     """
-    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    out[mask == 1] = [255, 0, 0]
-    out[mask == 2] = [0, 255, 0]
-    out[mask == 3] = [0, 0, 255]
+    ious = []
+    for c in range(num_classes):
+        p = (pred == c).float()
+        g = (gt == c).float()
+        inter = (p * g).sum(dim=(1, 2))
+        union = (p + g - p * g).sum(dim=(1, 2)) + 1e-6
+        ious.append((inter / union).mean())
+    return torch.stack(ious)  # (C,)
+
+
+def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
+    """
+    通用多类别可视化
+    - background (0) 为黑色
+    - 自动生成不同颜色
+    - 支持任意类别数
+    """
+    H, W = mask.shape
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+
+    if num_classes <= 1:
+        return out
+
+    for c in range(1, num_classes):
+        hue = c / num_classes
+        color = np.array(plt.cm.hsv(hue)[:3]) * 255
+        out[mask == c] = color.astype(np.uint8)
+
     return out
 
 
@@ -358,6 +399,8 @@ def run_test(
 
     dices: List[float] = []
     ious: List[float] = []
+    per_class_dices_all = []
+    per_class_ious_all = []
     vis_count = 0
 
     for bidx, batch in enumerate(loader):
@@ -405,6 +448,9 @@ def run_test(
         iou = mean_iou_foreground(pred_mask, gt_mask, num_classes=num_classes)
         dices.append(float(dice.item()))
         ious.append(float(iou.item()))
+        
+        per_class_dices_all.append(per_class_dice(pred_mask, gt_mask, num_classes).cpu())
+        per_class_ious_all.append(per_class_iou(pred_mask, gt_mask, num_classes).cpu())
 
         # ---------- vis ----------
         if vis_count < max_vis:
@@ -431,11 +477,11 @@ def run_test(
                 axs[0, 0].set_title("Image")
                 axs[0, 0].axis("off")
 
-                axs[0, 1].imshow(colorize_three_fg_else_black(gt_np[i]))
+                axs[0, 1].imshow(colorize_multiclass(gt_np[i], num_classes))
                 axs[0, 1].set_title("GT Mask")
                 axs[0, 1].axis("off")
 
-                axs[0, 2].imshow(colorize_three_fg_else_black(pred_np[i]))
+                axs[0, 2].imshow(colorize_multiclass(pred_np[i], num_classes))
                 axs[0, 2].set_title(f"Pred Mask (OVR-STAPLE K={staple_k})")
                 axs[0, 2].axis("off")
 
@@ -478,6 +524,25 @@ def run_test(
             )
 
     print("\n===== TEST DONE =====")
+    
+    # ===== 新增：打印所有类别 =====
+    per_class_dices_all = torch.stack(per_class_dices_all)
+    per_class_ious_all = torch.stack(per_class_ious_all)
+
+    mean_dice_c = per_class_dices_all.mean(dim=0)
+    std_dice_c = per_class_dices_all.std(dim=0)
+
+    mean_iou_c = per_class_ious_all.mean(dim=0)
+    std_iou_c = per_class_ious_all.std(dim=0)
+
+    print("\n===== Per-class Results (including BG=0) =====")
+    for c in range(num_classes):
+        print(
+            f"Class {c:02d} | "
+            f"Dice: {mean_dice_c[c]:.4f} ± {std_dice_c[c]:.4f} | "
+            f"IoU:  {mean_iou_c[c]:.4f} ± {std_iou_c[c]:.4f}"
+        )
+        
     print(f"Batches: {len(dices)}")
     print(f"Mean Dice (foreground 1..{num_classes-1}): {np.mean(dices):.4f}  ±  {np.std(dices):.4f}")
     print(f"Mean IoU  (foreground 1..{num_classes-1}): {np.mean(ious):.4f}  ±  {np.std(ious):.4f}")

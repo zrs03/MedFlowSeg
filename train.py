@@ -71,28 +71,45 @@ def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
 
 def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
     """
-    Mean Dice over foreground classes only (1..num_classes-1).
+    Mean Dice over foreground classes only (1..num_classes-1),
+    skip classes where both GT and pred are empty.
+
     pred, gt: (B,H,W) with labels in {0..num_classes-1}
     """
     dices = []
     for c in range(1, num_classes):
-        p = (pred == c).float()
         g = (gt == c).float()
-        inter = (p * g).sum(dim=(1, 2))
-        denom = p.sum(dim=(1, 2)) + g.sum(dim=(1, 2)) + 1e-6
-        dices.append((2 * inter / denom).mean())
+        p = (pred == c).float()
+        if g.sum() == 0:
+            continue
+
+        inter = (p * g).sum(dim=(1,2))
+        denom = p.sum(dim=(1,2)) + g.sum(dim=(1,2)) + 1e-6
+        dices.append((2*inter/denom).mean())
+
+    if len(dices) == 0:
+        return torch.tensor(0.0, device=pred.device)
     return torch.stack(dices).mean()
 
 
-def colorize_three_fg_else_black(mask: np.ndarray) -> np.ndarray:
+def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
     """
-    Only color class 1/2/3; everything else (including background 0) is pure black.
-    mask: (H,W) int labels
+    通用多类别可视化
+    - background (0) 为黑色
+    - 支持任意 num_classes
+    - 自动生成不同颜色
     """
-    out = np.zeros((*mask.shape, 3), dtype=np.uint8)  # black
-    out[mask == 1] = [255, 0, 0]
-    out[mask == 2] = [0, 255, 0]
-    out[mask == 3] = [0, 0, 255]
+    H, W = mask.shape
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+
+    if num_classes <= 1:
+        return out
+
+    for c in range(1, num_classes):
+        hue = c / num_classes
+        color = np.array(plt.cm.hsv(hue)[:3]) * 255
+        out[mask == c] = color.astype(np.uint8)
+
     return out
 
 
@@ -341,11 +358,11 @@ class LitMedFlowSeg(pl.LightningModule):
                         axs[0].set_title("Image")
                         axs[0].axis("off")
 
-                        axs[1].imshow(colorize_three_fg_else_black(gt[i]))
+                        axs[1].imshow(colorize_multiclass(gt[i], self.num_classes))
                         axs[1].set_title("GT")
                         axs[1].axis("off")
-
-                        axs[2].imshow(colorize_three_fg_else_black(pred[i]))
+                        
+                        axs[2].imshow(colorize_multiclass(pred[i], self.num_classes))
                         axs[2].set_title("Pred")
                         axs[2].axis("off")
 
@@ -377,19 +394,19 @@ def main():
     parser.add_argument("--val_root", type=str, default="./dataset/ACDC/SDF/val")
 
     # -------- Model --------
-    parser.add_argument("--num_classes", type=int, default=2)
+    parser.add_argument("--num_classes", type=int, default=4)
     parser.add_argument("--sample_steps", type=int, default=50)
 
     # -------- Optimization --------
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=144)
 
     # -------- Output --------
     parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg-ACDC")
-    parser.add_argument("--vis_every", type=int, default=5)
-    parser.add_argument("--vis_batches", type=int, default=3, help="visualize first N validation batches")
+    parser.add_argument("--vis_every", type=int, default=10)
+    parser.add_argument("--vis_batches", type=int, default=2, help="visualize first N validation batches")
 
     # threshold for pred decoding (since your sdf is normalized to [-1,1])
     parser.add_argument("--thresh", type=float, default=1e-3)
@@ -397,7 +414,7 @@ def main():
 
     # ✅ EMA: default ON, use --no_ema to disable
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
-    parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
 
     # ✅ Resume
     parser.add_argument(
@@ -467,7 +484,7 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
-        strategy="ddp_find_unused_parameters_true",
+        # strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
         callbacks=[ckpt_cb],
         logger=logger,

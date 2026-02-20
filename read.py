@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--path", type=str, default='/Birmingham/MedFlowSeg/000000_sdf_pred_k0.npy', help="path to .npy file")
+    ap.add_argument("--path", type=str, default='/Birmingham/MedFlowSeg/onehot.npy', help="path to .npy file")
     args = ap.parse_args()
 
     x = np.load(args.path)

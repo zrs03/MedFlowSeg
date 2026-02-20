@@ -1,15 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-✅ 修改目标：在你这版 “token 频域 + 方案A + 自token+自hog token拼接 + 三条边 cross-attn” 的基础上
-只加入【t_emb 的 Token-Time-FiLM 调制】——并且 feature patchify 与 hog patchify 两边都加。
-
-其余逻辑（拼接规则、三条边、只回写前N、ControlNet/UNet 主干）完全不变。
-"""
-
 from __future__ import annotations
 
 import math
-from typing import List, Sequence, Tuple, Union, Optional
+from typing import List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -167,110 +159,41 @@ class ControlResProc(nn.Module):
         return x
 
 
-# =========================================================
-# ✅ ViT-style patchify & unpatchify
-# =========================================================
-class PatchEmbed2D(nn.Module):
-    """
-    ViT-style patchify + linear projection by Conv2d(stride=patch).
-    Input : (B, C, H, W)
-    Output: (B, N, D) where N=(H/P)*(W/P)
-    """
-    def __init__(self, in_ch: int, embed_dim: int, patch: int):
+# -----------------------------
+# Spatial Cross Attention (multi-head) ✅ with Norm
+# -----------------------------
+class SpatialCrossAttention(nn.Module):
+    def __init__(self, q_ch: int, kv_ch: int, heads: int = 4, head_dim: int = 32):
         super().__init__()
-        self.in_ch = int(in_ch)
-        self.embed_dim = int(embed_dim)
-        self.patch = int(patch)
-        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=self.patch, stride=self.patch, bias=True)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
-        b, c, h, w = x.shape
-        p = self.patch
-        if (h % p) != 0 or (w % p) != 0:
-            raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h,w)}")
-        x = self.proj(x)  # (B, D, H/P, W/P)
-        hp, wp = x.shape[-2], x.shape[-1]
-        x = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, D)
-        return x, (hp, wp)
-
-
-class Unpatch2D(nn.Module):
-    """
-    token -> (B, C, H, W) 反 patchify
-    方式：Linear(D -> C*P*P) 后 reshape 回原图（非重叠）
-    """
-    def __init__(self, embed_dim: int, out_ch: int, patch: int):
-        super().__init__()
-        self.embed_dim = int(embed_dim)
-        self.out_ch = int(out_ch)
-        self.patch = int(patch)
-        self.to_patch = nn.Linear(embed_dim, out_ch * patch * patch, bias=True)
-
-    def forward(self, tokens: torch.Tensor, hw_patch: Tuple[int, int]) -> torch.Tensor:
-        # tokens: (B, N, D), hw_patch: (Hp, Wp)
-        b, n, d = tokens.shape
-        hp, wp = hw_patch
-        p = self.patch
-        if n != hp * wp:
-            raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp*wp}")
-
-        x = self.to_patch(tokens)  # (B, N, C*P*P)
-        x = x.view(b, hp, wp, self.out_ch, p, p)  # (B, Hp, Wp, C, p, p)
-        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()  # (B, C, Hp, p, Wp, p)
-        x = x.view(b, self.out_ch, hp * p, wp * p)  # (B, C, H, W)
-        return x
-
-
-# =========================================================
-# ✅ Token Time-FiLM (PatchEmbed 后对 tokens 做调制)
-# =========================================================
-class TokenTimeFiLM(nn.Module):
-    """
-    对 tokens 做 time conditioning:
-      x: (B,N,D)
-      t_emb: (B,time_ch)
-      out = (1+gamma)*x + beta
-    """
-    def __init__(self, dim: int, time_ch: int):
-        super().__init__()
-        self.dim = int(dim)
-        self.to_gb = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * self.dim))
-        # ✅ identity init
-        nn.init.zeros_(self.to_gb[-1].weight)
-        nn.init.zeros_(self.to_gb[-1].bias)
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        gamma, beta = self.to_gb(t_emb).chunk(2, dim=1)  # (B,D)
-        gamma = gamma[:, None, :]
-        beta  = beta[:, None, :]
-        return (1.0 + gamma) * x + beta
-
-
-# =========================================================
-# ✅ Token Cross-Attention (ViT-style)
-# =========================================================
-class TokenCrossAttention(nn.Module):
-    """
-    Cross-attention in token space:
-      q_tokens: (B, Nq, D)
-      kv_tokens: (B, Nk, D)
-    Output:
-      (B, Nq, D)
-    """
-    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.dim = int(dim)
         self.heads = int(heads)
-        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.heads, dropout=dropout, batch_first=True)
-        self.ln_q = nn.LayerNorm(self.dim)
-        self.ln_kv = nn.LayerNorm(self.dim)
-        self.proj = nn.Sequential(nn.Linear(self.dim, self.dim), nn.Dropout(dropout))
+        self.head_dim = int(head_dim)
+        inner = self.heads * self.head_dim
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        qn = self.ln_q(q)
-        kvn = self.ln_kv(kv)
-        out, _ = self.attn(qn, kvn, kvn, need_weights=False)
-        return self.proj(out)
+        self.to_q = nn.Conv2d(q_ch, inner, 1, bias=False)
+        self.to_k = nn.Conv2d(kv_ch, inner, 1, bias=False)
+        self.to_v = nn.Conv2d(kv_ch, inner, 1, bias=False)
+
+        self.out = nn.Conv2d(inner, q_ch, 1)
+        self.scale = self.head_dim**-0.5
+
+        self.norm_q = GroupNorm32(q_ch)
+        self.norm_kv = GroupNorm32(kv_ch)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+
+        x = self.norm_q(x)
+        c = self.norm_kv(c)
+
+        q = self.to_q(x).view(b, self.heads, self.head_dim, h * w)
+        k = self.to_k(c).view(b, self.heads, self.head_dim, h * w)
+        v = self.to_v(c).view(b, self.heads, self.head_dim, h * w)
+
+        attn = torch.einsum("bhdi,bhdj->bhij", q * self.scale, k).softmax(dim=-1)
+        out = torch.einsum("bhij,bhdj->bhdi", attn, v).reshape(
+            b, self.heads * self.head_dim, h, w
+        )
+        return self.out(out)
 
 
 # -----------------------------
@@ -281,10 +204,6 @@ def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
 
 
 class FreqDenseHOG(nn.Module):
-    """
-    输入 x: (B,C,H,W)
-    输出 hog_map: (B, C*K, H, W)  —— 不改变空间分辨率
-    """
     def __init__(
         self,
         hog_bins: int = 8,
@@ -325,245 +244,122 @@ class FreqDenseHOG(nn.Module):
         return hog_map
 
 
-# =========================================================
-# ✅ FA module: PatchEmbed → FFT → (freq cross-attn) → iFFT → MLP → Unpatch
-#   + 方案A：hog_fore / hog_back / hog_cond
-#   + 你指定的拼接与三条 cross-attn 边
-#   + ✅ 新增：feature tokens + hog tokens 都加 t 的 Token-Time-FiLM
-# =========================================================
-class FAModule(nn.Module):
-    """
-    输入：
-      fore/back/cond: (B, C, H, W)
-      hog_fore/hog_back/hog_cond: (B, C*K, H, W)
+# -----------------------------
+# (方案B) Frequency-domain direct head
+# -----------------------------
+class FreqDirectHeadFiLM(nn.Module):
+    def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
+        super().__init__()
+        self.ch = int(ch)
+        hid = int(hidden_mult * ch)
 
-    关键：
-      - attention 在频域：FFT 后转 RI tokens (B,N,2D) 做 cross-attn
-      - iFFT 后再做 MLP：在空间 tokens (B,N,D) 上做 FFN
-      - HOG（方案A）：HOG patchify 得 (B,N,D)，再 Linear 投到 (B,N,2D)
-      - 拼接规则：谁当 Q/KV，就只拼接自己 feature+自己 hog
-      - 三条边：
-          d_fb = attn(FQ <- BK)
-          d_fc = attn(FQ <- CK)
-          d_bc = attn(BK <- CK)
-      - 回写频谱只取前 N（feature RI tokens），hog tokens 仅作条件
-    """
+        self.in_norm = GroupNorm32(4 * ch)
+        self.conv_in = nn.Conv2d(4 * ch, hid, 3, padding=1)
+
+        self.hid_norm = GroupNorm32(hid)
+        self.to_film = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * hid))
+
+        self.conv_mid = nn.Conv2d(hid, hid, 3, padding=1)
+        self.conv_out = nn.Conv2d(hid, 2 * ch, 1)
+
+        nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x_ri4c: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv_in(F.silu(self.in_norm(x_ri4c)))
+
+        h = self.hid_norm(h)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
+        h = (1.0 + gamma) * h + beta
+
+        h = F.silu(self.conv_mid(F.silu(h)))
+        out = self.conv_out(h)
+        return out
+
+
+# -----------------------------
+# FA module (one-pass) + direct freq update
+# cond: as KV only
+# -----------------------------
+class FAModule(nn.Module):
     def __init__(
         self,
         ch: int,
         time_ch: int,
         heads: int,
         head_dim: int,
-        hog_bins: int,
         noise_strength: float = 1.0,
-        fa_patch: int = 4,
-        fa_attn_dropout: float = 0.0,
-        token_dim: Optional[int] = None,
     ):
         super().__init__()
         self.ch = int(ch)
-        self.hog_bins = int(hog_bins)
         self.noise_strength = float(noise_strength)
 
-        self.fa_patch = int(fa_patch)
-        if token_dim is None:
-            token_dim = int(heads * head_dim)
-        self.token_dim = int(token_dim)
+        self.attn_fb = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_fc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
+        self.attn_bc = SpatialCrossAttention(q_ch=2 * ch, kv_ch=2 * ch, heads=heads, head_dim=head_dim)
 
-        C = self.ch
-        D = self.token_dim
-        hog_ch = C * self.hog_bins
+        self.post_f = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.post_b = nn.Sequential(GroupNorm32(2 * ch), nn.SiLU(), nn.Conv2d(2 * ch, 2 * ch, 1))
+        self.norm_f = GroupNorm32(2 * ch)
+        self.norm_b = GroupNorm32(2 * ch)
 
-        # 1) patchify 主特征：C -> D
-        self.patch_f = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-        self.patch_b = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-        self.patch_c = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-
-        # 2) patchify HOG：C*K -> D（空间域 tokens）
-        self.patch_hf = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-        self.patch_hb = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-        self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-
-        # ✅ 新增：Time-FiLM on patch tokens (feature)
-        self.time_film_f = TokenTimeFiLM(D, time_ch)
-        self.time_film_b = TokenTimeFiLM(D, time_ch)
-        self.time_film_c = TokenTimeFiLM(D, time_ch)
-
-        # ✅ 新增：Time-FiLM on patch tokens (hog)
-        self.time_film_hf = TokenTimeFiLM(D, time_ch)
-        self.time_film_hb = TokenTimeFiLM(D, time_ch)
-        self.time_film_hc = TokenTimeFiLM(D, time_ch)
-
-        # 3) HOG tokens -> RI tokens (2D)
-        self.hog_to_ri_f = nn.Linear(D, 2 * D, bias=True)
-        self.hog_to_ri_b = nn.Linear(D, 2 * D, bias=True)
-        self.hog_to_ri_c = nn.Linear(D, 2 * D, bias=True)
-
-        # 4) 频域 cross-attn：embed_dim = 2D
-        self.attn_f_freq = TokenCrossAttention(dim=2 * D, heads=heads, dropout=fa_attn_dropout)
-        self.attn_b_freq = TokenCrossAttention(dim=2 * D, heads=heads, dropout=fa_attn_dropout)
-
-        # 5) iFFT 后 MLP：embed_dim = D
-        self.mlp_f = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 4 * D),
-            nn.SiLU(),
-            nn.Linear(4 * D, D),
-        )
-        self.mlp_b = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 4 * D),
-            nn.SiLU(),
-            nn.Linear(4 * D, D),
-        )
-
-        # 6) unpatch：D -> C
-        self.unpatch_f = Unpatch2D(embed_dim=D, out_ch=C, patch=self.fa_patch)
-        self.unpatch_b = Unpatch2D(embed_dim=D, out_ch=C, patch=self.fa_patch)
+        self.direct_head_f = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
+        self.direct_head_b = FreqDirectHeadFiLM(ch=ch, time_ch=time_ch)
 
     @staticmethod
-    def _tok_to_map(tok: torch.Tensor, hp: int, wp: int) -> torch.Tensor:
-        # (B, N, D) -> (B, D, Hp, Wp)
-        b, n, d = tok.shape
-        if n != hp * wp:
-            raise ValueError(f"_tok_to_map: N={n} but Hp*Wp={hp*wp}")
-        return tok.transpose(1, 2).contiguous().view(b, d, hp, wp)
+    def _to_ri(z: torch.Tensor) -> torch.Tensor:
+        return torch.cat([z.real, z.imag], dim=1)
 
     @staticmethod
-    def _map_to_tok(m: torch.Tensor) -> torch.Tensor:
-        # (B, D, Hp, Wp) -> (B, N, D)
-        return m.flatten(2).transpose(1, 2).contiguous()
+    def _to_complex(ri: torch.Tensor) -> torch.Tensor:
+        b, c2, h, w = ri.shape
+        c = c2 // 2
+        return torch.complex(ri[:, :c], ri[:, c:])
 
-    @staticmethod
-    def _complex_to_ri_tokens(z: torch.Tensor) -> torch.Tensor:
-        # z: (B, D, Hp, Wp) complex -> RI map (B, 2D, Hp, Wp) -> tokens (B, N, 2D)
-        ri = torch.cat([z.real, z.imag], dim=1)           # (B, 2D, Hp, Wp)
-        return ri.flatten(2).transpose(1, 2).contiguous() # (B, N, 2D)
+    def forward(self, fore: torch.Tensor, back: torch.Tensor, cond: torch.Tensor, t_emb: torch.Tensor):
+        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-    @staticmethod
-    def _ri_tokens_to_complex(tok_ri: torch.Tensor, hp: int, wp: int) -> torch.Tensor:
-        # tok_ri: (B, N, 2D) -> ri map (B, 2D, Hp, Wp) -> complex (B, D, Hp, Wp)
-        b, n, d2 = tok_ri.shape
-        if n != hp * wp:
-            raise ValueError(f"_ri_tokens_to_complex: N={n} but Hp*Wp={hp*wp}")
-        d = d2 // 2
-        ri = tok_ri.transpose(1, 2).contiguous().view(b, d2, hp, wp)  # (B, 2D, Hp, Wp)
-        return torch.complex(ri[:, :d], ri[:, d:])                     # (B, D, Hp, Wp) complex
+        Fri = self._to_ri(Fz)
+        Bri = self._to_ri(Bz)
+        Cri = self._to_ri(Cz)
 
-    def forward(
-        self,
-        fore: torch.Tensor,
-        back: torch.Tensor,
-        cond: torch.Tensor,
-        hog_fore: torch.Tensor,
-        hog_back: torch.Tensor,
-        hog_cond: torch.Tensor,
-        t_emb: torch.Tensor,
-    ):
-        # ----------------------------
-        # 1) PatchEmbed: (B,C,H,W) -> (B,N,D)
-        # ----------------------------
-        F_tok, hw_p = self.patch_f(fore)
-        B_tok, _    = self.patch_b(back)
-        C_tok, _    = self.patch_c(cond)
+        f_in = torch.cat([Fri, Cri], dim=1)
+        b_in = torch.cat([Bri, Cri], dim=1)
 
-        # ✅ 新增：Time-FiLM on feature tokens
-        F_tok = self.time_film_f(F_tok, t_emb)
-        B_tok = self.time_film_b(B_tok, t_emb)
-        C_tok = self.time_film_c(C_tok, t_emb)
+        Fri += self.direct_head_f(f_in, t_emb)
+        Bri += self.direct_head_b(b_in, t_emb)
 
-        Hp, Wp = hw_p
-        N = F_tok.shape[1]
+        d_fb = self.attn_fb(Fri, Bri)
+        d_fc = self.attn_fc(Fri, Cri)
+        Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
 
-        # tokens -> token-grid maps: (B,D,Hp,Wp)
-        F_map = self._tok_to_map(F_tok, Hp, Wp)
-        B_map = self._tok_to_map(B_tok, Hp, Wp)
-        C_map = self._tok_to_map(C_tok, Hp, Wp)
+        d_bc = self.attn_bc(Bri, Cri)
+        Bri2 = self.norm_b(self.post_b(Bri + d_bc))
 
-        # ----------------------------
-        # 2) FFT on token-grid: (Hp,Wp)
-        # ----------------------------
-        Fz = torch.fft.fftshift(torch.fft.fft2(F_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Bz = torch.fft.fftshift(torch.fft.fft2(B_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Cz = torch.fft.fftshift(torch.fft.fft2(C_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        F2c = self._to_complex(Fri2)
+        B2c = self._to_complex(Bri2)
 
-        # ----------------------------
-        # 3) complex -> RI tokens: (B,N,2D)
-        # ----------------------------
-        Ff_tok = self._complex_to_ri_tokens(Fz)  # (B,N,2D)
-        Bf_tok = self._complex_to_ri_tokens(Bz)  # (B,N,2D)
-        Cf_tok = self._complex_to_ri_tokens(Cz)  # (B,N,2D)
+        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
+        B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
 
-        # ----------------------------
-        # 4) HOG tokens: (B,N,D) -> (B,N,2D)
-        # ----------------------------
-        Hf_tok, _ = self.patch_hf(hog_fore)  # (B,N,D)
-        Hb_tok, _ = self.patch_hb(hog_back)  # (B,N,D)
-        Hc_tok, _ = self.patch_hc(hog_cond)  # (B,N,D)
-
-        # ✅ 新增：Time-FiLM on hog tokens
-        Hf_tok = self.time_film_hf(Hf_tok, t_emb)
-        Hb_tok = self.time_film_hb(Hb_tok, t_emb)
-        Hc_tok = self.time_film_hc(Hc_tok, t_emb)
-
-        Hf2_tok = self.hog_to_ri_f(Hf_tok)   # (B,N,2D)
-        Hb2_tok = self.hog_to_ri_b(Hb_tok)   # (B,N,2D)
-        Hc2_tok = self.hog_to_ri_c(Hc_tok)   # (B,N,2D)
-
-        # ----------------------------
-        # 5) 拼接规则：只拼接 “自己 feature + 自己 hog”
-        #    并按三条边做 cross-attn
-        # ----------------------------
-        FQ = torch.cat([Ff_tok, Hf2_tok], dim=1)  # (B,2N,2D)
-        BK = torch.cat([Bf_tok, Hb2_tok], dim=1)  # (B,2N,2D)
-        CK = torch.cat([Cf_tok, Hc2_tok], dim=1)  # (B,2N,2D)
-
-        d_fb = self.attn_f_freq(FQ, BK)  # (B,2N,2D)
-        d_fc = self.attn_f_freq(FQ, CK)  # (B,2N,2D)
-        FQ2 = FQ + d_fb + d_fc
-
-        d_bc = self.attn_b_freq(BK, CK)  # (B,2N,2D)
-        BK2 = BK + d_bc
-
-        # 回写频谱只取前 N（feature RI tokens），hog tokens 不回写
-        Ff_tok2 = FQ2[:, :N, :]  # (B,N,2D)
-        Bf_tok2 = BK2[:, :N, :]  # (B,N,2D)
-
-        # ----------------------------
-        # 6) iFFT: RI tokens -> complex -> iFFT2 -> real token-grid (B,D,Hp,Wp)
-        # ----------------------------
-        Fz2 = self._ri_tokens_to_complex(Ff_tok2, Hp, Wp)  # (B,D,Hp,Wp) complex
-        Bz2 = self._ri_tokens_to_complex(Bf_tok2, Hp, Wp)
-
-        Fz2 = torch.fft.ifftshift(Fz2, dim=(-2, -1))
-        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))
-
-        F_map2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real  # (B,D,Hp,Wp)
-        B_map2 = torch.fft.ifft2(Bz2, dim=(-2, -1), norm="ortho").real
-
-        # map -> space tokens: (B,N,D)
-        F_tok2 = self._map_to_tok(F_map2)
-        B_tok2 = self._map_to_tok(B_map2)
-
-        # ----------------------------
-        # 7) MLP 在 iFFT 后： (B,N,D) -> (B,N,D)
-        # ----------------------------
-        F_tok2 = F_tok2 + self.mlp_f(F_tok2)
-        B_tok2 = B_tok2 + self.mlp_b(B_tok2)
-
-        # ----------------------------
-        # 8) Unpatch: (B,N,D) -> (B,C,H,W)
-        # ----------------------------
-        fore_out = self.unpatch_f(F_tok2, hw_p)
-        back_out = self.unpatch_b(B_tok2, hw_p)
+        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
+        back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
 
         return fore_out, back_out
 
 
 # -----------------------------
-# Encoder stage (blocks only; downsample handled outside)
+# Encoder stage (blocks only; downsample handled outside) ✅
 # -----------------------------
 class EncoderStageFiLM(nn.Module):
+    """
+    ✅ 只负责 ResBlocks，返回 skip（同分辨率特征）
+    ✅ downsample 放到外层做：x = stage.down(skip)
+    """
     def __init__(self, in_ch: int, out_ch: int, time_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
@@ -577,11 +373,11 @@ class EncoderStageFiLM(nn.Module):
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
             x = blk(x, t_emb)
-        return x
+        return x  # skip (same resolution)
 
 
 # -----------------------------
-# Decoder stage
+# Decoder stage (NO cond direct add; ControlNet uses zero-injection instead)
 # -----------------------------
 class DecoderStageDirect(nn.Module):
     def __init__(
@@ -620,7 +416,7 @@ class DecoderStageDirect(nn.Module):
 
 
 # -----------------------------
-# Main Network
+# Main Network (ControlNet style injection + optional per-level control ResBlocks)
 # -----------------------------
 class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
     def __init__(
@@ -640,20 +436,20 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         use_bottleneck_coupling: bool,
         fa_stacks: int,
         noise_strength: float = 1.0,
-        # --- HOG config (dense) ---
+        # --- HOG routing params ---
         hog_bins: int = 8,
         hog_tau: float = 0.35,
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
+        hog_softmax_tau: float = 0.10,
+        # --- 方案E: bin 权重 head ---
+        hog_bin_weight_hidden: int = 0,
         # --- ControlNet injections ---
         control_inject_to_encoder: bool = True,
         control_inject_to_decoder: bool = True,
         control_inject_to_bottleneck: bool = True,
+        # --- NEW: per-level control processing depth ---
         control_resblocks_per_level: int = 1,
-        # --- FA patch/token settings ---
-        fa_patch: int = 4,
-        fa_attn_dropout: float = 0.0,
-        fa_token_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -684,15 +480,11 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         self.control_inject_to_bottleneck = bool(control_inject_to_bottleneck)
         self.control_resblocks_per_level = int(control_resblocks_per_level)
 
-        # dense HOG config
+        # HOG routing config
         self.hog_bins = int(hog_bins)
         self.hog_tau = float(hog_tau)
         self.hog_eps = float(hog_eps)
-
-        # FA config
-        self.fa_patch = int(fa_patch)
-        self.fa_attn_dropout = float(fa_attn_dropout)
-        self.fa_token_dim = fa_token_dim
+        self.hog_softmax_tau = float(hog_softmax_tau)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
@@ -707,7 +499,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         # control stem
         self.cond_stem = nn.Conv2d(cond_in_ch, self.base_ch, 3, padding=1)
 
-        # Dense HOG extractor
+        # HOG extractor
         self.freq_hog = FreqDenseHOG(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
@@ -715,18 +507,23 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             mag_weight=hog_mag_weight,
         )
 
+        # 方案E：ctx只用 t_emb -> wk
+        out_dim = self.fore_in_ch * self.hog_bins
+        if hog_bin_weight_hidden and hog_bin_weight_hidden > 0:
+            self.hog_bin_weight_head = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.time_dim, int(hog_bin_weight_hidden)),
+                nn.SiLU(),
+                nn.Linear(int(hog_bin_weight_hidden), out_dim),
+            )
+        else:
+            self.hog_bin_weight_head = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.time_dim, out_dim),
+            )
+
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
-
-        # FA levels: last K
-        K_levels = min(self.freq_attn_depth, n_levels)
-        self.attn_level_set = set(range(n_levels - K_levels, n_levels))
-
-        self.hog_norm_levels = nn.ModuleList([
-            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
-            for i in range(n_levels)
-        ])
-        self.hog_norm_mid = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
 
         # encoders: 主干 back/fore + Control cond
         self.back_enc = nn.ModuleList()
@@ -740,6 +537,10 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             self.fore_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
             self.cond_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
 
+        # FA levels: last K
+        K = min(self.freq_attn_depth, n_levels)
+        self.attn_level_set = set(range(n_levels - K, n_levels))
+
         def make_fa_list(ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
             for _ in range(self.fa_stacks):
@@ -749,11 +550,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
                         time_ch=self.time_dim,
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
-                        hog_bins=self.hog_bins,
                         noise_strength=self.noise_strength,
-                        fa_patch=self.fa_patch,
-                        fa_attn_dropout=self.fa_attn_dropout,
-                        token_dim=self.fa_token_dim,
                     )
                 )
             return mods
@@ -785,7 +582,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
 
         self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
 
-        # per-level c_skip processing
+        # per-level c_skip processing (ResBlockFiLM x N)
         self.ctrl_proc_levels = nn.ModuleList(
             [
                 ControlResProc(
@@ -813,6 +610,69 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
 
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], 2 * self.chs[i]) for i in range(n_levels)])
 
+    # -----------------------------
+    # Scheme-1 HOG routing (方案E: ctx只用 t_emb)
+    # ✅ 修改：只对 back 做 share，fore 不变
+    # -----------------------------
+    def _hog_routing_fuse(self, x_back: torch.Tensor, x_fore: torch.Tensor, t_emb: torch.Tensor):
+        b, cf, h, w = x_fore.shape
+        k = self.hog_bins
+        eps = self.hog_eps
+
+        if cf != self.fore_in_ch:
+            raise ValueError(f"Unexpected fore channel count: got {cf}, expected {self.fore_in_ch}")
+
+        hog_back_map = self.freq_hog(x_back)
+        hog_fore_map = self.freq_hog(x_fore)
+
+        pb = hog_back_map.view(b, 1, k, h, w).permute(0, 1, 3, 4, 2).contiguous()
+        pf = hog_fore_map.view(b, cf, k, h, w).permute(0, 1, 3, 4, 2).contiguous()
+
+        pb = pb / (pb.sum(dim=-1, keepdim=True) + eps)
+        pf = pf / (pf.sum(dim=-1, keepdim=True) + eps)
+
+        wk_logits = self.hog_bin_weight_head(t_emb).view(b, cf, k)
+        wk = torch.softmax(wk_logits, dim=-1).view(b, cf, 1, 1, k)
+
+        sim_c = (pf * pb * wk).sum(dim=-1)
+        alpha_c = torch.clamp(sim_c, 0.0, 1.0)
+
+        # FFT
+        Fz = torch.fft.fftshift(torch.fft.fft2(x_fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(x_back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+
+        # channel weight for background share strength
+        tau = max(self.hog_softmax_tau, 1e-6)
+        w_ch = torch.softmax(alpha_c / tau, dim=1)
+        alpha_back = torch.clamp((w_ch * alpha_c).sum(dim=1, keepdim=True), 0.0, 1.0)
+
+        # ✅ 只更新背景频域：B 共享一部分来自 F_mix；F 完全保持不变
+        F_mix = (w_ch.to(Fz.dtype) * Fz).sum(dim=1, keepdim=True)  # (B,1,H,W)
+        B_shared = 0.5 * (Bz + F_mix)  # (B,1,H,W)
+        Bz2 = (1.0 - alpha_back).to(Bz.dtype) * Bz + alpha_back.to(Bz.dtype) * B_shared
+
+        # iFFT
+        Fz2 = torch.fft.ifftshift(Fz, dim=(-2, -1))          # fore unchanged
+        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))         # back updated
+
+        x_fore2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real
+        x_back2 = torch.fft.ifft2(Bz2, dim=(-2, -1), norm="ortho").real
+        return x_back2, x_fore2
+
+    def freeze_base(self):
+        base_modules = [
+            self.back_stem, self.fore_stem,
+            self.back_enc, self.fore_enc,
+            self.dec, self.out_v,
+            self.couple_modules,
+            self.bottleneck_coupler,
+        ]
+        for m in base_modules:
+            if m is None:
+                continue
+            for p in m.parameters():
+                p.requires_grad = False
+
     def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
         if isinstance(t, float):
             t = torch.tensor(t, device=x_t.device)
@@ -826,8 +686,12 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         x_back = x_t[:, 0:1]
         x_fore = x_t[:, 1:]
 
+        # HOG routing (fore unchanged; back updated)
+        x_back, x_fore = self._hog_routing_fuse(x_back, x_fore, t_emb=t_emb)
+
         back = self.back_stem(x_back)
         fore = self.fore_stem(x_fore)
+
         cond = self.cond_stem(image)
 
         fore_skips: List[torch.Tensor] = []
@@ -835,9 +699,9 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         cond_skips: List[torch.Tensor] = []
 
         for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
-            b_skip = enc_b(back, t_emb)   # (B, C, H, W)
-            f_skip = enc_f(fore, t_emb)   # (B, C, H, W)
-            c_skip = enc_c(cond, t_emb)   # (B, C, H, W)
+            b_skip = enc_b(back, t_emb)
+            f_skip = enc_f(fore, t_emb)
+            c_skip = enc_c(cond, t_emb)
 
             c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
 
@@ -851,23 +715,10 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
 
             b_main, f_main, c_main = b_skip, f_skip, c_skip_proc
 
-            # ✅ 在进入 FA 前：dense HOG + GN（
             if level in self.attn_level_set:
-                hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
-                hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
-                hog_c = self.freq_hog(c_main)  # (B, C*K, H, W)
-
-                hog_f = self.hog_norm_levels[level](hog_f)
-                hog_b = self.hog_norm_levels[level](hog_b)
-                hog_c = self.hog_norm_levels[level](hog_c)
-
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
-                    f_main, b_main = fa(
-                        f_main, b_main, c_main,
-                        hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
-                        t_emb=t_emb
-                    )
+                    f_main, b_main = fa(f_main, b_main, c_main, t_emb=t_emb)
 
             back = enc_b.down(b_main) if enc_b.down is not None else b_main
             fore = enc_f.down(f_main) if enc_f.down is not None else f_main
@@ -879,22 +730,9 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             back = back + self.ctrl_zero_b_mid(cond_mid)
             fore = fore + self.ctrl_zero_f_mid(cond_mid)
 
-        # ✅ bottleneck 同理：dense HOG + log1p + GN（方案A：fore/back/cond）
         if self.bottleneck_coupler is not None:
-            hog_f = self.freq_hog(fore)
-            hog_b = self.freq_hog(back)
-            hog_c = self.freq_hog(cond_mid)
-
-            hog_f = self.hog_norm_mid(hog_f)
-            hog_b = self.hog_norm_mid(hog_b)
-            hog_c = self.hog_norm_mid(hog_c)
-
             for fa in self.bottleneck_coupler:
-                fore, back = fa(
-                    fore, back, cond_mid,
-                    hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
-                    t_emb=t_emb
-                )
+                fore, back = fa(fore, back, cond_mid, t_emb=t_emb)
 
         h = torch.cat([back, fore], dim=1)
 
@@ -918,7 +756,7 @@ def build_model(
     img_in_ch: int = 1,
     xt_in_ch: int = 4,
     base_ch: int = 64,
-    ch_mult: Sequence[int] = (1, 2, 4, 4),
+    ch_mult: Sequence[int] = (1, 2, 4, 8),
     num_res_blocks: int = 2,
     time_dim: int = 256,
     dropout: float = 0.0,
@@ -926,21 +764,17 @@ def build_model(
     attn_head_dim: int = 32,
     freq_attn_depth: int = 1,
     use_bottleneck_coupling: bool = True,
-    fa_stacks: int = 4,
+    fa_stacks: int = 1,
     noise_strength: float = 1.0,
-    # dense HOG
     hog_bins: int = 8,
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
-    # control
+    hog_softmax_tau: float = 0.10,
+    hog_bin_weight_hidden: int = 0,
     control_inject_to_encoder: bool = True,
     control_inject_to_decoder: bool = True,
     control_inject_to_bottleneck: bool = True,
     control_resblocks_per_level: int = 1,
-    # FA token
-    fa_patch: int = 4,
-    fa_attn_dropout: float = 0.0,
-    fa_token_dim: Optional[int] = None,
 ) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet:
     return FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(
         image_hw=tuple(image_hw),
@@ -961,13 +795,12 @@ def build_model(
         hog_tau=hog_tau,
         hog_mag_weight=hog_mag_weight,
         hog_eps=1e-8,
+        hog_softmax_tau=hog_softmax_tau,
+        hog_bin_weight_hidden=hog_bin_weight_hidden,
         control_inject_to_encoder=control_inject_to_encoder,
         control_inject_to_decoder=control_inject_to_decoder,
         control_inject_to_bottleneck=control_inject_to_bottleneck,
         control_resblocks_per_level=control_resblocks_per_level,
-        fa_patch=fa_patch,
-        fa_attn_dropout=fa_attn_dropout,
-        fa_token_dim=fa_token_dim,
     )
 
 
@@ -985,13 +818,12 @@ if __name__ == "__main__":
         hog_bins=8,
         hog_tau=0.35,
         hog_mag_weight=True,
+        hog_softmax_tau=0.10,
+        hog_bin_weight_hidden=0,
         control_inject_to_encoder=True,
         control_inject_to_decoder=True,
         control_inject_to_bottleneck=True,
         control_resblocks_per_level=1,
-        fa_patch=4,
-        fa_attn_dropout=0.0,
-        fa_token_dim=None,
     )
 
     x_t = torch.randn(2, 4, 256, 256)
