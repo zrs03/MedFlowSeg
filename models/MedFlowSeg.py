@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-✅ 修改版：把旧的“token-grid FFT 上算 HOG + 频谱通道拼接”的 FAModule
-替换为你前一份代码里的 FA（FFT->RI + direct head + token cross-attn，并注入 dense freq-HOG tokens）。
+✅ 修改版（按你的最新要求）：
+- 不再把 hog_token 拼进 attention 的 KV
+- attention 仍然在 token 维度做：
+    fore 关注 back+cond
+    back 只关注 cond
+- 在 unpatch / iFFT 之前（也就是 token 层面），用 HOG token 生成 (B,N,D) 的滤波器 gate，
+  对 attention 后的 F_tok2 / B_tok2 做逐元素点乘更新：
+    gate_f = g([Hc_tok, Hf_tok]) -> (B,N,D)
+    gate_b = g([Hc_tok, Hb_tok]) -> (B,N,D)
+    F_tok3 = F_tok2 * (1 + gate_f)
+    B_tok3 = B_tok2 * (1 + gate_b)
 
-改动点：
-1) 替换 FAModule 实现（新 FAModule 需要额外输入 hog_fore/hog_cond）
-2) MainNet.__init__ 增加：
-   - self.freq_hog = FreqDenseHOG(...)
-   - self.hog_norm_levels / self.hog_norm_mid  (log1p + GN 稳定化)
-3) MainNet.forward 在每个需要 FA 的 level / bottleneck：
-   - 计算 hog_f/hog_c = freq_hog(...)
-   - hog = GN(log1p(hog))
-   - 调用 fa(..., hog_fore=hog_f, hog_cond=hog_c, ...)
-其余结构保持不变（U-SA X注入、cond encoder/decoder、主干 decoder 都不动）。
+因此：
+1) FAModule 额外输入 hog_back
+2) MainNet.forward 每个需要 FA 的 level/bottleneck 计算 hog_b，并 log1p+GN 后传入
+其余结构保持不变（U-SA X 注入、cond encoder/decoder、主干 decoder 等不动）
 """
 
 from __future__ import annotations
@@ -277,16 +280,6 @@ class LearnableGaussianBlur2d(nn.Module):
 class TriSAFuse(nn.Module):
     """
     ✅ 按图（kGauss + 3个独立的1x1 kConv）
-
-    f_anc = Max( f_cond*(1-kGauss), f_cond )
-         = max( f_cond - Gauss(f_cond), f_cond )
-
-    g_fore  = Sigmoid( kConv_fore(|f_anc|) )   # (B,1,H,W)
-    g_back  = Sigmoid( kConv_back(|f_anc|) )   # (B,1,H,W)
-    g_cross = Sigmoid( kConv_cross(|f_anc|) )  # (B,1,H,W)
-
-    f_fore^0 = f_fore^0 + f_fore^0 · g_fore
-    f_back^0 = f_back^0 + f_back^0 · g_back + f_fore^0 · g_cross
     """
     def __init__(
         self,
@@ -415,14 +408,18 @@ class FreqDirectHeadFiLM(nn.Module):
 
 
 # =========================================================
-# ✅ NEW FA module: FFT on (B,C,H,W), direct head, patch tokens cross-attn,
-#                 and inject HOG tokens via KV concat.
+# ✅ NEW FA module:
+#    - FFT -> RI
+#    - direct head update (FiLM)
+#    - token cross-attn (NO hog tokens in KV)
+#    - token-domain filter: gate_f/gate_b from HOG tokens, shape (B,N,D)
+#    - unpatch -> complex -> iFFT
 # =========================================================
 class FAModule(nn.Module):
     """
     输入：
       fore/back/cond: (B, C, H, W)
-      hog_fore/hog_cond: (B, C*K, H, W)
+      hog_fore/hog_back/hog_cond: (B, C*K, H, W)
     输出：
       fore_out/back_out: (B, C, H, W)
     """
@@ -437,6 +434,8 @@ class FAModule(nn.Module):
         fa_patch: int = 8,
         fa_attn_dropout: float = 0.0,
         token_dim: Optional[int] = None,
+        gate_hidden_mult: int = 2,          # gate MLP hidden = mult*D
+        gate_scale: float = 1.0,            # (1 + gate_scale * tanh(gate))
     ):
         super().__init__()
         self.ch = int(ch)
@@ -448,6 +447,8 @@ class FAModule(nn.Module):
             token_dim = int(heads * head_dim)
         self.token_dim = int(token_dim)
 
+        self.gate_scale = float(gate_scale)
+
         ri_ch = 2 * self.ch
         hog_ch = self.ch * self.hog_bins
 
@@ -458,6 +459,7 @@ class FAModule(nn.Module):
 
         # patchify HOG maps (C*K -> D)
         self.patch_hf = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_hb = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
         self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
 
         # unpatch back to RI maps (D -> 2C)
@@ -486,6 +488,27 @@ class FAModule(nn.Module):
         self.direct_head_f = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
         self.direct_head_b = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
+        # token-domain filter (B,N,D) from concatenated HOG tokens (B,N,2D)
+        hid = int(gate_hidden_mult * self.token_dim)
+        self.gate_f = nn.Sequential(
+            nn.LayerNorm(2 * self.token_dim),
+            nn.Linear(2 * self.token_dim, hid),
+            nn.SiLU(),
+            nn.Linear(hid, self.token_dim),
+        )
+        self.gate_b = nn.Sequential(
+            nn.LayerNorm(2 * self.token_dim),
+            nn.Linear(2 * self.token_dim, hid),
+            nn.SiLU(),
+            nn.Linear(hid, self.token_dim),
+        )
+
+        # small init to keep early training stable
+        for m in [self.gate_f[-1], self.gate_b[-1]]:
+            if isinstance(m, nn.Linear):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
+
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
         return torch.cat([z.real, z.imag], dim=1)
@@ -502,6 +525,7 @@ class FAModule(nn.Module):
         back: torch.Tensor,
         cond: torch.Tensor,
         hog_fore: torch.Tensor,
+        hog_back: torch.Tensor,
         hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -528,22 +552,39 @@ class FAModule(nn.Module):
 
         # ---- patchify HOG -> tokens ----
         Hf_tok, _ = self.patch_hf(hog_fore)  # (B, N, D)
+        Hb_tok, _ = self.patch_hb(hog_back)  # (B, N, D)
         Hc_tok, _ = self.patch_hc(hog_cond)  # (B, N, D)
 
-        # ---- token cross-attention with HOG injected via KV concat ----
-        KV_f = torch.cat([B_tok, Hf_tok, Hc_tok], dim=1)
+        # =====================================================
+        # (A) token cross-attention (NO hog tokens in KV)
+        #     fore attends back+cond
+        #     back attends cond only
+        # =====================================================
+        KV_f = torch.cat([B_tok, C_tok], dim=1)  # (B, 2N, D)
         d_f = self.attn_f(F_tok, KV_f)
         F_tok2 = F_tok + d_f
         F_tok2 = F_tok2 + self.ffn_f(F_tok2)
 
-        KV_b = torch.cat([C_tok, Hf_tok, Hc_tok], dim=1)
-        d_b = self.attn_b(B_tok, KV_b)
+        d_b = self.attn_b(B_tok, C_tok)  # KV = cond only
         B_tok2 = B_tok + d_b
         B_tok2 = B_tok2 + self.ffn_b(B_tok2)
 
+        # =====================================================
+        # (B) token-domain filter/gate (B,N,D) from HOG tokens
+        #     fore gate from [Hc, Hf]
+        #     back gate from [Hc, Hb]
+        # =====================================================
+        g_f_in = torch.cat([Hc_tok, Hf_tok], dim=-1)  # (B, N, 2D)
+        gate_f = torch.tanh(self.gate_f(g_f_in))      # (B, N, D) in [-1,1]
+        F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_f)
+
+        g_b_in = torch.cat([Hc_tok, Hb_tok], dim=-1)  # (B, N, 2D)
+        gate_b = torch.tanh(self.gate_b(g_b_in))      # (B, N, D)
+        B_tok3 = B_tok2 * (1.0 + self.gate_scale * gate_b)
+
         # ---- unpatch back to RI maps ----
-        Fri2 = self.unpatch_f(F_tok2, hw_p)  # (B, 2C, H, W)
-        Bri2 = self.unpatch_b(B_tok2, hw_p)
+        Fri2 = self.unpatch_f(F_tok3, hw_p)  # (B, 2C, H, W)
+        Bri2 = self.unpatch_b(B_tok3, hw_p)
 
         # complex back
         F2c = self._to_complex(Fri2)
@@ -683,6 +724,9 @@ class MainNet(nn.Module):
         fa_attn_dropout: float = 0.0,
         fa_token_dim: Optional[int] = None,
         fa_noise_strength: float = 1.0,
+        # Gate
+        fa_gate_hidden_mult: int = 2,
+        fa_gate_scale: float = 1.0,
         # U-SA strict gauss
         usa_gauss_ks: int = 7,
         usa_gauss_sigma_init: float = 1.5,
@@ -722,6 +766,9 @@ class MainNet(nn.Module):
         self.fa_attn_dropout = float(fa_attn_dropout)
         self.fa_token_dim = fa_token_dim
         self.fa_noise_strength = float(fa_noise_strength)
+
+        self.fa_gate_hidden_mult = int(fa_gate_hidden_mult)
+        self.fa_gate_scale = float(fa_gate_scale)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
@@ -823,6 +870,8 @@ class MainNet(nn.Module):
                         fa_patch=self.fa_patch,
                         fa_attn_dropout=self.fa_attn_dropout,
                         token_dim=self.fa_token_dim,
+                        gate_hidden_mult=self.fa_gate_hidden_mult,
+                        gate_scale=self.fa_gate_scale,
                     )
                 )
             return mods
@@ -904,17 +953,21 @@ class MainNet(nn.Module):
             c_main = cond_skips[level]
 
             if level in self.attn_level_set:
-                # ✅ 在进入 FA 前：dense HOG + log1p + GN
+                # ✅ 在进入 FA 前：dense HOG + log1p + GN （f/c/b 都算）
                 hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
+                hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
                 hog_c = self.freq_hog(c_main)  # (B, C*K, H, W)
-                hog_f = self.hog_norm_levels[level](torch.log1p(hog_f))
-                hog_c = self.hog_norm_levels[level](torch.log1p(hog_c))
+
+                norm = self.hog_norm_levels[level]
+                hog_f = norm(torch.log1p(hog_f))
+                hog_b = norm(torch.log1p(hog_b))
+                hog_c = norm(torch.log1p(hog_c))
 
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
                     f_main, b_main = fa(
                         fore=f_main, back=b_main, cond=c_main,
-                        hog_fore=hog_f, hog_cond=hog_c,
+                        hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
                         t_emb=t_emb
                     )
 
@@ -924,15 +977,19 @@ class MainNet(nn.Module):
         # bottleneck coupling
         if self.bottleneck_coupler is not None:
             cond_bot = cond_skips[-1]
+
             hog_f = self.freq_hog(fore)
+            hog_b = self.freq_hog(back)
             hog_c = self.freq_hog(cond_bot)
+
             hog_f = self.hog_norm_mid(torch.log1p(hog_f))
+            hog_b = self.hog_norm_mid(torch.log1p(hog_b))
             hog_c = self.hog_norm_mid(torch.log1p(hog_c))
 
             for fa in self.bottleneck_coupler:
                 fore, back = fa(
                     fore=fore, back=back, cond=cond_bot,
-                    hog_fore=hog_f, hog_cond=hog_c,
+                    hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
                     t_emb=t_emb
                 )
 
@@ -972,6 +1029,8 @@ def build_model(
     fa_attn_dropout: float = 0.0,
     fa_token_dim: Optional[int] = None,
     fa_noise_strength: float = 1.0,
+    fa_gate_hidden_mult: int = 2,
+    fa_gate_scale: float = 1.0,
     usa_gauss_ks: int = 7,
     usa_gauss_sigma_init: float = 1.5,
     usa_init_bias: float = -10.0,
@@ -999,6 +1058,8 @@ def build_model(
         fa_attn_dropout=fa_attn_dropout,
         fa_token_dim=fa_token_dim,
         fa_noise_strength=fa_noise_strength,
+        fa_gate_hidden_mult=fa_gate_hidden_mult,
+        fa_gate_scale=fa_gate_scale,
         usa_gauss_ks=usa_gauss_ks,
         usa_gauss_sigma_init=usa_gauss_sigma_init,
         usa_init_bias=usa_init_bias,
@@ -1022,7 +1083,7 @@ if __name__ == "__main__":
         attn_head_dim=32,
         freq_attn_depth=1,
         use_bottleneck_coupling=True,
-        fa_stacks=4,
+        fa_stacks=2,
         hog_bins=8,
         hog_tau=0.35,
         hog_mag_weight=True,
@@ -1032,6 +1093,8 @@ if __name__ == "__main__":
         fa_attn_dropout=0.0,
         fa_token_dim=None,
         fa_noise_strength=1.0,
+        fa_gate_hidden_mult=2,
+        fa_gate_scale=1.0,
         usa_gauss_ks=7,
         usa_gauss_sigma_init=1.5,
         usa_init_bias=-10.0,
