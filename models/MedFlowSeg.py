@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-✅ 修改版（按你的最新要求）：
-- 不再把 hog_token 拼进 attention 的 KV
-- attention 仍然在 token 维度做：
-    fore 关注 back+cond
-    back 只关注 cond
-- 在 unpatch / iFFT 之前（也就是 token 层面），用 HOG token 生成 (B,N,D) 的滤波器 gate，
-  对 attention 后的 F_tok2 / B_tok2 做逐元素点乘更新：
-    gate_f = g([Hc_tok, Hf_tok]) -> (B,N,D)
-    gate_b = g([Hc_tok, Hb_tok]) -> (B,N,D)
-    F_tok3 = F_tok2 * (1 + gate_f)
-    B_tok3 = B_tok2 * (1 + gate_b)
+✅ 完整修改版（按你的最新要求 + R=2 时间嵌入到 HOG->滤波器 gate 过程）
 
-因此：
-1) FAModule 额外输入 hog_back
-2) MainNet.forward 每个需要 FA 的 level/bottleneck 计算 hog_b，并 log1p+GN 后传入
-其余结构保持不变（U-SA X 注入、cond encoder/decoder、主干 decoder 等不动）
+核心改动：
+1) 不再把 hog_token 拼到 attention 的 KV
+2) attention 仍在 token 维度做：
+   - fore attends (back + cond)
+   - back attends (cond only)
+3) 在 unpatch/iFFT 前（token 域），用 HOG tokens 生成 (B,N,D) gate，并逐元素点乘更新：
+   - gate_f from [Hc_tok, Hf_tok]
+   - gate_b from [Hc_tok, Hb_tok]
+4) ✅ HOG 生成滤波器 gate 的过程嵌入时间（R=2）：
+   - 使用 TokenFiLMBlock: LN -> (1+gamma(t))*x + beta(t) -> 小FFN -> residual
+   - 分别对 gate_f / gate_b 的输入 token (B,N,2D) 做 2 次（R=2）
+   - 输出线性层初始化为 0，使初始 gate≈0（训练更稳）
+
+其余结构保持不变（U-SA X 注入、cond encoder/decoder、主干 decoder 不动）。
 """
 
 from __future__ import annotations
@@ -408,11 +408,57 @@ class FreqDirectHeadFiLM(nn.Module):
 
 
 # =========================================================
+# ✅ Token FiLM block (R=2 time-conditioned gate builder)
+#    LN -> (1+gamma(t))*x + beta(t) -> small FFN -> residual
+# =========================================================
+class TokenFiLMBlock(nn.Module):
+    """
+    x: (B, N, D)
+    t_emb: (B, time_ch)
+    """
+    def __init__(self, dim: int, time_ch: int, mlp_hidden_mult: int = 2):
+        super().__init__()
+        self.dim = int(dim)
+        hid = int(mlp_hidden_mult * dim)
+
+        self.ln = nn.LayerNorm(self.dim)
+        self.to_film = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_ch, hid),
+            nn.SiLU(),
+            nn.Linear(hid, 2 * self.dim),
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.SiLU(),
+        )
+
+        # make film near identity at init
+        last = self.to_film[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+        # make ffn near identity-ish (small)
+        if isinstance(self.ffn[0], nn.Linear):
+            nn.init.normal_(self.ffn[0].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.ffn[0].bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.ln(x)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=-1)  # (B,D)
+        gamma = gamma[:, None, :]
+        beta  = beta[:, None, :]
+        h = (1.0 + gamma) * h + beta
+        h = self.ffn(h)
+        return x + h
+
+
+# =========================================================
 # ✅ NEW FA module:
 #    - FFT -> RI
 #    - direct head update (FiLM)
 #    - token cross-attn (NO hog tokens in KV)
-#    - token-domain filter: gate_f/gate_b from HOG tokens, shape (B,N,D)
+#    - token-domain gate from HOG tokens with time embedding (R=2)
 #    - unpatch -> complex -> iFFT
 # =========================================================
 class FAModule(nn.Module):
@@ -434,8 +480,8 @@ class FAModule(nn.Module):
         fa_patch: int = 8,
         fa_attn_dropout: float = 0.0,
         token_dim: Optional[int] = None,
-        gate_hidden_mult: int = 2,          # gate MLP hidden = mult*D
-        gate_scale: float = 1.0,            # (1 + gate_scale * tanh(gate))
+        gate_scale: float = 1.0,     # (1 + gate_scale * tanh(gate))
+        gate_R: int = 2,             # ✅ R=2
     ):
         super().__init__()
         self.ch = int(ch)
@@ -448,6 +494,7 @@ class FAModule(nn.Module):
         self.token_dim = int(token_dim)
 
         self.gate_scale = float(gate_scale)
+        self.gate_R = int(gate_R)
 
         ri_ch = 2 * self.ch
         hog_ch = self.ch * self.hog_bins
@@ -488,26 +535,30 @@ class FAModule(nn.Module):
         self.direct_head_f = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
         self.direct_head_b = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
-        # token-domain filter (B,N,D) from concatenated HOG tokens (B,N,2D)
-        hid = int(gate_hidden_mult * self.token_dim)
-        self.gate_f = nn.Sequential(
-            nn.LayerNorm(2 * self.token_dim),
-            nn.Linear(2 * self.token_dim, hid),
-            nn.SiLU(),
-            nn.Linear(hid, self.token_dim),
+        # =====================================================
+        # ✅ time-conditioned gate builder (token domain)
+        # input token: (B,N,2D) -> output gate: (B,N,D)
+        # R = gate_R blocks
+        # =====================================================
+        gate_in_dim = 2 * self.token_dim
+
+        self.gate_f_blocks = nn.ModuleList([TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)])
+        self.gate_b_blocks = nn.ModuleList([TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)])
+
+        self.gate_f_out = nn.Sequential(
+            nn.LayerNorm(gate_in_dim),
+            nn.Linear(gate_in_dim, self.token_dim),
         )
-        self.gate_b = nn.Sequential(
-            nn.LayerNorm(2 * self.token_dim),
-            nn.Linear(2 * self.token_dim, hid),
-            nn.SiLU(),
-            nn.Linear(hid, self.token_dim),
+        self.gate_b_out = nn.Sequential(
+            nn.LayerNorm(gate_in_dim),
+            nn.Linear(gate_in_dim, self.token_dim),
         )
 
-        # small init to keep early training stable
-        for m in [self.gate_f[-1], self.gate_b[-1]]:
-            if isinstance(m, nn.Linear):
-                nn.init.zeros_(m.weight)
-                nn.init.zeros_(m.bias)
+        # init output to 0 => initial gate ≈ 0
+        nn.init.zeros_(self.gate_f_out[-1].weight)
+        nn.init.zeros_(self.gate_f_out[-1].bias)
+        nn.init.zeros_(self.gate_b_out[-1].weight)
+        nn.init.zeros_(self.gate_b_out[-1].bias)
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -570,16 +621,19 @@ class FAModule(nn.Module):
         B_tok2 = B_tok2 + self.ffn_b(B_tok2)
 
         # =====================================================
-        # (B) token-domain filter/gate (B,N,D) from HOG tokens
-        #     fore gate from [Hc, Hf]
-        #     back gate from [Hc, Hb]
+        # (B) ✅ time-conditioned token-domain gate (R=2)
+        #     gate_f from [Hc, Hf], gate_b from [Hc, Hb]
         # =====================================================
-        g_f_in = torch.cat([Hc_tok, Hf_tok], dim=-1)  # (B, N, 2D)
-        gate_f = torch.tanh(self.gate_f(g_f_in))      # (B, N, D) in [-1,1]
+        g_f = torch.cat([Hc_tok, Hf_tok], dim=-1)  # (B, N, 2D)
+        for blk in self.gate_f_blocks:
+            g_f = blk(g_f, t_emb)
+        gate_f = torch.tanh(self.gate_f_out(g_f))  # (B, N, D)
         F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_f)
 
-        g_b_in = torch.cat([Hc_tok, Hb_tok], dim=-1)  # (B, N, 2D)
-        gate_b = torch.tanh(self.gate_b(g_b_in))      # (B, N, D)
+        g_b = torch.cat([Hc_tok, Hb_tok], dim=-1)  # (B, N, 2D)
+        for blk in self.gate_b_blocks:
+            g_b = blk(g_b, t_emb)
+        gate_b = torch.tanh(self.gate_b_out(g_b))  # (B, N, D)
         B_tok3 = B_tok2 * (1.0 + self.gate_scale * gate_b)
 
         # ---- unpatch back to RI maps ----
@@ -725,8 +779,8 @@ class MainNet(nn.Module):
         fa_token_dim: Optional[int] = None,
         fa_noise_strength: float = 1.0,
         # Gate
-        fa_gate_hidden_mult: int = 2,
         fa_gate_scale: float = 1.0,
+        fa_gate_R: int = 2,  # ✅ R=2
         # U-SA strict gauss
         usa_gauss_ks: int = 7,
         usa_gauss_sigma_init: float = 1.5,
@@ -767,8 +821,8 @@ class MainNet(nn.Module):
         self.fa_token_dim = fa_token_dim
         self.fa_noise_strength = float(fa_noise_strength)
 
-        self.fa_gate_hidden_mult = int(fa_gate_hidden_mult)
         self.fa_gate_scale = float(fa_gate_scale)
+        self.fa_gate_R = int(fa_gate_R)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
@@ -870,8 +924,8 @@ class MainNet(nn.Module):
                         fa_patch=self.fa_patch,
                         fa_attn_dropout=self.fa_attn_dropout,
                         token_dim=self.fa_token_dim,
-                        gate_hidden_mult=self.fa_gate_hidden_mult,
                         gate_scale=self.fa_gate_scale,
+                        gate_R=self.fa_gate_R,  # ✅ R=2
                     )
                 )
             return mods
@@ -953,7 +1007,7 @@ class MainNet(nn.Module):
             c_main = cond_skips[level]
 
             if level in self.attn_level_set:
-                # ✅ 在进入 FA 前：dense HOG + log1p + GN （f/c/b 都算）
+                # ✅ dense HOG + log1p + GN（f/b/c 都算）
                 hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
                 hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
                 hog_c = self.freq_hog(c_main)  # (B, C*K, H, W)
@@ -1029,8 +1083,8 @@ def build_model(
     fa_attn_dropout: float = 0.0,
     fa_token_dim: Optional[int] = None,
     fa_noise_strength: float = 1.0,
-    fa_gate_hidden_mult: int = 2,
     fa_gate_scale: float = 1.0,
+    fa_gate_R: int = 2,  # ✅ R=2
     usa_gauss_ks: int = 7,
     usa_gauss_sigma_init: float = 1.5,
     usa_init_bias: float = -10.0,
@@ -1058,8 +1112,8 @@ def build_model(
         fa_attn_dropout=fa_attn_dropout,
         fa_token_dim=fa_token_dim,
         fa_noise_strength=fa_noise_strength,
-        fa_gate_hidden_mult=fa_gate_hidden_mult,
         fa_gate_scale=fa_gate_scale,
+        fa_gate_R=fa_gate_R,
         usa_gauss_ks=usa_gauss_ks,
         usa_gauss_sigma_init=usa_gauss_sigma_init,
         usa_init_bias=usa_init_bias,
@@ -1093,8 +1147,8 @@ if __name__ == "__main__":
         fa_attn_dropout=0.0,
         fa_token_dim=None,
         fa_noise_strength=1.0,
-        fa_gate_hidden_mult=2,
         fa_gate_scale=1.0,
+        fa_gate_R=2,  # ✅ R=2
         usa_gauss_ks=7,
         usa_gauss_sigma_init=1.5,
         usa_init_bias=-10.0,
