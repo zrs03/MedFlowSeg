@@ -515,7 +515,7 @@ def run(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_root", type=str, default="./REFUGE2dataset")
-    ap.add_argument("--out_root", type=str, default="./dataset/REFUGE2/SDF")
+    ap.add_argument("--out_root", type=str, default="./dataset/REFUGE2_cup/SDF")
 
     ap.add_argument("--size", type=int, default=256, help="随机裁剪输出尺寸（默认256）")
 
