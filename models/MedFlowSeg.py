@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-✅ 修改版（按你的最终要求）：
-只用 cond encoder 的第一层（level0）特征，对 fore/back 的 encoder 第一层特征做 TriSAFuse：
-- TriSAFuse 仅在 level==0 时执行：b_skip, f_skip = usa_x(c_skip_proc, b_skip, f_skip)
-- 其他全部保持不变：
-  - ✅ FA：已替换为 ControlNet-style FA（freq-map RI + direct head + spatial cross-attn），但保持同样的调用签名
-    - forward(fore, back, cond, hog_fore, hog_back, hog_cond, t_emb) 仍然一致
-    - hog_* 仍计算/传入，但 ControlNet-style FA 内部不使用（为了“其他都不要改”）
-  - Token-Time-FiLM：保留原实现（但 ControlNet-style FA 不用 token patchify，自然也不使用 token-film）
-  - decoder 仍通过 zero conv 注入（ctrl_zero_dec）
-  - encoder/bottleneck 的 zero conv 注入模块仍保留，但默认关（control_inject_to_encoder=False / control_inject_to_bottleneck=False）
+✅ 完整修改版（按你的最终澄清要求）
+
+保留：
+1) cond 走完整 encoder+decoder 得到 c_dec0（full-res）
+2) X 注入：仅在 fore/back encoder 的 level0，用 c_dec0 做 TriSAFuse
+3) FA：token cross-attn（不拼 hog token 到 KV） + token gate（HOG tokens -> gate，且 gate builder 含 time embedding，R=2）
+4) HOG：dense freq HOG + log1p + GN
+5) 主干 decoder 结构不变
+
+修改点（你刚澄清的）：
+✅ ZeroConv 注入发生在「主干 decoder」：
+- cond encoder 的 cond_skips[level] 通过 ZeroConv 映射到 2*chs[level]
+- 在每个 decoder stage 后注入到 h： h = h + ctrl_zero_dec[level](cond_skips[level])
 """
 
 from __future__ import annotations
@@ -22,9 +25,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -----------------------------
-# Time embedding + FiLM
-# -----------------------------
+# =========================================================
+# Time embedding + FiLM (conv)
+# =========================================================
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -138,11 +141,11 @@ class Upsample(nn.Module):
         return self.op(x)
 
 
-# -----------------------------
-# ZeroConv (ControlNet 核心)
-# -----------------------------
+# =========================================================
+# ZeroConv (ControlNet-style injection)
+# =========================================================
 class ZeroConv2d(nn.Module):
-    """1x1 conv with ZERO init (weight/bias = 0)."""
+    """1x1 conv with ZERO init."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 1)
@@ -153,9 +156,9 @@ class ZeroConv2d(nn.Module):
         return self.conv(x)
 
 
-# -----------------------------
-# Control feature processor: N x ResBlockFiLM per level
-# -----------------------------
+# =========================================================
+# Control processor (optional, for cond features)
+# =========================================================
 class ControlResProc(nn.Module):
     def __init__(self, ch: int, time_ch: int, num_blocks: int, dropout: float):
         super().__init__()
@@ -174,7 +177,77 @@ class ControlResProc(nn.Module):
 
 
 # =========================================================
-# ✅ Learnable Gaussian + TriSAFuse (X 注入)
+# ViT-style patchify & unpatchify
+# =========================================================
+class PatchEmbed2D(nn.Module):
+    """
+    (B,C,H,W) -> (B,N,D), N=(H/P)*(W/P)
+    """
+    def __init__(self, in_ch: int, embed_dim: int, patch: int):
+        super().__init__()
+        self.in_ch = int(in_ch)
+        self.embed_dim = int(embed_dim)
+        self.patch = int(patch)
+        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=self.patch, stride=self.patch, bias=True)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        b, c, h, w = x.shape
+        p = self.patch
+        if (h % p) != 0 or (w % p) != 0:
+            raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h,w)}")
+        x = self.proj(x)  # (B, D, Hp, Wp)
+        hp, wp = x.shape[-2], x.shape[-1]
+        x = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, D)
+        return x, (hp, wp)
+
+
+class Unpatch2D(nn.Module):
+    """
+    (B,N,D) -> (B,C,H,W)
+    """
+    def __init__(self, embed_dim: int, out_ch: int, patch: int):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.out_ch = int(out_ch)
+        self.patch = int(patch)
+        self.to_patch = nn.Linear(embed_dim, out_ch * patch * patch, bias=True)
+
+    def forward(self, tokens: torch.Tensor, hw_patch: Tuple[int, int]) -> torch.Tensor:
+        b, n, d = tokens.shape
+        hp, wp = hw_patch
+        p = self.patch
+        if n != hp * wp:
+            raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp*wp}")
+
+        x = self.to_patch(tokens)  # (B, N, C*P*P)
+        x = x.view(b, hp, wp, self.out_ch, p, p)
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        x = x.view(b, self.out_ch, hp * p, wp * p)
+        return x
+
+
+# =========================================================
+# Token Cross-Attention
+# =========================================================
+class TokenCrossAttention(nn.Module):
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.dim = int(dim)
+        self.heads = int(heads)
+        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.heads, dropout=dropout, batch_first=True)
+        self.ln_q = nn.LayerNorm(self.dim)
+        self.ln_kv = nn.LayerNorm(self.dim)
+        self.proj = nn.Sequential(nn.Linear(self.dim, self.dim), nn.Dropout(dropout))
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        qn = self.ln_q(q)
+        kvn = self.ln_kv(kv)
+        out, _ = self.attn(qn, kvn, kvn, need_weights=False)
+        return self.proj(out)
+
+
+# =========================================================
+# Learnable Gaussian (per-channel depthwise conv)
 # =========================================================
 class LearnableGaussianBlur2d(nn.Module):
     """
@@ -207,31 +280,38 @@ class LearnableGaussianBlur2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 4 or x.shape[1] != self.channels:
             raise ValueError(f"LearnableGaussianBlur2d expects (B,{self.channels},H,W), got {tuple(x.shape)}")
-        w = F.softplus(self.raw)
-        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)
+        w = F.softplus(self.raw)  # non-negative
+        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)  # per-channel sum=1
         pad = self.kernel_size // 2
         return F.conv2d(x, w, bias=None, stride=1, padding=pad, groups=self.channels)
 
 
+# =========================================================
+# Strict U-SA (用于 X 注入)
+# =========================================================
 class TriSAFuse(nn.Module):
     """
-    ✅ Strict U-SA：用 cond 的高频/锚点生成三个 gate，对 fore/back 做 X 注入
+    ✅ 按图（kGauss + 3个独立的1x1 kConv）
     """
     def __init__(
         self,
         ch: int,
         gauss_ks: int = 7,
         gauss_sigma_init: float = 1.5,
-        init_bias: float = -10.0,
+        init_bias: float = -2.0,
     ):
         super().__init__()
         self.ch = int(ch)
-        self.gauss = LearnableGaussianBlur2d(self.ch, kernel_size=gauss_ks, sigma_init=gauss_sigma_init)
+        self.gauss = LearnableGaussianBlur2d(
+            channels=self.ch, kernel_size=gauss_ks, sigma_init=gauss_sigma_init
+        )
 
         self.k_fore  = nn.Conv2d(self.ch, 1, 1, bias=True)
+        self.k_back  = nn.Conv2d(self.ch, 1, 1, bias=True)
         self.k_cross = nn.Conv2d(self.ch, 1, 1, bias=True)
 
         nn.init.zeros_(self.k_fore.weight);  nn.init.constant_(self.k_fore.bias,  init_bias)
+        nn.init.zeros_(self.k_back.weight);  nn.init.constant_(self.k_back.bias,  init_bias)
         nn.init.zeros_(self.k_cross.weight); nn.init.constant_(self.k_cross.bias, init_bias)
 
     def forward(self, f_cond: torch.Tensor, f_back: torch.Tensor, f_fore: torch.Tensor):
@@ -244,114 +324,18 @@ class TriSAFuse(nn.Module):
 
         a = f_anc.abs()
         g_fore  = torch.sigmoid(self.k_fore(a))
+        g_back  = torch.sigmoid(self.k_back(a))
         g_cross = torch.sigmoid(self.k_cross(a))
 
         f_fore0 = f_fore
         f_fore = f_fore0 + f_fore0 * g_fore
-        f_back = f_back + f_back * g_cross
+        f_back = f_back + f_back * g_back + f_fore0 * g_cross
         return f_back, f_fore
 
 
 # =========================================================
-# ✅ ViT-style patchify & unpatchify (保留：其他不改)
+# ✅ Dense frequency-domain HOG on feature maps
 # =========================================================
-class PatchEmbed2D(nn.Module):
-    """
-    ViT-style patchify + linear projection by Conv2d(stride=patch).
-    Input : (B, C, H, W)
-    Output: (B, N, D) where N=(H/P)*(W/P)
-    """
-    def __init__(self, in_ch: int, embed_dim: int, patch: int):
-        super().__init__()
-        self.in_ch = int(in_ch)
-        self.embed_dim = int(embed_dim)
-        self.patch = int(patch)
-        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=self.patch, stride=self.patch, bias=True)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
-        b, c, h, w = x.shape
-        p = self.patch
-        if (h % p) != 0 or (w % p) != 0:
-            raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h,w)}")
-        x = self.proj(x)  # (B, D, H/P, W/P)
-        hp, wp = x.shape[-2], x.shape[-1]
-        x = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, D)
-        return x, (hp, wp)
-
-
-class Unpatch2D(nn.Module):
-    """
-    token -> (B, C, H, W) 反 patchify
-    方式：Linear(D -> C*P*P) 后 reshape 回原图（非重叠）
-    """
-    def __init__(self, embed_dim: int, out_ch: int, patch: int):
-        super().__init__()
-        self.embed_dim = int(embed_dim)
-        self.out_ch = int(out_ch)
-        self.patch = int(patch)
-        self.to_patch = nn.Linear(embed_dim, out_ch * patch * patch, bias=True)
-
-    def forward(self, tokens: torch.Tensor, hw_patch: Tuple[int, int]) -> torch.Tensor:
-        b, n, d = tokens.shape
-        hp, wp = hw_patch
-        p = self.patch
-        if n != hp * wp:
-            raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp*wp}")
-
-        x = self.to_patch(tokens)  # (B, N, C*P*P)
-        x = x.view(b, hp, wp, self.out_ch, p, p)  # (B, Hp, Wp, C, p, p)
-        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()  # (B, C, Hp, p, Wp, p)
-        x = x.view(b, self.out_ch, hp * p, wp * p)  # (B, C, H, W)
-        return x
-
-
-# =========================================================
-# ✅ Token Time-FiLM (保留：其他不改)
-# =========================================================
-class TokenTimeFiLM(nn.Module):
-    """
-    对 tokens 做 time conditioning:
-      x: (B,N,D)
-      t_emb: (B,time_ch)
-      out = (1+gamma)*x + beta
-    """
-    def __init__(self, dim: int, time_ch: int):
-        super().__init__()
-        self.dim = int(dim)
-        self.to_gb = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * self.dim))
-        nn.init.zeros_(self.to_gb[-1].weight)
-        nn.init.zeros_(self.to_gb[-1].bias)
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        gamma, beta = self.to_gb(t_emb).chunk(2, dim=1)  # (B,D)
-        gamma = gamma[:, None, :]
-        beta  = beta[:, None, :]
-        return (1.0 + gamma) * x + beta
-
-
-# =========================================================
-# ✅ Token Cross-Attention (保留：其他不改)
-# =========================================================
-class TokenCrossAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.dim = int(dim)
-        self.heads = int(heads)
-        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.heads, dropout=dropout, batch_first=True)
-        self.ln_q = nn.LayerNorm(self.dim)
-        self.ln_kv = nn.LayerNorm(self.dim)
-        self.proj = nn.Sequential(nn.Linear(self.dim, self.dim), nn.Dropout(dropout))
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        qn = self.ln_q(q)
-        kvn = self.ln_kv(kv)
-        out, _ = self.attn(qn, kvn, kvn, need_weights=False)
-        return self.proj(out)
-
-
-# -----------------------------
-# Dense frequency-domain "HOG" + magnitude
-# -----------------------------
 def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
     return (x + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -359,7 +343,7 @@ def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
 class FreqDenseHOG(nn.Module):
     """
     输入 x: (B,C,H,W)
-    输出 hog_map: (B, C*K, H, W)  —— 不改变空间分辨率
+    输出 hog_map: (B, C*K, H, W)
     """
     def __init__(
         self,
@@ -382,7 +366,6 @@ class FreqDenseHOG(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
-
         X = torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         mag = X.abs().clamp_min(self.eps)
         phi = torch.angle(X)
@@ -402,40 +385,8 @@ class FreqDenseHOG(nn.Module):
 
 
 # =========================================================
-# ✅ ControlNet-style FA (替换进来) —— 但保持相同 forward 签名
+# direct frequency update head with FiLM
 # =========================================================
-class SpatialCrossAttention(nn.Module):
-    def __init__(self, q_ch: int, kv_ch: int, heads: int = 4, head_dim: int = 32):
-        super().__init__()
-        self.heads = int(heads)
-        self.head_dim = int(head_dim)
-        inner = self.heads * self.head_dim
-
-        self.to_q = nn.Conv2d(q_ch, inner, 1, bias=False)
-        self.to_k = nn.Conv2d(kv_ch, inner, 1, bias=False)
-        self.to_v = nn.Conv2d(kv_ch, inner, 1, bias=False)
-
-        self.out = nn.Conv2d(inner, q_ch, 1)
-        self.scale = self.head_dim**-0.5
-
-        self.norm_q = GroupNorm32(q_ch)
-        self.norm_kv = GroupNorm32(kv_ch)
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        b, _, h, w = x.shape
-
-        x = self.norm_q(x)
-        c = self.norm_kv(c)
-
-        q = self.to_q(x).view(b, self.heads, self.head_dim, h * w)
-        k = self.to_k(c).view(b, self.heads, self.head_dim, h * w)
-        v = self.to_v(c).view(b, self.heads, self.head_dim, h * w)
-
-        attn = torch.einsum("bhdi,bhdj->bhij", q * self.scale, k).softmax(dim=-1)
-        out = torch.einsum("bhij,bhdj->bhdi", attn, v).reshape(b, self.heads * self.head_dim, h, w)
-        return self.out(out)
-
-
 class FreqDirectHeadFiLM(nn.Module):
     def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
         super().__init__()
@@ -468,13 +419,53 @@ class FreqDirectHeadFiLM(nn.Module):
         return out
 
 
+# =========================================================
+# ✅ Token FiLM block (R=2 time-conditioned gate builder)
+# =========================================================
+class TokenFiLMBlock(nn.Module):
+    """
+    x: (B, N, D)
+    t_emb: (B, time_ch)
+    """
+    def __init__(self, dim: int, time_ch: int, mlp_hidden_mult: int = 2):
+        super().__init__()
+        self.dim = int(dim)
+        hid = int(mlp_hidden_mult * dim)
+
+        self.ln = nn.LayerNorm(self.dim)
+        self.to_film = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_ch, hid),
+            nn.SiLU(),
+            nn.Linear(hid, 2 * self.dim),
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.SiLU(),
+        )
+
+        last = self.to_film[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+        if isinstance(self.ffn[0], nn.Linear):
+            nn.init.normal_(self.ffn[0].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.ffn[0].bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.ln(x)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=-1)
+        gamma = gamma[:, None, :]
+        beta  = beta[:, None, :]
+        h = (1.0 + gamma) * h + beta
+        h = self.ffn(h)
+        return x + h
+
+
+# =========================================================
+# ✅ FA module (token attn + hog gate with time, R=2)
+# =========================================================
 class FAModule(nn.Module):
-    """
-    ✅ ControlNet-style FA:
-    - operate on full-res frequency maps (RI: 2C channels)
-    - direct head + 3 spatial cross-attn edges
-    - 兼容你现有 MainNet 的调用方式：hog_* 仍作为参数传入（但模块内部不使用）
-    """
     def __init__(
         self,
         ch: int,
@@ -483,24 +474,67 @@ class FAModule(nn.Module):
         head_dim: int,
         hog_bins: int,
         noise_strength: float = 1.0,
-        fa_patch: int = 4,
+        fa_patch: int = 8,
         fa_attn_dropout: float = 0.0,
         token_dim: Optional[int] = None,
+        gate_scale: float = 1.0,
+        gate_R: int = 2,
     ):
         super().__init__()
         self.ch = int(ch)
+        self.hog_bins = int(hog_bins)
+        self.noise_strength = float(noise_strength)
 
-        self.attn_fb = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
-        self.attn_fc = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
-        self.attn_bc = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
+        self.fa_patch = int(fa_patch)
+        if token_dim is None:
+            token_dim = int(heads * head_dim)
+        self.token_dim = int(token_dim)
 
-        self.post_f = nn.Sequential(GroupNorm32(2 * self.ch), nn.SiLU(), nn.Conv2d(2 * self.ch, 2 * self.ch, 1))
-        self.post_b = nn.Sequential(GroupNorm32(2 * self.ch), nn.SiLU(), nn.Conv2d(2 * self.ch, 2 * self.ch, 1))
-        self.norm_f = GroupNorm32(2 * self.ch)
-        self.norm_b = GroupNorm32(2 * self.ch)
+        self.gate_scale = float(gate_scale)
+        self.gate_R = int(gate_R)
+
+        ri_ch = 2 * self.ch
+        hog_ch = self.ch * self.hog_bins
+
+        self.patch_f = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_b = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_c = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+
+        self.patch_hf = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_hb = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+
+        self.unpatch_f = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.fa_patch)
+        self.unpatch_b = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.fa_patch)
+
+        self.attn_f = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=fa_attn_dropout)
+        self.attn_b = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=fa_attn_dropout)
+
+        self.ffn_f = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, 4 * self.token_dim),
+            nn.SiLU(),
+            nn.Linear(4 * self.token_dim, self.token_dim),
+        )
+        self.ffn_b = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, 4 * self.token_dim),
+            nn.SiLU(),
+            nn.Linear(4 * self.token_dim, self.token_dim),
+        )
 
         self.direct_head_f = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
         self.direct_head_b = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
+
+        gate_in_dim = 2 * self.token_dim
+        self.gate_f_blocks = nn.ModuleList([TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)])
+        self.gate_b_blocks = nn.ModuleList([TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)])
+
+        self.gate_f_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
+        self.gate_b_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
+
+        nn.init.zeros_(self.gate_f_out[-1].weight); nn.init.zeros_(self.gate_f_out[-1].bias)
+        nn.init.zeros_(self.gate_b_out[-1].weight); nn.init.zeros_(self.gate_b_out[-1].bias)
 
     @staticmethod
     def _to_ri(z: torch.Tensor) -> torch.Tensor:
@@ -521,7 +555,7 @@ class FAModule(nn.Module):
         hog_back: torch.Tensor,
         hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
@@ -530,18 +564,42 @@ class FAModule(nn.Module):
         Bri = self._to_ri(Bz)
         Cri = self._to_ri(Cz)
 
-        f_in = torch.cat([Fri, Cri], dim=1)  # (B,4C,H,W)
+        f_in = torch.cat([Fri, Cri], dim=1)
         b_in = torch.cat([Bri, Cri], dim=1)
-
         Fri = Fri + self.direct_head_f(f_in, t_emb)
         Bri = Bri + self.direct_head_b(b_in, t_emb)
 
-        d_fb = self.attn_fb(Fri, Bri)
-        d_fc = self.attn_fc(Fri, Cri)
-        Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
+        F_tok, hw_p = self.patch_f(Fri)
+        B_tok, _ = self.patch_b(Bri)
+        C_tok, _ = self.patch_c(Cri)
 
-        d_bc = self.attn_bc(Bri, Cri)
-        Bri2 = self.norm_b(self.post_b(Bri + d_bc))
+        Hf_tok, _ = self.patch_hf(hog_fore)
+        Hb_tok, _ = self.patch_hb(hog_back)
+        Hc_tok, _ = self.patch_hc(hog_cond)
+
+        # (A) token cross-attn (no hog in KV)
+        KV_f = torch.cat([B_tok, C_tok], dim=1)
+        F_tok2 = F_tok + self.attn_f(F_tok, KV_f)
+        F_tok2 = F_tok2 + self.ffn_f(F_tok2)
+
+        B_tok2 = B_tok + self.attn_b(B_tok, C_tok)
+        B_tok2 = B_tok2 + self.ffn_b(B_tok2)
+
+        # (B) token gate from HOG + time, R=2
+        g_f = torch.cat([Hc_tok, Hf_tok], dim=-1)
+        for blk in self.gate_f_blocks:
+            g_f = blk(g_f, t_emb)
+        gate_f = torch.tanh(self.gate_f_out(g_f))
+        F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_f)
+
+        g_b = torch.cat([Hc_tok, Hb_tok], dim=-1)
+        for blk in self.gate_b_blocks:
+            g_b = blk(g_b, t_emb)
+        gate_b = torch.tanh(self.gate_b_out(g_b))
+        B_tok3 = B_tok2 * (1.0 + self.gate_scale * gate_b)
+
+        Fri2 = self.unpatch_f(F_tok3, hw_p)
+        Bri2 = self.unpatch_b(B_tok3, hw_p)
 
         F2c = self._to_complex(Fri2)
         B2c = self._to_complex(Bri2)
@@ -554,15 +612,15 @@ class FAModule(nn.Module):
         return fore_out, back_out
 
 
-# -----------------------------
-# Encoder stage (blocks only; downsample handled outside)
-# -----------------------------
+# =========================================================
+# Encoder/Decoder stages
+# =========================================================
 class EncoderStageFiLM(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, time_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
         ch = in_ch
-        for _ in range(num_blocks):
+        for _ in range(int(num_blocks)):
             blocks.append(ResBlockFiLM(ch, out_ch, time_ch=time_ch, dropout=dropout))
             ch = out_ch
         self.blocks = nn.ModuleList(blocks)
@@ -574,10 +632,8 @@ class EncoderStageFiLM(nn.Module):
         return x
 
 
-# -----------------------------
-# Decoder stage
-# -----------------------------
 class DecoderStageDirect(nn.Module):
+    """主干 decoder：输入是 concat(back,fore) 所以通道是 2*chs"""
     def __init__(
         self,
         in_ch: int,
@@ -594,28 +650,62 @@ class DecoderStageDirect(nn.Module):
 
         blocks: List[nn.Module] = []
         ch = in_ch
-        for _ in range(num_blocks):
+        for _ in range(int(num_blocks)):
             blocks.append(ResBlockFiLM(ch, out_ch, time_ch=time_ch, dropout=dropout))
             ch = out_ch
         self.blocks = nn.ModuleList(blocks)
-
         self.fuse_norm = GroupNorm32(in_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         if self.up is not None:
             x = self.up(x)
-
         x = x + self.skip_to_x(skip)
         x = F.silu(self.fuse_norm(x))
-
         for blk in self.blocks:
             x = blk(x, t_emb)
         return x
 
 
-# -----------------------------
-# Main Network
-# -----------------------------
+class DecoderStageSingle(nn.Module):
+    """cond decoder：单分支（通道是 chs）"""
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+        time_ch: int,
+        num_blocks: int,
+        up: bool,
+        dropout: float,
+    ):
+        super().__init__()
+        self.up = Upsample(in_ch) if up else None
+        self.skip_to_x = nn.Identity() if skip_ch == in_ch else nn.Conv2d(skip_ch, in_ch, 1, bias=True)
+        self.fuse_norm = GroupNorm32(in_ch)
+
+        blocks: List[nn.Module] = []
+        ch = in_ch
+        for _ in range(int(num_blocks)):
+            blocks.append(ResBlockFiLM(ch, out_ch, time_ch=time_ch, dropout=dropout))
+            ch = out_ch
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        if self.up is not None:
+            x = self.up(x)
+        x = x + self.skip_to_x(skip)
+        x = F.silu(self.fuse_norm(x))
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        return x
+
+
+# =========================================================
+# Main UNet
+# - cond: encoder -> proc -> decoder -> c_dec0
+# - X injection: TriSAFuse ONLY at fore/back encoder level0 using c_dec0
+# - ZeroConv injection: cond encoder skips -> main decoder (h) at each level
+# =========================================================
 class MainNet(nn.Module):
     def __init__(
         self,
@@ -633,22 +723,19 @@ class MainNet(nn.Module):
         freq_attn_depth: int,
         use_bottleneck_coupling: bool,
         fa_stacks: int,
-        noise_strength: float = 1.0,
-        # --- HOG config (dense) ---
         hog_bins: int = 8,
         hog_tau: float = 0.35,
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
-        # --- ControlNet injections ---
-        control_inject_to_encoder: bool = False,      # ✅ 默认关掉（encoder level0 用 TriSAFuse）
-        control_inject_to_decoder: bool = True,       # ✅ decoder zero conv 注入保留
-        control_inject_to_bottleneck: bool = False,   # ✅ 默认关掉
         control_resblocks_per_level: int = 1,
-        # --- FA patch/token settings ---
-        fa_patch: int = 4,
+        # ✅ decoder injection switch
+        control_inject_to_decoder: bool = True,
+        fa_patch: int = 8,
         fa_attn_dropout: float = 0.0,
         fa_token_dim: Optional[int] = None,
-        # --- X injection (TriSAFuse) ---
+        fa_noise_strength: float = 1.0,
+        fa_gate_scale: float = 1.0,
+        fa_gate_R: int = 2,
         usa_gauss_ks: int = 7,
         usa_gauss_sigma_init: float = 1.5,
         usa_init_bias: float = -10.0,
@@ -675,22 +762,22 @@ class MainNet(nn.Module):
         self.freq_attn_depth = int(freq_attn_depth)
         self.use_bottleneck_coupling = bool(use_bottleneck_coupling)
         self.fa_stacks = int(fa_stacks)
-        self.noise_strength = float(noise_strength)
 
-        self.control_inject_to_encoder = bool(control_inject_to_encoder)
-        self.control_inject_to_decoder = bool(control_inject_to_decoder)
-        self.control_inject_to_bottleneck = bool(control_inject_to_bottleneck)
-        self.control_resblocks_per_level = int(control_resblocks_per_level)
-
-        # dense HOG config
         self.hog_bins = int(hog_bins)
         self.hog_tau = float(hog_tau)
         self.hog_eps = float(hog_eps)
+        self.hog_mag_weight = bool(hog_mag_weight)
 
-        # FA config
+        self.control_resblocks_per_level = int(control_resblocks_per_level)
+        self.control_inject_to_decoder = bool(control_inject_to_decoder)
+
         self.fa_patch = int(fa_patch)
         self.fa_attn_dropout = float(fa_attn_dropout)
         self.fa_token_dim = fa_token_dim
+        self.fa_noise_strength = float(fa_noise_strength)
+
+        self.fa_gate_scale = float(fa_gate_scale)
+        self.fa_gate_R = int(fa_gate_R)
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
@@ -698,43 +785,14 @@ class MainNet(nn.Module):
         self.fore_in_ch = self.xt_in_ch - 1
         cond_in_ch = self.img_in_ch
 
-        # stems (主干)
         self.back_stem = nn.Conv2d(back_in_ch, self.base_ch, 3, padding=1)
         self.fore_stem = nn.Conv2d(self.fore_in_ch, self.base_ch, 3, padding=1)
-
-        # control stem
         self.cond_stem = nn.Conv2d(cond_in_ch, self.base_ch, 3, padding=1)
-
-        # Dense HOG extractor
-        self.freq_hog = FreqDenseHOG(
-            hog_bins=self.hog_bins,
-            hog_tau=self.hog_tau,
-            eps=self.hog_eps,
-            mag_weight=hog_mag_weight,
-        )
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
-        # ✅ TriSAFuse：只用于 level0 的 encoder 特征注入
-        self.usa_x = TriSAFuse(
-            ch=self.chs[0],
-            gauss_ks=usa_gauss_ks,
-            gauss_sigma_init=usa_gauss_sigma_init,
-            init_bias=usa_init_bias,
-        )
-
-        # FA levels: last K
-        K_levels = min(self.freq_attn_depth, n_levels)
-        self.attn_level_set = set(range(n_levels - K_levels, n_levels))
-
-        self.hog_norm_levels = nn.ModuleList([
-            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
-            for i in range(n_levels)
-        ])
-        self.hog_norm_mid = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
-
-        # encoders: 主干 back/fore + Control cond
+        # encoders
         self.back_enc = nn.ModuleList()
         self.fore_enc = nn.ModuleList()
         self.cond_enc = nn.ModuleList()
@@ -746,31 +804,7 @@ class MainNet(nn.Module):
             self.fore_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
             self.cond_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
 
-        def make_fa_list(ch: int) -> nn.ModuleList:
-            mods = nn.ModuleList()
-            for _ in range(self.fa_stacks):
-                mods.append(
-                    FAModule(
-                        ch=ch,
-                        time_ch=self.time_dim,
-                        heads=self.attn_heads,
-                        head_dim=self.attn_head_dim,
-                        hog_bins=self.hog_bins,
-                        noise_strength=self.noise_strength,
-                        fa_patch=self.fa_patch,
-                        fa_attn_dropout=self.fa_attn_dropout,
-                        token_dim=self.fa_token_dim,
-                    )
-                )
-            return mods
-
-        self.couple_modules = nn.ModuleDict()
-        for i in sorted(self.attn_level_set):
-            self.couple_modules[str(i)] = make_fa_list(self.chs[i])
-
-        self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
-
-        # decoder (shared, only skip_fb)
+        # main decoder (fb concat)
         self.dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = 2 * self.chs[i]
@@ -789,35 +823,87 @@ class MainNet(nn.Module):
                 )
             )
 
-        self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
-
-        # per-level c_skip processing
-        self.ctrl_proc_levels = nn.ModuleList(
-            [
-                ControlResProc(
-                    self.chs[i],
+        # cond decoder（单分支，给 c_dec0）
+        self.cond_dec = nn.ModuleList()
+        for i in reversed(range(n_levels)):
+            skip_ch = self.chs[i]
+            in_ch = (self.chs[i + 1]) if i < (n_levels - 1) else (self.chs[i])
+            out_ch = self.chs[i]
+            up = i < (n_levels - 1)
+            self.cond_dec.append(
+                DecoderStageSingle(
+                    in_ch=in_ch,
+                    skip_ch=skip_ch,
+                    out_ch=out_ch,
                     time_ch=self.time_dim,
-                    num_blocks=self.control_resblocks_per_level,
+                    num_blocks=self.num_res_blocks,
+                    up=up,
                     dropout=self.dropout,
                 )
+            )
+
+        self.out_v = nn.Conv2d(2 * self.base_ch, self.xt_in_ch, 3, padding=1)
+
+        # FA levels: last K
+        K_levels = min(self.freq_attn_depth, n_levels)
+        self.attn_level_set = set(range(n_levels - K_levels, n_levels))
+
+        self.freq_hog = FreqDenseHOG(
+            hog_bins=self.hog_bins,
+            hog_tau=self.hog_tau,
+            eps=self.hog_eps,
+            mag_weight=self.hog_mag_weight,
+        )
+
+        self.hog_norm_levels = nn.ModuleList([
+            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
+            for i in range(n_levels)
+        ])
+        self.hog_norm_mid = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
+
+        def make_fa_list(ch: int) -> nn.ModuleList:
+            mods = nn.ModuleList()
+            for _ in range(self.fa_stacks):
+                mods.append(
+                    FAModule(
+                        ch=ch,
+                        time_ch=self.time_dim,
+                        heads=self.attn_heads,
+                        head_dim=self.attn_head_dim,
+                        hog_bins=self.hog_bins,
+                        noise_strength=self.fa_noise_strength,
+                        fa_patch=self.fa_patch,
+                        fa_attn_dropout=self.fa_attn_dropout,
+                        token_dim=self.fa_token_dim,
+                        gate_scale=self.fa_gate_scale,
+                        gate_R=self.fa_gate_R,
+                    )
+                )
+            return mods
+
+        self.couple_modules = nn.ModuleDict()
+        for i in sorted(self.attn_level_set):
+            self.couple_modules[str(i)] = make_fa_list(self.chs[i])
+        self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
+
+        # cond skip processor
+        self.ctrl_proc_levels = nn.ModuleList(
+            [
+                ControlResProc(self.chs[i], time_ch=self.time_dim, num_blocks=self.control_resblocks_per_level, dropout=self.dropout)
                 for i in range(n_levels)
             ]
         )
-        self.ctrl_proc_mid = ControlResProc(
-            self.chs[-1],
-            time_ch=self.time_dim,
-            num_blocks=self.control_resblocks_per_level,
-            dropout=self.dropout,
-        )
 
-        # ControlNet ZeroConv injections（encoder/bottleneck保留模块，但默认不用）
-        self.ctrl_zero_b_enc = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
-        self.ctrl_zero_f_enc = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
-        self.ctrl_zero_b_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
-        self.ctrl_zero_f_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
-
-        # ✅ decoder 注入保留
+        # ✅ ZeroConv injections to MAIN DECODER (per level): chs[level] -> 2*chs[level]
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], 2 * self.chs[i]) for i in range(n_levels)])
+
+        # X injection only at encoder level0 using c_dec0
+        self.usa_x = TriSAFuse(
+            ch=self.chs[0],
+            gauss_ks=usa_gauss_ks,
+            gauss_sigma_init=usa_gauss_sigma_init,
+            init_bias=usa_init_bias,
+        )
 
     def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
         if isinstance(t, float):
@@ -832,96 +918,104 @@ class MainNet(nn.Module):
         x_back = x_t[:, 0:1]
         x_fore = x_t[:, 1:]
 
-        back = self.back_stem(x_back)
-        fore = self.fore_stem(x_fore)
-        cond = self.cond_stem(image)
+        back0 = self.back_stem(x_back)
+        fore0 = self.fore_stem(x_fore)
+        cond0 = self.cond_stem(image)
 
+        # (1) cond encoder -> cond_skips (processed)
+        cond_skips: List[torch.Tensor] = []
+        cond = cond0
+        for level, enc_c in enumerate(self.cond_enc):
+            c_skip = enc_c(cond, t_emb)
+            c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
+            cond_skips.append(c_skip_proc)
+            cond = enc_c.down(c_skip_proc) if enc_c.down is not None else c_skip_proc
+
+        # (2) cond decoder -> c_dec0 (full-res)
+        c_h = cond
+        for cdec, c_skip in zip(self.cond_dec, reversed(cond_skips)):
+            c_h = cdec(c_h, c_skip, t_emb)
+        c_dec0 = c_h  # (B, chs[0], H, W)
+
+        # (3) fore/back encoder with X injection at level0 only
         fore_skips: List[torch.Tensor] = []
         back_skips: List[torch.Tensor] = []
-        cond_skips: List[torch.Tensor] = []
 
-        for level, (enc_b, enc_f, enc_c) in enumerate(zip(self.back_enc, self.fore_enc, self.cond_enc)):
-            b_skip = enc_b(back, t_emb)   # (B, C, H, W)
-            f_skip = enc_f(fore, t_emb)   # (B, C, H, W)
-            c_skip = enc_c(cond, t_emb)   # (B, C, H, W)
+        back = back0
+        fore = fore0
 
-            c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
+        for level, (enc_b, enc_f) in enumerate(zip(self.back_enc, self.fore_enc)):
+            b_skip = enc_b(back, t_emb)
+            f_skip = enc_f(fore, t_emb)
 
             if level == 0:
-                b_skip, f_skip = self.usa_x(f_cond=c_skip_proc, f_back=b_skip, f_fore=f_skip)
-
-            if self.control_inject_to_encoder:
-                b_skip = b_skip + self.ctrl_zero_b_enc[level](c_skip_proc)
-                f_skip = f_skip + self.ctrl_zero_f_enc[level](c_skip_proc)
+                b_skip, f_skip = self.usa_x(f_cond=c_dec0, f_back=b_skip, f_fore=f_skip)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
-            cond_skips.append(c_skip_proc)
 
-            b_main, f_main, c_main = b_skip, f_skip, c_skip_proc
+            b_main, f_main = b_skip, f_skip
+            c_main = cond_skips[level]
 
-            # ✅ 在进入 FA 前：dense HOG + GN（不变）
             if level in self.attn_level_set:
-                hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
-                hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
-                hog_c = self.freq_hog(c_main)  # (B, C*K, H, W)
+                hog_f = self.freq_hog(f_main)
+                hog_b = self.freq_hog(b_main)
+                hog_c = self.freq_hog(c_main)
 
-                hog_f = self.hog_norm_levels[level](hog_f)
-                hog_b = self.hog_norm_levels[level](hog_b)
-                hog_c = self.hog_norm_levels[level](hog_c)
+                norm = self.hog_norm_levels[level]
+                hog_f = norm(torch.log1p(hog_f))
+                hog_b = norm(torch.log1p(hog_b))
+                hog_c = norm(torch.log1p(hog_c))
 
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
                     f_main, b_main = fa(
-                        f_main, b_main, c_main,
+                        fore=f_main, back=b_main, cond=c_main,
                         hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
                         t_emb=t_emb
                     )
 
             back = enc_b.down(b_main) if enc_b.down is not None else b_main
             fore = enc_f.down(f_main) if enc_f.down is not None else f_main
-            cond = enc_c.down(c_main) if enc_c.down is not None else c_main
 
-        cond_mid = self.ctrl_proc_mid(cond, t_emb)
-
-        if self.control_inject_to_bottleneck:
-            back = back + self.ctrl_zero_b_mid(cond_mid)
-            fore = fore + self.ctrl_zero_f_mid(cond_mid)
-
-        # ✅ bottleneck 同理：dense HOG + GN（不变）
+        # bottleneck coupling
         if self.bottleneck_coupler is not None:
+            cond_bot = cond_skips[-1]
+
             hog_f = self.freq_hog(fore)
             hog_b = self.freq_hog(back)
-            hog_c = self.freq_hog(cond_mid)
+            hog_c = self.freq_hog(cond_bot)
 
-            hog_f = self.hog_norm_mid(hog_f)
-            hog_b = self.hog_norm_mid(hog_b)
-            hog_c = self.hog_norm_mid(hog_c)
+            hog_f = self.hog_norm_mid(torch.log1p(hog_f))
+            hog_b = self.hog_norm_mid(torch.log1p(hog_b))
+            hog_c = self.hog_norm_mid(torch.log1p(hog_c))
 
             for fa in self.bottleneck_coupler:
                 fore, back = fa(
-                    fore, back, cond_mid,
+                    fore=fore, back=back, cond=cond_bot,
                     hog_fore=hog_f, hog_back=hog_b, hog_cond=hog_c,
                     t_emb=t_emb
                 )
 
+        # (4) main decoder + ✅ ZeroConv injection from cond encoder skips
         h = torch.cat([back, fore], dim=1)
-
-        for dec_idx, (dec, f_skip, b_skip, c_skip_proc) in enumerate(
-            zip(self.dec, reversed(fore_skips), reversed(back_skips), reversed(cond_skips))
-        ):
+        n_levels = len(self.chs)
+        for dec_idx, (dec, f_skip, b_skip) in enumerate(zip(self.dec, reversed(fore_skips), reversed(back_skips))):
             skip_fb = torch.cat([b_skip, f_skip], dim=1)
             h = dec(h, skip_fb, t_emb)
 
             if self.control_inject_to_decoder:
-                level = (len(self.chs) - 1) - dec_idx
-                h = h + self.ctrl_zero_dec[level](c_skip_proc)
+                # decoder 从高到低：level = n_levels-1-dec_idx
+                level = (n_levels - 1) - dec_idx
+                h = h + self.ctrl_zero_dec[level](cond_skips[level])
 
         h = F.silu(h)
-        v = self.out_v(h)
-        return v
+        return self.out_v(h)
 
 
+# =========================================================
+# build_model
+# =========================================================
 def build_model(
     image_hw: Tuple[int, int] = (256, 256),
     img_in_ch: int = 1,
@@ -936,21 +1030,18 @@ def build_model(
     freq_attn_depth: int = 0,
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 4,
-    noise_strength: float = 1.0,
-    # dense HOG
     hog_bins: int = 8,
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
-    # control
-    control_inject_to_encoder: bool = False,
-    control_inject_to_decoder: bool = True,
-    control_inject_to_bottleneck: bool = False,
+    hog_eps: float = 1e-8,
     control_resblocks_per_level: int = 1,
-    # FA token (kept; ControlNet-style FA ignores)
+    control_inject_to_decoder: bool = True,
     fa_patch: int = 4,
     fa_attn_dropout: float = 0.0,
     fa_token_dim: Optional[int] = None,
-    # X injection (TriSAFuse)
+    fa_noise_strength: float = 1.0,
+    fa_gate_scale: float = 1.0,
+    fa_gate_R: int = 2,
     usa_gauss_ks: int = 7,
     usa_gauss_sigma_init: float = 1.5,
     usa_init_bias: float = -10.0,
@@ -969,24 +1060,27 @@ def build_model(
         freq_attn_depth=freq_attn_depth,
         use_bottleneck_coupling=use_bottleneck_coupling,
         fa_stacks=fa_stacks,
-        noise_strength=noise_strength,
         hog_bins=hog_bins,
         hog_tau=hog_tau,
         hog_mag_weight=hog_mag_weight,
-        hog_eps=1e-8,
-        control_inject_to_encoder=control_inject_to_encoder,
-        control_inject_to_decoder=control_inject_to_decoder,
-        control_inject_to_bottleneck=control_inject_to_bottleneck,
+        hog_eps=hog_eps,
         control_resblocks_per_level=control_resblocks_per_level,
+        control_inject_to_decoder=control_inject_to_decoder,
         fa_patch=fa_patch,
         fa_attn_dropout=fa_attn_dropout,
         fa_token_dim=fa_token_dim,
+        fa_noise_strength=fa_noise_strength,
+        fa_gate_scale=fa_gate_scale,
+        fa_gate_R=fa_gate_R,
         usa_gauss_ks=usa_gauss_ks,
         usa_gauss_sigma_init=usa_gauss_sigma_init,
         usa_init_bias=usa_init_bias,
     )
 
 
+# =========================================================
+# quick test
+# =========================================================
 if __name__ == "__main__":
     net = build_model(
         image_hw=(256, 256),
@@ -994,23 +1088,29 @@ if __name__ == "__main__":
         xt_in_ch=4,
         base_ch=32,
         ch_mult=(1, 2, 4, 4),
-        freq_attn_depth=2,
-        fa_stacks=2,
+        num_res_blocks=2,
+        time_dim=256,
+        dropout=0.0,
+        attn_heads=4,
+        attn_head_dim=32,
+        freq_attn_depth=1,
         use_bottleneck_coupling=True,
-        noise_strength=1.0,
+        fa_stacks=2,
         hog_bins=8,
         hog_tau=0.35,
         hog_mag_weight=True,
-        control_inject_to_encoder=False,     # ✅ encoder 不用 zero conv（只在 level0 用 TriSAFuse）
-        control_inject_to_decoder=True,      # ✅ decoder 保留 zero conv 注入
-        control_inject_to_bottleneck=False,  # ✅ bottleneck 默认不注入
+        hog_eps=1e-8,
         control_resblocks_per_level=1,
-        fa_patch=4,
+        control_inject_to_decoder=True,  # ✅ 注入到主干 decoder
+        fa_patch=8,
         fa_attn_dropout=0.0,
         fa_token_dim=None,
+        fa_noise_strength=1.0,
+        fa_gate_scale=1.0,
+        fa_gate_R=2,
         usa_gauss_ks=7,
         usa_gauss_sigma_init=1.5,
-        usa_init_bias=-2.0,
+        usa_init_bias=-10.0,
     )
 
     x_t = torch.randn(2, 4, 256, 256)
