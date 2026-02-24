@@ -4,8 +4,10 @@
 只用 cond encoder 的第一层（level0）特征，对 fore/back 的 encoder 第一层特征做 TriSAFuse：
 - TriSAFuse 仅在 level==0 时执行：b_skip, f_skip = usa_x(c_skip_proc, b_skip, f_skip)
 - 其他全部保持不变：
-  - FA：token 频域 + 方案A + 自token+自hog token拼接 + 三条边 cross-attn + 只回写前N
-  - Token-Time-FiLM：feature patchify 与 hog patchify 两边都加（不变）
+  - ✅ FA：已替换为 ControlNet-style FA（freq-map RI + direct head + spatial cross-attn），但保持同样的调用签名
+    - forward(fore, back, cond, hog_fore, hog_back, hog_cond, t_emb) 仍然一致
+    - hog_* 仍计算/传入，但 ControlNet-style FA 内部不使用（为了“其他都不要改”）
+  - Token-Time-FiLM：保留原实现（但 ControlNet-style FA 不用 token patchify，自然也不使用 token-film）
   - decoder 仍通过 zero conv 注入（ctrl_zero_dec）
   - encoder/bottleneck 的 zero conv 注入模块仍保留，但默认关（control_inject_to_encoder=False / control_inject_to_bottleneck=False）
 """
@@ -251,7 +253,7 @@ class TriSAFuse(nn.Module):
 
 
 # =========================================================
-# ✅ ViT-style patchify & unpatchify
+# ✅ ViT-style patchify & unpatchify (保留：其他不改)
 # =========================================================
 class PatchEmbed2D(nn.Module):
     """
@@ -304,7 +306,7 @@ class Unpatch2D(nn.Module):
 
 
 # =========================================================
-# ✅ Token Time-FiLM (PatchEmbed 后对 tokens 做调制)
+# ✅ Token Time-FiLM (保留：其他不改)
 # =========================================================
 class TokenTimeFiLM(nn.Module):
     """
@@ -317,7 +319,6 @@ class TokenTimeFiLM(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.to_gb = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * self.dim))
-        # ✅ identity init
         nn.init.zeros_(self.to_gb[-1].weight)
         nn.init.zeros_(self.to_gb[-1].bias)
 
@@ -329,16 +330,9 @@ class TokenTimeFiLM(nn.Module):
 
 
 # =========================================================
-# ✅ Token Cross-Attention (ViT-style)
+# ✅ Token Cross-Attention (保留：其他不改)
 # =========================================================
 class TokenCrossAttention(nn.Module):
-    """
-    Cross-attention in token space:
-      q_tokens: (B, Nq, D)
-      kv_tokens: (B, Nk, D)
-    Output:
-      (B, Nq, D)
-    """
     def __init__(self, dim: int, heads: int, dropout: float = 0.0):
         super().__init__()
         self.dim = int(dim)
@@ -408,12 +402,79 @@ class FreqDenseHOG(nn.Module):
 
 
 # =========================================================
-# ✅ FA module: PatchEmbed → FFT → (freq cross-attn) → iFFT → MLP → Unpatch
-#   + 方案A：hog_fore / hog_back / hog_cond
-#   + 拼接与三条 cross-attn 边
-#   + ✅ feature tokens + hog tokens 都加 t 的 Token-Time-FiLM
+# ✅ ControlNet-style FA (替换进来) —— 但保持相同 forward 签名
 # =========================================================
+class SpatialCrossAttention(nn.Module):
+    def __init__(self, q_ch: int, kv_ch: int, heads: int = 4, head_dim: int = 32):
+        super().__init__()
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        inner = self.heads * self.head_dim
+
+        self.to_q = nn.Conv2d(q_ch, inner, 1, bias=False)
+        self.to_k = nn.Conv2d(kv_ch, inner, 1, bias=False)
+        self.to_v = nn.Conv2d(kv_ch, inner, 1, bias=False)
+
+        self.out = nn.Conv2d(inner, q_ch, 1)
+        self.scale = self.head_dim**-0.5
+
+        self.norm_q = GroupNorm32(q_ch)
+        self.norm_kv = GroupNorm32(kv_ch)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+
+        x = self.norm_q(x)
+        c = self.norm_kv(c)
+
+        q = self.to_q(x).view(b, self.heads, self.head_dim, h * w)
+        k = self.to_k(c).view(b, self.heads, self.head_dim, h * w)
+        v = self.to_v(c).view(b, self.heads, self.head_dim, h * w)
+
+        attn = torch.einsum("bhdi,bhdj->bhij", q * self.scale, k).softmax(dim=-1)
+        out = torch.einsum("bhij,bhdj->bhdi", attn, v).reshape(b, self.heads * self.head_dim, h, w)
+        return self.out(out)
+
+
+class FreqDirectHeadFiLM(nn.Module):
+    def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
+        super().__init__()
+        self.ch = int(ch)
+        hid = int(hidden_mult * ch)
+
+        self.in_norm = GroupNorm32(4 * ch)
+        self.conv_in = nn.Conv2d(4 * ch, hid, 3, padding=1)
+
+        self.hid_norm = GroupNorm32(hid)
+        self.to_film = nn.Sequential(nn.SiLU(), nn.Linear(time_ch, 2 * hid))
+
+        self.conv_mid = nn.Conv2d(hid, hid, 3, padding=1)
+        self.conv_out = nn.Conv2d(hid, 2 * ch, 1)
+
+        nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x_ri4c: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv_in(F.silu(self.in_norm(x_ri4c)))
+
+        h = self.hid_norm(h)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
+        h = (1.0 + gamma) * h + beta
+
+        h = F.silu(self.conv_mid(F.silu(h)))
+        out = self.conv_out(h)
+        return out
+
+
 class FAModule(nn.Module):
+    """
+    ✅ ControlNet-style FA:
+    - operate on full-res frequency maps (RI: 2C channels)
+    - direct head + 3 spatial cross-attn edges
+    - 兼容你现有 MainNet 的调用方式：hog_* 仍作为参数传入（但模块内部不使用）
+    """
     def __init__(
         self,
         ch: int,
@@ -428,89 +489,28 @@ class FAModule(nn.Module):
     ):
         super().__init__()
         self.ch = int(ch)
-        self.hog_bins = int(hog_bins)
-        self.noise_strength = float(noise_strength)
 
-        self.fa_patch = int(fa_patch)
-        if token_dim is None:
-            token_dim = int(heads * head_dim)
-        self.token_dim = int(token_dim)
+        self.attn_fb = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
+        self.attn_fc = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
+        self.attn_bc = SpatialCrossAttention(q_ch=2 * self.ch, kv_ch=2 * self.ch, heads=heads, head_dim=head_dim)
 
-        C = self.ch
-        D = self.token_dim
-        hog_ch = C * self.hog_bins
+        self.post_f = nn.Sequential(GroupNorm32(2 * self.ch), nn.SiLU(), nn.Conv2d(2 * self.ch, 2 * self.ch, 1))
+        self.post_b = nn.Sequential(GroupNorm32(2 * self.ch), nn.SiLU(), nn.Conv2d(2 * self.ch, 2 * self.ch, 1))
+        self.norm_f = GroupNorm32(2 * self.ch)
+        self.norm_b = GroupNorm32(2 * self.ch)
 
-        # 1) patchify 主特征：C -> D
-        self.patch_f = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-        self.patch_b = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-        self.patch_c = PatchEmbed2D(in_ch=C, embed_dim=D, patch=self.fa_patch)
-
-        # 2) patchify HOG：C*K -> D（空间域 tokens）
-        self.patch_hf = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-        self.patch_hb = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-        self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=D, patch=self.fa_patch)
-
-        # ✅ Time-FiLM on patch tokens (feature)
-        self.time_film_f = TokenTimeFiLM(D, time_ch)
-        self.time_film_b = TokenTimeFiLM(D, time_ch)
-        self.time_film_c = TokenTimeFiLM(D, time_ch)
-
-        # ✅ Time-FiLM on patch tokens (hog)
-        self.time_film_hf = TokenTimeFiLM(D, time_ch)
-        self.time_film_hb = TokenTimeFiLM(D, time_ch)
-        self.time_film_hc = TokenTimeFiLM(D, time_ch)
-
-        # 3) HOG tokens -> RI tokens (2D)
-        self.hog_to_ri_f = nn.Linear(D, 2 * D, bias=True)
-        self.hog_to_ri_b = nn.Linear(D, 2 * D, bias=True)
-        self.hog_to_ri_c = nn.Linear(D, 2 * D, bias=True)
-
-        # 4) 频域 cross-attn：embed_dim = 2D
-        self.attn_f_freq = TokenCrossAttention(dim=2 * D, heads=heads, dropout=fa_attn_dropout)
-        self.attn_b_freq = TokenCrossAttention(dim=2 * D, heads=heads, dropout=fa_attn_dropout)
-
-        # 5) iFFT 后 MLP：embed_dim = D
-        self.mlp_f = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 4 * D),
-            nn.SiLU(),
-            nn.Linear(4 * D, D),
-        )
-        self.mlp_b = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 4 * D),
-            nn.SiLU(),
-            nn.Linear(4 * D, D),
-        )
-
-        # 6) unpatch：D -> C
-        self.unpatch_f = Unpatch2D(embed_dim=D, out_ch=C, patch=self.fa_patch)
-        self.unpatch_b = Unpatch2D(embed_dim=D, out_ch=C, patch=self.fa_patch)
+        self.direct_head_f = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
+        self.direct_head_b = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
     @staticmethod
-    def _tok_to_map(tok: torch.Tensor, hp: int, wp: int) -> torch.Tensor:
-        b, n, d = tok.shape
-        if n != hp * wp:
-            raise ValueError(f"_tok_to_map: N={n} but Hp*Wp={hp*wp}")
-        return tok.transpose(1, 2).contiguous().view(b, d, hp, wp)
+    def _to_ri(z: torch.Tensor) -> torch.Tensor:
+        return torch.cat([z.real, z.imag], dim=1)
 
     @staticmethod
-    def _map_to_tok(m: torch.Tensor) -> torch.Tensor:
-        return m.flatten(2).transpose(1, 2).contiguous()
-
-    @staticmethod
-    def _complex_to_ri_tokens(z: torch.Tensor) -> torch.Tensor:
-        ri = torch.cat([z.real, z.imag], dim=1)           # (B, 2D, Hp, Wp)
-        return ri.flatten(2).transpose(1, 2).contiguous() # (B, N, 2D)
-
-    @staticmethod
-    def _ri_tokens_to_complex(tok_ri: torch.Tensor, hp: int, wp: int) -> torch.Tensor:
-        b, n, d2 = tok_ri.shape
-        if n != hp * wp:
-            raise ValueError(f"_ri_tokens_to_complex: N={n} but Hp*Wp={hp*wp}")
-        d = d2 // 2
-        ri = tok_ri.transpose(1, 2).contiguous().view(b, d2, hp, wp)  # (B, 2D, Hp, Wp)
-        return torch.complex(ri[:, :d], ri[:, d:])                     # (B, D, Hp, Wp) complex
+    def _to_complex(ri: torch.Tensor) -> torch.Tensor:
+        b, c2, h, w = ri.shape
+        c = c2 // 2
+        return torch.complex(ri[:, :c], ri[:, c:])
 
     def forward(
         self,
@@ -522,86 +522,35 @@ class FAModule(nn.Module):
         hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
     ):
-        # 1) PatchEmbed: (B,C,H,W) -> (B,N,D)
-        F_tok, hw_p = self.patch_f(fore)
-        B_tok, _    = self.patch_b(back)
-        C_tok, _    = self.patch_c(cond)
+        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Bz = torch.fft.fftshift(torch.fft.fft2(back, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-        # ✅ Time-FiLM on feature tokens
-        F_tok = self.time_film_f(F_tok, t_emb)
-        B_tok = self.time_film_b(B_tok, t_emb)
-        C_tok = self.time_film_c(C_tok, t_emb)
+        Fri = self._to_ri(Fz)
+        Bri = self._to_ri(Bz)
+        Cri = self._to_ri(Cz)
 
-        Hp, Wp = hw_p
-        N = F_tok.shape[1]
+        f_in = torch.cat([Fri, Cri], dim=1)  # (B,4C,H,W)
+        b_in = torch.cat([Bri, Cri], dim=1)
 
-        # tokens -> token-grid maps: (B,D,Hp,Wp)
-        F_map = self._tok_to_map(F_tok, Hp, Wp)
-        B_map = self._tok_to_map(B_tok, Hp, Wp)
-        C_map = self._tok_to_map(C_tok, Hp, Wp)
+        Fri = Fri + self.direct_head_f(f_in, t_emb)
+        Bri = Bri + self.direct_head_b(b_in, t_emb)
 
-        # 2) FFT on token-grid
-        Fz = torch.fft.fftshift(torch.fft.fft2(F_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Bz = torch.fft.fftshift(torch.fft.fft2(B_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        Cz = torch.fft.fftshift(torch.fft.fft2(C_map, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        d_fb = self.attn_fb(Fri, Bri)
+        d_fc = self.attn_fc(Fri, Cri)
+        Fri2 = self.norm_f(self.post_f(Fri + d_fb + d_fc))
 
-        # 3) complex -> RI tokens
-        Ff_tok = self._complex_to_ri_tokens(Fz)  # (B,N,2D)
-        Bf_tok = self._complex_to_ri_tokens(Bz)  # (B,N,2D)
-        Cf_tok = self._complex_to_ri_tokens(Cz)  # (B,N,2D)
+        d_bc = self.attn_bc(Bri, Cri)
+        Bri2 = self.norm_b(self.post_b(Bri + d_bc))
 
-        # 4) HOG tokens
-        Hf_tok, _ = self.patch_hf(hog_fore)  # (B,N,D)
-        Hb_tok, _ = self.patch_hb(hog_back)  # (B,N,D)
-        Hc_tok, _ = self.patch_hc(hog_cond)  # (B,N,D)
+        F2c = self._to_complex(Fri2)
+        B2c = self._to_complex(Bri2)
 
-        # ✅ Time-FiLM on hog tokens
-        Hf_tok = self.time_film_hf(Hf_tok, t_emb)
-        Hb_tok = self.time_film_hb(Hb_tok, t_emb)
-        Hc_tok = self.time_film_hc(Hc_tok, t_emb)
+        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
+        B2c = torch.fft.ifftshift(B2c, dim=(-2, -1))
 
-        Hf2_tok = self.hog_to_ri_f(Hf_tok)   # (B,N,2D)
-        Hb2_tok = self.hog_to_ri_b(Hb_tok)   # (B,N,2D)
-        Hc2_tok = self.hog_to_ri_c(Hc_tok)   # (B,N,2D)
-
-        # 5) 拼接规则 + 三条边
-        FQ = torch.cat([Ff_tok, Hf2_tok], dim=1)  # (B,2N,2D)
-        BK = torch.cat([Bf_tok, Hb2_tok], dim=1)  # (B,2N,2D)
-        CK = torch.cat([Cf_tok, Hc2_tok], dim=1)  # (B,2N,2D)
-
-        d_fb = self.attn_f_freq(FQ, BK)
-        d_fc = self.attn_f_freq(FQ, CK)
-        FQ2 = FQ + d_fb + d_fc
-
-        d_bc = self.attn_b_freq(BK, CK)
-        BK2 = BK + d_bc
-
-        # 只回写前 N
-        Ff_tok2 = FQ2[:, :N, :]
-        Bf_tok2 = BK2[:, :N, :]
-
-        # 6) iFFT
-        Fz2 = self._ri_tokens_to_complex(Ff_tok2, Hp, Wp)
-        Bz2 = self._ri_tokens_to_complex(Bf_tok2, Hp, Wp)
-
-        Fz2 = torch.fft.ifftshift(Fz2, dim=(-2, -1))
-        Bz2 = torch.fft.ifftshift(Bz2, dim=(-2, -1))
-
-        F_map2 = torch.fft.ifft2(Fz2, dim=(-2, -1), norm="ortho").real
-        B_map2 = torch.fft.ifft2(Bz2, dim=(-2, -1), norm="ortho").real
-
-        # map -> tokens
-        F_tok2 = self._map_to_tok(F_map2)
-        B_tok2 = self._map_to_tok(B_map2)
-
-        # 7) MLP
-        F_tok2 = F_tok2 + self.mlp_f(F_tok2)
-        B_tok2 = B_tok2 + self.mlp_b(B_tok2)
-
-        # 8) Unpatch
-        fore_out = self.unpatch_f(F_tok2, hw_p)
-        back_out = self.unpatch_b(B_tok2, hw_p)
-
+        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
+        back_out = torch.fft.ifft2(B2c, dim=(-2, -1), norm="ortho").real
         return fore_out, back_out
 
 
@@ -896,14 +845,11 @@ class MainNet(nn.Module):
             f_skip = enc_f(fore, t_emb)   # (B, C, H, W)
             c_skip = enc_c(cond, t_emb)   # (B, C, H, W)
 
-            # ✅ 只用 cond encoder 的第一层特征（level0 的 c_skip）：
             c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
 
-            # ✅ 仅在 level0：用 c_skip_proc 对 b_skip / f_skip 做 TriSAFuse
             if level == 0:
                 b_skip, f_skip = self.usa_x(f_cond=c_skip_proc, f_back=b_skip, f_fore=f_skip)
 
-            # ❌ encoder zero conv 注入默认不使用（开关仍保留，默认 False）
             if self.control_inject_to_encoder:
                 b_skip = b_skip + self.ctrl_zero_b_enc[level](c_skip_proc)
                 f_skip = f_skip + self.ctrl_zero_f_enc[level](c_skip_proc)
@@ -967,7 +913,6 @@ class MainNet(nn.Module):
             skip_fb = torch.cat([b_skip, f_skip], dim=1)
             h = dec(h, skip_fb, t_emb)
 
-            # ✅ decoder 通过 zero conv 注入（保留）
             if self.control_inject_to_decoder:
                 level = (len(self.chs) - 1) - dec_idx
                 h = h + self.ctrl_zero_dec[level](c_skip_proc)
@@ -988,7 +933,7 @@ def build_model(
     dropout: float = 0.0,
     attn_heads: int = 4,
     attn_head_dim: int = 32,
-    freq_attn_depth: int = 1,
+    freq_attn_depth: int = 0,
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 4,
     noise_strength: float = 1.0,
@@ -997,11 +942,11 @@ def build_model(
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
     # control
-    control_inject_to_encoder: bool = False,      # ✅ encoder level0 用 TriSAFuse，默认关 zero-conv 注入
-    control_inject_to_decoder: bool = True,       # ✅ decoder zero conv 注入开
-    control_inject_to_bottleneck: bool = False,   # ✅ 默认关
+    control_inject_to_encoder: bool = False,
+    control_inject_to_decoder: bool = True,
+    control_inject_to_bottleneck: bool = False,
     control_resblocks_per_level: int = 1,
-    # FA token
+    # FA token (kept; ControlNet-style FA ignores)
     fa_patch: int = 4,
     fa_attn_dropout: float = 0.0,
     fa_token_dim: Optional[int] = None,
