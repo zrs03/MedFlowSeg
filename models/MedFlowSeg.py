@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-✅ 修改版：把 X 注入改为【cond encoder 首层(level0)通过 TriSAFuse 注入到 back/fore】，
-decoder 仍然通过 zero conv 注入（ctrl_zero_dec）——其余都不变：
-- FA：token 频域 + 方案A + 自token+自hog token拼接 + 三条边 cross-attn + 只回写前N 不变
-- Token-Time-FiLM：feature patchify 与 hog patchify 两边都加（不变）
-- ControlNet/UNet 主干不变（除了 encoder 注入逻辑这处改动）
-
-建议：build_model 里设置
-  control_inject_to_encoder=False
-  control_inject_to_bottleneck=False
-  control_inject_to_decoder=True
+✅ 修改版（按你的最终要求）：
+只用 cond encoder 的第一层（level0）特征，对 fore/back 的 encoder 第一层特征做 TriSAFuse：
+- TriSAFuse 仅在 level==0 时执行：b_skip, f_skip = usa_x(c_skip_proc, b_skip, f_skip)
+- 其他全部保持不变：
+  - FA：token 频域 + 方案A + 自token+自hog token拼接 + 三条边 cross-attn + 只回写前N
+  - Token-Time-FiLM：feature patchify 与 hog patchify 两边都加（不变）
+  - decoder 仍通过 zero conv 注入（ctrl_zero_dec）
+  - encoder/bottleneck 的 zero conv 注入模块仍保留，但默认关（control_inject_to_encoder=False / control_inject_to_bottleneck=False）
 """
 
 from __future__ import annotations
@@ -229,11 +227,9 @@ class TriSAFuse(nn.Module):
         self.gauss = LearnableGaussianBlur2d(self.ch, kernel_size=gauss_ks, sigma_init=gauss_sigma_init)
 
         self.k_fore  = nn.Conv2d(self.ch, 1, 1, bias=True)
-        self.k_back  = nn.Conv2d(self.ch, 1, 1, bias=True)
         self.k_cross = nn.Conv2d(self.ch, 1, 1, bias=True)
 
         nn.init.zeros_(self.k_fore.weight);  nn.init.constant_(self.k_fore.bias,  init_bias)
-        nn.init.zeros_(self.k_back.weight);  nn.init.constant_(self.k_back.bias,  init_bias)
         nn.init.zeros_(self.k_cross.weight); nn.init.constant_(self.k_cross.bias, init_bias)
 
     def forward(self, f_cond: torch.Tensor, f_back: torch.Tensor, f_fore: torch.Tensor):
@@ -246,12 +242,11 @@ class TriSAFuse(nn.Module):
 
         a = f_anc.abs()
         g_fore  = torch.sigmoid(self.k_fore(a))
-        g_back  = torch.sigmoid(self.k_back(a))
         g_cross = torch.sigmoid(self.k_cross(a))
 
         f_fore0 = f_fore
         f_fore = f_fore0 + f_fore0 * g_fore
-        f_back = f_back + f_back * g_back + f_fore0 * g_cross
+        f_back = f_back + f_back * g_cross
         return f_back, f_fore
 
 
@@ -416,25 +411,9 @@ class FreqDenseHOG(nn.Module):
 # ✅ FA module: PatchEmbed → FFT → (freq cross-attn) → iFFT → MLP → Unpatch
 #   + 方案A：hog_fore / hog_back / hog_cond
 #   + 拼接与三条 cross-attn 边
-#   + ✅ 新增：feature tokens + hog tokens 都加 t 的 Token-Time-FiLM
+#   + ✅ feature tokens + hog tokens 都加 t 的 Token-Time-FiLM
 # =========================================================
 class FAModule(nn.Module):
-    """
-    输入：
-      fore/back/cond: (B, C, H, W)
-      hog_fore/hog_back/hog_cond: (B, C*K, H, W)
-
-    关键：
-      - attention 在频域：FFT 后转 RI tokens (B,N,2D) 做 cross-attn
-      - iFFT 后再做 MLP：在空间 tokens (B,N,D) 上做 FFN
-      - HOG（方案A）：HOG patchify 得 (B,N,D)，再 Linear 投到 (B,N,2D)
-      - 拼接规则：谁当 Q/KV，就只拼接自己 feature+自己 hog
-      - 三条边：
-          d_fb = attn(FQ <- BK)
-          d_fc = attn(FQ <- CK)
-          d_bc = attn(BK <- CK)
-      - 回写频谱只取前 N（feature RI tokens），hog tokens 仅作条件
-    """
     def __init__(
         self,
         ch: int,
@@ -688,7 +667,7 @@ class DecoderStageDirect(nn.Module):
 # -----------------------------
 # Main Network
 # -----------------------------
-class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
+class MainNet(nn.Module):
     def __init__(
         self,
         *,
@@ -712,9 +691,9 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
         # --- ControlNet injections ---
-        control_inject_to_encoder: bool = False,      # ✅ 默认关掉（encoder改用TriSAFuse）
+        control_inject_to_encoder: bool = False,      # ✅ 默认关掉（encoder level0 用 TriSAFuse）
         control_inject_to_decoder: bool = True,       # ✅ decoder zero conv 注入保留
-        control_inject_to_bottleneck: bool = False,   # ✅ 默认关掉（按你要求“其他都不变”，这里只建议关）
+        control_inject_to_bottleneck: bool = False,   # ✅ 默认关掉
         control_resblocks_per_level: int = 1,
         # --- FA patch/token settings ---
         fa_patch: int = 4,
@@ -788,7 +767,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
-        # ✅ X 注入：cond encoder 首层(level0)用 TriSAFuse
+        # ✅ TriSAFuse：只用于 level0 的 encoder 特征注入
         self.usa_x = TriSAFuse(
             ch=self.chs[0],
             gauss_ks=usa_gauss_ks,
@@ -888,7 +867,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
         self.ctrl_zero_b_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
         self.ctrl_zero_f_mid = ZeroConv2d(self.chs[-1], self.chs[-1])
 
-        # ✅ decoder 注入保留（你要求：decoder 通过 zero conv 注入）
+        # ✅ decoder 注入保留
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], 2 * self.chs[i]) for i in range(n_levels)])
 
     def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
@@ -917,13 +896,14 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             f_skip = enc_f(fore, t_emb)   # (B, C, H, W)
             c_skip = enc_c(cond, t_emb)   # (B, C, H, W)
 
+            # ✅ 只用 cond encoder 的第一层特征（level0 的 c_skip）：
             c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
 
-            # ✅ X 注入改为：cond encoder 首层(level0)通过 TriSAFuse 注入到 b/f
+            # ✅ 仅在 level0：用 c_skip_proc 对 b_skip / f_skip 做 TriSAFuse
             if level == 0:
                 b_skip, f_skip = self.usa_x(f_cond=c_skip_proc, f_back=b_skip, f_fore=f_skip)
 
-            # ❌ encoder zero conv 注入默认不使用（如你想保留开关，可把下面取消注释）
+            # ❌ encoder zero conv 注入默认不使用（开关仍保留，默认 False）
             if self.control_inject_to_encoder:
                 b_skip = b_skip + self.ctrl_zero_b_enc[level](c_skip_proc)
                 f_skip = f_skip + self.ctrl_zero_f_enc[level](c_skip_proc)
@@ -934,7 +914,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
 
             b_main, f_main, c_main = b_skip, f_skip, c_skip_proc
 
-            # ✅ 在进入 FA 前：dense HOG + GN
+            # ✅ 在进入 FA 前：dense HOG + GN（不变）
             if level in self.attn_level_set:
                 hog_f = self.freq_hog(f_main)  # (B, C*K, H, W)
                 hog_b = self.freq_hog(b_main)  # (B, C*K, H, W)
@@ -962,7 +942,7 @@ class FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(nn.Module):
             back = back + self.ctrl_zero_b_mid(cond_mid)
             fore = fore + self.ctrl_zero_f_mid(cond_mid)
 
-        # ✅ bottleneck 同理：dense HOG + GN（方案A：fore/back/cond）
+        # ✅ bottleneck 同理：dense HOG + GN（不变）
         if self.bottleneck_coupler is not None:
             hog_f = self.freq_hog(fore)
             hog_b = self.freq_hog(back)
@@ -1008,7 +988,7 @@ def build_model(
     dropout: float = 0.0,
     attn_heads: int = 4,
     attn_head_dim: int = 32,
-    freq_attn_depth: int = 0,
+    freq_attn_depth: int = 1,
     use_bottleneck_coupling: bool = True,
     fa_stacks: int = 4,
     noise_strength: float = 1.0,
@@ -1017,7 +997,7 @@ def build_model(
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
     # control
-    control_inject_to_encoder: bool = False,      # ✅ encoder用TriSAFuse，默认关
+    control_inject_to_encoder: bool = False,      # ✅ encoder level0 用 TriSAFuse，默认关 zero-conv 注入
     control_inject_to_decoder: bool = True,       # ✅ decoder zero conv 注入开
     control_inject_to_bottleneck: bool = False,   # ✅ 默认关
     control_resblocks_per_level: int = 1,
@@ -1029,8 +1009,8 @@ def build_model(
     usa_gauss_ks: int = 7,
     usa_gauss_sigma_init: float = 1.5,
     usa_init_bias: float = -10.0,
-) -> FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet:
-    return FMForeBackCondDeepKTriFFTSingleDecoderResUNet_ControlNet(
+) -> MainNet:
+    return MainNet(
         image_hw=tuple(image_hw),
         img_in_ch=img_in_ch,
         xt_in_ch=xt_in_ch,
@@ -1076,16 +1056,16 @@ if __name__ == "__main__":
         hog_bins=8,
         hog_tau=0.35,
         hog_mag_weight=True,
-        control_inject_to_encoder=False,     # ✅ encoder不用zero conv
-        control_inject_to_decoder=True,      # ✅ decoder保留zero conv注入
-        control_inject_to_bottleneck=False,  # ✅ bottleneck默认不注入
+        control_inject_to_encoder=False,     # ✅ encoder 不用 zero conv（只在 level0 用 TriSAFuse）
+        control_inject_to_decoder=True,      # ✅ decoder 保留 zero conv 注入
+        control_inject_to_bottleneck=False,  # ✅ bottleneck 默认不注入
         control_resblocks_per_level=1,
         fa_patch=4,
         fa_attn_dropout=0.0,
         fa_token_dim=None,
         usa_gauss_ks=7,
         usa_gauss_sigma_init=1.5,
-        usa_init_bias=-10.0,
+        usa_init_bias=-2.0,
     )
 
     x_t = torch.randn(2, 4, 256, 256)
