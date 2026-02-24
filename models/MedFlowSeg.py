@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-✅ 完整修改版（按你的最终澄清要求）
+✅ 完整修改版（按你最新要求）
 
-保留：
-1) cond 走完整 encoder+decoder 得到 c_dec0（full-res）
-2) X 注入：仅在 fore/back encoder 的 level0，用 c_dec0 做 TriSAFuse
-3) FA：token cross-attn（不拼 hog token 到 KV） + token gate（HOG tokens -> gate，且 gate builder 含 time embedding，R=2）
+保留不变：
+1) cond 仍走完整 encoder + decoder
+2) X 注入：仅在 fore/back encoder 的 level0 注入一次 TriSAFuse
+3) FA：token cross-attn（不拼 hog token 到 KV） + token gate（HOG tokens -> gate，gate builder 含 time embedding，R=2）
 4) HOG：dense freq HOG + log1p + GN
-5) 主干 decoder 结构不变
+5) 主干 shared decoder（fb concat）结构不变；注入位置仍在每个 decoder stage 后
 
-修改点（你刚澄清的）：
-✅ ZeroConv 注入发生在「主干 decoder」：
-- cond encoder 的 cond_skips[level] 通过 ZeroConv 映射到 2*chs[level]
-- 在每个 decoder stage 后注入到 h： h = h + ctrl_zero_dec[level](cond_skips[level])
+修改点（你的新要求）：
+✅ TriSAFuse：改为使用 cond encoder 的第一层特征（level0 的 cond skip）与 fore/back encoder level0 做 trifuse
+✅ ZeroConv 注入：cond 经过 decoder 后，收集“cond decoder 每层 decoder 特征”，并用 zero conv 注入 shared decoder 对应层
 """
 
 from __future__ import annotations
@@ -702,9 +701,9 @@ class DecoderStageSingle(nn.Module):
 
 # =========================================================
 # Main UNet
-# - cond: encoder -> proc -> decoder -> c_dec0
-# - X injection: TriSAFuse ONLY at fore/back encoder level0 using c_dec0
-# - ZeroConv injection: cond encoder skips -> main decoder (h) at each level
+# - cond: encoder -> proc -> decoder -> (collect per-level decoder feats)
+# - X injection: TriSAFuse ONLY at fore/back encoder level0 using cond encoder level0 feat
+# - ZeroConv injection: cond decoder feats -> shared decoder (h) at each level
 # =========================================================
 class MainNet(nn.Module):
     def __init__(
@@ -823,7 +822,7 @@ class MainNet(nn.Module):
                 )
             )
 
-        # cond decoder（单分支，给 c_dec0）
+        # cond decoder（单分支，收集每层 cond decoder feature）
         self.cond_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
@@ -897,7 +896,7 @@ class MainNet(nn.Module):
         # ✅ ZeroConv injections to MAIN DECODER (per level): chs[level] -> 2*chs[level]
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], 2 * self.chs[i]) for i in range(n_levels)])
 
-        # X injection only at encoder level0 using c_dec0
+        # X injection only at encoder level0 using cond encoder level0 feat
         self.usa_x = TriSAFuse(
             ch=self.chs[0],
             gauss_ks=usa_gauss_ks,
@@ -931,11 +930,19 @@ class MainNet(nn.Module):
             cond_skips.append(c_skip_proc)
             cond = enc_c.down(c_skip_proc) if enc_c.down is not None else c_skip_proc
 
-        # (2) cond decoder -> c_dec0 (full-res)
+        # ✅ TriSAFuse 使用 cond encoder 的第一层特征（level0 skip）
+        cond_enc_l0 = cond_skips[0]  # (B, chs[0], H, W)
+
+        # (2) cond decoder -> collect per-level decoder feats (for zero-conv inject)
         c_h = cond
-        for cdec, c_skip in zip(self.cond_dec, reversed(cond_skips)):
+        n_levels = len(self.chs)
+        cond_dec_feats: List[torch.Tensor] = [None] * n_levels  # type: ignore
+
+        for cdec_idx, (cdec, c_skip) in enumerate(zip(self.cond_dec, reversed(cond_skips))):
             c_h = cdec(c_h, c_skip, t_emb)
-        c_dec0 = c_h  # (B, chs[0], H, W)
+            # cond decoder 从高到低：level = n_levels-1-cdec_idx
+            level = (n_levels - 1) - cdec_idx
+            cond_dec_feats[level] = c_h
 
         # (3) fore/back encoder with X injection at level0 only
         fore_skips: List[torch.Tensor] = []
@@ -949,7 +956,8 @@ class MainNet(nn.Module):
             f_skip = enc_f(fore, t_emb)
 
             if level == 0:
-                b_skip, f_skip = self.usa_x(f_cond=c_dec0, f_back=b_skip, f_fore=f_skip)
+                # ✅ 用 cond encoder level0 特征做 trifuse
+                b_skip, f_skip = self.usa_x(f_cond=cond_enc_l0, f_back=b_skip, f_fore=f_skip)
 
             back_skips.append(b_skip)
             fore_skips.append(f_skip)
@@ -997,17 +1005,16 @@ class MainNet(nn.Module):
                     t_emb=t_emb
                 )
 
-        # (4) main decoder + ✅ ZeroConv injection from cond encoder skips
+        # (4) main decoder + ✅ ZeroConv injection from cond DECODER feats
         h = torch.cat([back, fore], dim=1)
-        n_levels = len(self.chs)
         for dec_idx, (dec, f_skip, b_skip) in enumerate(zip(self.dec, reversed(fore_skips), reversed(back_skips))):
             skip_fb = torch.cat([b_skip, f_skip], dim=1)
             h = dec(h, skip_fb, t_emb)
 
             if self.control_inject_to_decoder:
-                # decoder 从高到低：level = n_levels-1-dec_idx
+                # shared decoder 从高到低：level = n_levels-1-dec_idx
                 level = (n_levels - 1) - dec_idx
-                h = h + self.ctrl_zero_dec[level](cond_skips[level])
+                h = h + self.ctrl_zero_dec[level](cond_dec_feats[level])
 
         h = F.silu(h)
         return self.out_v(h)
