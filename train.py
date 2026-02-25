@@ -1,17 +1,16 @@
 # ======================================================
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
-# Threshold + Argmax decoding (SegDiff-style)
-# + EMA (Exponential Moving Average)
+# ✅ Adapted for NO-BACKGROUND channels in sdf/onehot (C=3 for ACDC labels 1/2/3)
 #
-# ✅ EMA default ON with "--no_ema" to disable
-# ✅ Save EMA shadow into Lightning checkpoint so test/inference can load EMA weights
+# Changes (minimal but necessary):
+# 1) num_classes default -> 3
+# 2) Decode functions updated for "no background channel" sdf:
+#    - GT: fg_bin = (sdf <= 0) per channel; add explicit background channel for argmax
+#    - Pred: fg_bin = (sdf <= fg_factor*thresh) per channel; add explicit background channel for argmax
+#    - Background is chosen where all fg channels are 0
 #
-# ✅ VIS Fix (改法2): 记录并可视化前 N 个 val batches（而不是只记录 batch_idx==0）
-#    - 新增参数: --vis_batches  (默认 1)
-#
-# ✅ NEW: Resume training support (no other changes)
-#    - --resume_ckpt path/to/ckpt.ckpt
+# Everything else kept the same (EMA/vis/resume/training logic).
 # ======================================================
 
 import argparse
@@ -33,59 +32,72 @@ from utils.dataset import FolderDataset
 # ======================================================
 # Utils
 # ======================================================
-def sdf_to_mask_thresh_argmax_pred(sdf: torch.Tensor, thresh: float, fg_factor: float = 3.0) -> torch.Tensor:
+def sdf_to_mask_thresh_argmax_pred_no_bg(
+    sdf: torch.Tensor, thresh: float, fg_factor: float = 3.0
+) -> torch.Tensor:
     """
-    Pred: threshold + argmax (SegDiff-style)
+    Pred decoding for NO-BG sdf channels.
 
-    sdf: (B, C, H, W), signed distance (normalized to [-1,1] in your preprocessing)
-    - Use only foreground channels 1..C-1 for thresholding.
-    - Foreground binary: sdf <= fg_factor*thresh
-    - Add background channel=0 then argmax to get labels 0..C-1
-
-    returns: (B, H, W) with values in {0..C-1}
+    sdf: (B, C, H, W) where C=3 corresponds to labels {1,2,3} (no background channel stored).
+    We create an explicit background channel so argmax can output {0..C}:
+      - Foreground binary per class: sdf <= fg_factor*thresh
+      - Background binary: 1 if all foreground binaries are 0 at that pixel
+      - Argmax over (bg + fg_bins) -> labels in {0..C}
+        where:
+          0 -> background
+          1 -> class-1 (ACDC label 1)
+          2 -> class-2 (ACDC label 2)
+          3 -> class-3 (ACDC label 3)
     """
-    sdf_fg = sdf[:, 1:]
-    fg_bin = (sdf_fg <= (fg_factor * thresh)).to(torch.int8)
+    if sdf.ndim != 4:
+        raise ValueError(f"sdf must be (B,C,H,W), got {tuple(sdf.shape)}")
 
-    bg = torch.zeros_like(fg_bin[:, :1])
-    m = torch.cat([bg, fg_bin], dim=1)
-    return torch.argmax(m, dim=1)
+    fg_bin = (sdf <= (fg_factor * thresh)).to(torch.int8)  # (B,C,H,W)
+    # background where no fg class is active
+    bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)  # (B,1,H,W)
+
+    m = torch.cat([bg_bin, fg_bin], dim=1)  # (B,1+C,H,W)
+    return torch.argmax(m, dim=1)  # (B,H,W) in {0..C}
 
 
-def sdf_to_mask_thresh_argmax_gt(sdf_gt: torch.Tensor) -> torch.Tensor:
+def sdf_to_mask_thresh_argmax_gt_no_bg(sdf_gt: torch.Tensor) -> torch.Tensor:
     """
-    GT: threshold + argmax.
-    Since GT sdf is signed distance: inside is negative, boundary=0, outside positive.
+    GT decoding for NO-BG sdf channels.
+
+    sdf_gt: (B, C, H, W) where C=3 corresponds to labels {1,2,3}.
+    For signed distance maps: inside is negative, boundary=0, outside positive.
     So foreground is sdf <= 0.
 
-    sdf_gt: (B, C, H, W)
-    returns: (B, H, W) with values in {0..C-1}
+    We add explicit background channel:
+      bg=1 where all fg bins are 0.
     """
-    sdf_fg = sdf_gt[:, 1:]
-    fg_bin = (sdf_fg <= 0.0).to(torch.int8)
+    if sdf_gt.ndim != 4:
+        raise ValueError(f"sdf_gt must be (B,C,H,W), got {tuple(sdf_gt.shape)}")
 
-    bg = torch.zeros_like(fg_bin[:, :1])
-    m = torch.cat([bg, fg_bin], dim=1)
-    return torch.argmax(m, dim=1)
+    fg_bin = (sdf_gt <= 0.0).to(torch.int8)  # (B,C,H,W)
+    bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)  # (B,1,H,W)
+
+    m = torch.cat([bg_bin, fg_bin], dim=1)  # (B,1+C,H,W)
+    return torch.argmax(m, dim=1)  # (B,H,W) in {0..C}
 
 
-def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes_with_bg: int) -> torch.Tensor:
     """
-    Mean Dice over foreground classes only (1..num_classes-1),
-    skip classes where both GT and pred are empty.
+    Mean Dice over foreground classes only (1..num_classes_with_bg-1),
+    skip classes where GT is empty.
 
-    pred, gt: (B,H,W) with labels in {0..num_classes-1}
+    pred, gt: (B,H,W) with labels in {0..num_classes_with_bg-1}
     """
     dices = []
-    for c in range(1, num_classes):
+    for c in range(1, num_classes_with_bg):
         g = (gt == c).float()
         p = (pred == c).float()
         if g.sum() == 0:
             continue
 
-        inter = (p * g).sum(dim=(1,2))
-        denom = p.sum(dim=(1,2)) + g.sum(dim=(1,2)) + 1e-6
-        dices.append((2*inter/denom).mean())
+        inter = (p * g).sum(dim=(1, 2))
+        denom = p.sum(dim=(1, 2)) + g.sum(dim=(1, 2)) + 1e-6
+        dices.append((2 * inter / denom).mean())
 
     if len(dices) == 0:
         return torch.tensor(0.0, device=pred.device)
@@ -177,11 +189,11 @@ class EMA:
 class LitMedFlowSeg(pl.LightningModule):
     def __init__(
         self,
-        num_classes: int = 4,
+        num_classes: int = 3,  # ✅ now means "foreground channels count" (no bg stored)
         lr: float = 1e-4,
         sample_steps: int = 10,
         vis_every: int = 5,
-        vis_batches: int = 1,  # ✅ 改法2：可视化前 N 个 val batches
+        vis_batches: int = 1,
         output_root: str = "./Outputs/MedFlowSeg",
         thresh: float = 0.2,
         fg_factor: float = 3.0,
@@ -193,9 +205,14 @@ class LitMedFlowSeg(pl.LightningModule):
         self.save_hyperparameters()
 
         # Flow-matching model (expects x_t, image, t)
+        # ✅ xt_in_ch must match GT sdf channels (no-bg): C=3
         self.model = build_model(xt_in_ch=num_classes)
 
-        self.num_classes = num_classes
+        # num_classes_fg: 3 (labels 1/2/3)
+        self.num_classes_fg = int(num_classes)
+        # num_classes_with_bg used for visualization/dice/label space after decode
+        self.num_classes_with_bg = self.num_classes_fg + 1
+
         self.lr = lr
         self.sample_steps = sample_steps
 
@@ -224,48 +241,43 @@ class LitMedFlowSeg(pl.LightningModule):
     # EMA hooks
     # -----------------------------
     def on_fit_start(self):
-        # init EMA after Lightning moves model to correct device(s)
         if self.use_ema and self.ema is None:
             self.ema = EMA(self.model, decay=self.ema_decay)
 
-            # if resumed and ckpt had EMA shadow, restore it
             if self._ema_shadow_from_ckpt is not None:
                 self.ema.shadow = {k: v.to(self.device) for k, v in self._ema_shadow_from_ckpt.items()}
             if self._ema_decay_from_ckpt is not None:
                 self.ema.decay = float(self._ema_decay_from_ckpt)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # called after optimizer.step() by default -> safe place to update EMA
         if self.use_ema and self.ema is not None:
             self.ema.update(self.model)
 
     def on_validation_epoch_start(self):
-        # swap to EMA weights for the whole validation epoch
         if self.use_ema and self.ema is not None:
             self.ema.store(self.model)
             self.ema.copy_to(self.model)
 
-    # ✅ save / load EMA into checkpoint so test can use EMA
     def on_save_checkpoint(self, checkpoint):
         if self.use_ema and self.ema is not None:
             checkpoint["ema_shadow"] = {k: v.detach().cpu() for k, v in self.ema.shadow.items()}
             checkpoint["ema_decay"] = float(self.ema.decay)
 
     def on_load_checkpoint(self, checkpoint):
-        # cache; apply in on_fit_start after ema exists and device is set
         self._ema_shadow_from_ckpt = checkpoint.get("ema_shadow", None)
         self._ema_decay_from_ckpt = checkpoint.get("ema_decay", None)
 
     # --------------------------------------------------
-    # Flow Matching sampling (Euler integrate dx/dt = v_theta)
+    # Flow Matching sampling
     # --------------------------------------------------
     @torch.no_grad()
     def sample(self, image: torch.Tensor) -> torch.Tensor:
         """
         Start from x(0) ~ N(0, I) and integrate to t=1.
+        Output sdf_pred has shape (B, C, H, W) where C=num_classes_fg (no bg stored).
         """
         B, _, H, W = image.shape
-        x = torch.randn(B, self.num_classes, H, W, device=image.device)
+        x = torch.randn(B, self.num_classes_fg, H, W, device=image.device)
 
         dt = 1.0 / self.sample_steps
         for i in range(self.sample_steps):
@@ -276,10 +288,10 @@ class LitMedFlowSeg(pl.LightningModule):
         return x
 
     # --------------------------------------------------
-    # Training: Conditional Flow Matching (linear bridge)
+    # Training
     # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, x1 = batch  # x1 is sdf_gt, (B,C,H,W)
+        image, x1 = batch  # x1 is sdf_gt, (B,C,H,W) where C=num_classes_fg
 
         B = image.shape[0]
         device = image.device
@@ -302,14 +314,17 @@ class LitMedFlowSeg(pl.LightningModule):
     # Validation
     # --------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        image, sdf_gt = batch
+        image, sdf_gt = batch  # sdf_gt: (B,C,H,W), C=num_classes_fg (no bg)
 
         sdf_pred = self.sample(image)
 
-        pred_mask = sdf_to_mask_thresh_argmax_pred(sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor)
-        gt_mask = sdf_to_mask_thresh_argmax_gt(sdf_gt)
+        # ✅ decode adapted to NO-BG sdf channels
+        pred_mask = sdf_to_mask_thresh_argmax_pred_no_bg(
+            sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor
+        )
+        gt_mask = sdf_to_mask_thresh_argmax_gt_no_bg(sdf_gt)
 
-        dice = mean_dice_foreground(pred_mask, gt_mask, self.num_classes)
+        dice = mean_dice_foreground(pred_mask, gt_mask, self.num_classes_with_bg)
 
         self.log(
             "val_mean_dice",
@@ -320,7 +335,6 @@ class LitMedFlowSeg(pl.LightningModule):
             sync_dist=True,
         )
 
-        # ✅ 改法2：缓存前 N 个 batch（而不是只缓存 batch_idx==0）
         if batch_idx < self.vis_batches:
             self._val_vis_cache.append(
                 {
@@ -344,7 +358,6 @@ class LitMedFlowSeg(pl.LightningModule):
                 save_dir = self.vis_root / f"epoch_{epoch:04d}"
                 save_dir.mkdir(parents=True, exist_ok=True)
 
-                # ✅ 逐个 batch 可视化；每个 batch 最多画 4 张
                 for cache in self._val_vis_cache:
                     img = cache["image"][:, 0].numpy()
                     pred = cache["pred"].numpy()
@@ -358,11 +371,11 @@ class LitMedFlowSeg(pl.LightningModule):
                         axs[0].set_title("Image")
                         axs[0].axis("off")
 
-                        axs[1].imshow(colorize_multiclass(gt[i], self.num_classes))
+                        axs[1].imshow(colorize_multiclass(gt[i], self.num_classes_with_bg))
                         axs[1].set_title("GT")
                         axs[1].axis("off")
-                        
-                        axs[2].imshow(colorize_multiclass(pred[i], self.num_classes))
+
+                        axs[2].imshow(colorize_multiclass(pred[i], self.num_classes_with_bg))
                         axs[2].set_title("Pred")
                         axs[2].axis("off")
 
@@ -372,7 +385,6 @@ class LitMedFlowSeg(pl.LightningModule):
 
             self._val_vis_cache.clear()
 
-        # restore original (non-EMA) weights after validation epoch
         if self.use_ema and self.ema is not None:
             self.ema.restore(self.model)
 
@@ -394,7 +406,8 @@ def main():
     parser.add_argument("--val_root", type=str, default="./dataset/ACDC/SDF/val")
 
     # -------- Model --------
-    parser.add_argument("--num_classes", type=int, default=4)
+    # ✅ IMPORTANT: this is now foreground channel count (no bg stored). For ACDC labels 1/2/3 -> 3
+    parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--sample_steps", type=int, default=50)
 
     # -------- Optimization --------
@@ -457,15 +470,15 @@ def main():
 
     # -------- Model --------
     model = LitMedFlowSeg(
-        num_classes=args.num_classes,
+        num_classes=args.num_classes,  # ✅ C=3 for no-bg sdf
         lr=args.lr,
         sample_steps=args.sample_steps,
         vis_every=args.vis_every,
-        vis_batches=args.vis_batches,  # ✅
+        vis_batches=args.vis_batches,
         output_root=args.output_root,
         thresh=args.thresh,
         fg_factor=args.fg_factor,
-        use_ema=(not args.no_ema),  # ✅ default ON
+        use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
     )
 
@@ -491,7 +504,7 @@ def main():
         log_every_n_steps=20,
     )
 
-    # ✅ Resume support (Lightning will restore optimizer/scheduler/epoch/global_step/etc.)
+    # ✅ Resume support
     ckpt_path = args.resume_ckpt.strip() if isinstance(args.resume_ckpt, str) else ""
     if ckpt_path == "":
         ckpt_path = None

@@ -3,15 +3,16 @@
 # One script to:
 # 1) Extract ACDC ED 2D slice (best z by GT), pad/crop to fixed size
 # 2) Normalize image with percentile-clip min-max to [-1, 1]
-# 3) Convert GT label to one-hot (C=4) and then to per-channel SDF (C=4)
+# 3) ✅ Convert GT label to one-hot WITHOUT background (C=3, labels 1/2/3)
+#    and then to per-channel SDF (C=3)
 # 4) Patient-level split 8:1:1 (train/val/test) and save split.json
 # 5) Save outputs to:
 #    out_root/
 #      split.json
 #      train/patientXXX/
-#         ED_frameYY_img.npy        (H,W) float32 in [-1,1]
-#         ED_frameYY_gt_onehot.npy  (4,H,W) uint8
-#         ED_frameYY_gt_sdf.npy     (4,H,W) float32 clipped to [-clip,clip]
+#         img.npy        (H,W) float32 in [-1,1]
+#         onehot.npy     (3,H,W) uint8   (labels 1..3 only; no background channel)
+#         sdf.npy        (3,H,W) float32 clipped to [-1,1] (normalized by clip)
 #      val/...
 #      test/...
 #
@@ -28,6 +29,7 @@
 # - Works for both training/ and testing/ splits inside ACDCdataset.
 # - ED frame is chosen as the earlier frame among the two GT frames (by frame number).
 # - Best z slice is picked by maximizing non-zero GT pixels (avoid empty slices).
+# - ✅ Background (label 0) is NOT stored in onehot/sdf.
 
 from pathlib import Path
 import argparse
@@ -135,15 +137,25 @@ def _to_hwz(arr: np.ndarray) -> np.ndarray:
     return np.moveaxis(arr, [h, w, z], [0, 1, 2])
 
 
-def to_onehot_4(gt2d: np.ndarray, num_classes: int = 4) -> np.ndarray:
+def to_onehot_no_bg(gt2d: np.ndarray, fg_labels=(1, 2, 3)) -> np.ndarray:
     """
+    ✅ No-background onehot.
+
     gt2d: (H,W) integer labels in {0,1,2,3}
-    return: (C,H,W) uint8 one-hot
+    fg_labels: which labels to keep as channels (default 1,2,3)
+
+    return: (C,H,W) uint8 one-hot, where:
+      channel 0 -> label 1
+      channel 1 -> label 2
+      channel 2 -> label 3
+    background(0) is ignored (all-zero across channels).
     """
     gt2d = gt2d.astype(np.int64, copy=False)
-    gt2d = np.clip(gt2d, 0, num_classes - 1)
-    onehot = np.eye(num_classes, dtype=np.uint8)[gt2d]  # (H,W,C)
-    onehot = np.transpose(onehot, (2, 0, 1))           # (C,H,W)
+    C = len(fg_labels)
+    H, W = gt2d.shape
+    onehot = np.zeros((C, H, W), dtype=np.uint8)
+    for i, lab in enumerate(fg_labels):
+        onehot[i] = (gt2d == int(lab)).astype(np.uint8)
     return onehot
 
 
@@ -162,11 +174,11 @@ def pick_best_z_by_gt(gt_hwz: np.ndarray) -> int:
 def onehot_to_sdf_per_channel(
     onehot: np.ndarray,
     clip: float = 10.0,
-    normalize: bool = False,          # 新增：是否缩放到 [-1,1]
-    normalize_eps: float = 1e-8       # 新增：防止 clip=0
+    normalize: bool = False,          # whether scale to [-1,1]
+    normalize_eps: float = 1e-8
 ) -> np.ndarray:
     """
-    onehot: (C,H,W) uint8/bool (C=4)
+    onehot: (C,H,W) uint8/bool
     returns sdf: (C,H,W) float32
         inside mask  -> negative distance
         outside mask -> positive distance
@@ -174,13 +186,13 @@ def onehot_to_sdf_per_channel(
 
     If normalize=True:
         output is scaled to [-1,1] by dividing by `clip` (after clipping).
-        i.e., sdf_out = clip(sdf_raw, -clip, clip) / clip
+        sdf_out = clip(sdf_raw, -clip, clip) / clip
     """
     if onehot.ndim != 3:
         raise ValueError(f"Expected onehot shape (C,H,W), got {onehot.shape}")
 
     if clip is None:
-        raise ValueError("clip cannot be None if normalize=True (and recommended to be set always).")
+        raise ValueError("clip cannot be None.")
     if normalize and clip <= 0:
         raise ValueError(f"clip must be > 0 when normalize=True, got clip={clip}")
 
@@ -198,10 +210,8 @@ def onehot_to_sdf_per_channel(
             # channel empty -> treat as far outside
             sdf_c = np.full((H, W), fill_value=clip, dtype=np.float32)
 
-        # clip to [-clip, clip]
         sdf_c = np.clip(sdf_c, -clip, clip).astype(np.float32)
 
-        # normalize to [-1,1] if requested
         if normalize:
             sdf_c = sdf_c / (float(clip) + normalize_eps)
 
@@ -320,7 +330,6 @@ def _find_case_dir(base_dir: Path, patient_name: str) -> Path | None:
         cand = root / patient_name
         if cand.exists() and cand.is_dir():
             return cand
-        # fallback: rglob in case nested
         hits = list(root.rglob(patient_name))
         hits = [h for h in hits if h.is_dir() and h.name == patient_name]
         if hits:
@@ -341,7 +350,7 @@ def process_one_patient(
     sdf_clip: float,
 ) -> bool:
     """
-    Extract ED slice, normalize to [-1,1], onehot GT, SDF, then save.
+    Extract ED slice, normalize to [-1,1], onehot GT (no bg), SDF (no bg), then save.
     Returns True if saved, False if skipped.
     """
     case_dir = _find_case_dir(base_dir, patient_name)
@@ -351,7 +360,6 @@ def process_one_patient(
 
     ed_img_path, ed_gt_path, ed_frame_num = _get_acdc_ed_files(case_dir)
     if ed_img_path is None:
-        # no ED/ES GT pair
         return False
 
     ed_img = nib.load(str(ed_img_path)).get_fdata()
@@ -371,14 +379,14 @@ def process_one_patient(
     # image [-1,1]
     img_norm = minmax01_single(img2d, clip_percentiles=clip_percentiles)
 
-    # onehot + sdf
-    gt_onehot = to_onehot_4(gt2d, num_classes=4)              # (4,H,W) uint8
-    gt_sdf = onehot_to_sdf_per_channel(gt_onehot, clip=sdf_clip, normalize=True)  # (4,H,W) float32
+    # ✅ onehot (no background) + sdf (no background)
+    gt_onehot = to_onehot_no_bg(gt2d, fg_labels=(1, 2, 3))              # (3,H,W) uint8
+    gt_sdf = onehot_to_sdf_per_channel(gt_onehot, clip=sdf_clip, normalize=True)  # (3,H,W) float32 in [-1,1]
 
     _ensure_dirs(out_patient_dir)
-    np.save(out_patient_dir / f"img.npy", img_norm.astype(np.float32))
-    np.save(out_patient_dir / f"onehot.npy", gt_onehot)
-    np.save(out_patient_dir / f"sdf.npy", gt_sdf.astype(np.float32))
+    np.save(out_patient_dir / "img.npy", img_norm.astype(np.float32))
+    np.save(out_patient_dir / "onehot.npy", gt_onehot)
+    np.save(out_patient_dir / "sdf.npy", gt_sdf.astype(np.float32))
 
     return True
 

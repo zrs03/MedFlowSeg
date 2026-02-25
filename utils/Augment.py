@@ -3,7 +3,7 @@
 ACDCAugment.py
 Offline augmentation for extracted 2D samples.
 
-CHANGED (your request):
+CHANGED (your request + no-bg compatibility):
 - Input pairs are found by searching for:
     img.npy
     onehot.npy
@@ -12,9 +12,16 @@ CHANGED (your request):
 - After augmentation, regenerate sdf.npy FROM onehot.npy (distance transform per channel)
 - Folder structure stays the same: numeric folders under --out_root
 
+IMPORTANT:
+- This version supports "no background channel" onehot:
+    onehot.npy is (C,H,W) where C=3 (labels 1/2/3 only).
+  Background is implicit = all-zero across channels.
+- We MUST NOT force every pixel to belong to some class.
+  Therefore we re-onehot with a background check.
+
 Expected input under --in_root (any nested structure is OK):
   .../img.npy      : (H,W) float32
-  .../onehot.npy   : (C,H,W) uint8/bool/float (will be treated as onehot)
+  .../onehot.npy   : (C,H,W) uint8/bool/float (no-bg onehot OK)
 
 Output under --out_root:
   000000/
@@ -151,15 +158,11 @@ def _build_affine_2d_rot_scale_trans(
     A_xy = (s_inv * R.T).astype(np.float32)
 
     # offset in xy:
-    # x_in = A_xy @ x_out + offset
     t_xy = np.array([tx, ty], dtype=np.float32)
     c_xy = np.array([cx, cy], dtype=np.float32)
     offset_xy = c_xy - A_xy @ (c_xy + t_xy)
 
     # scipy expects (y,x) coords:
-    # matrix maps (y,x)_out -> (y,x)_in
-    # If A_xy maps [x_out, y_out] -> [x_in, y_in],
-    # then A_yx should map [y_out, x_out] -> [y_in, x_in].
     A_yx = np.array([[A_xy[1, 1], A_xy[1, 0]],
                      [A_xy[0, 1], A_xy[0, 0]]], dtype=np.float32)
     offset_yx = np.array([offset_xy[1], offset_xy[0]], dtype=np.float32)
@@ -214,17 +217,30 @@ def _apply_affine_to_onehot(
     return out
 
 
-def _reonehot_argmax(onehot_f: np.ndarray) -> np.ndarray:
+def _reonehot_argmax_no_bg(onehot_f: np.ndarray, thr: float = 0.5) -> np.ndarray:
     """
-    Fix potential overlaps/holes after warping.
-    onehot_f: (C,H,W) float
-    -> hard onehot (C,H,W) uint8 with exactly one class per pixel.
+    ✅ No-background safe re-onehot.
+
+    onehot_f: (C,H,W) float (may have overlaps/holes after warping)
+    Background is implicit. We keep background where "no foreground".
+    Rule:
+      fg_score = max_c onehot_f[c]
+      if fg_score < thr -> all zeros (background)
+      else -> argmax class = 1 at that pixel
+
+    Returns: (C,H,W) uint8
     """
-    lbl = np.argmax(onehot_f, axis=0).astype(np.int32)  # (H,W)
-    C = onehot_f.shape[0]
-    out = np.zeros_like(onehot_f, dtype=np.uint8)
+    if onehot_f.ndim != 3:
+        raise ValueError(f"Expected (C,H,W), got {onehot_f.shape}")
+
+    C, H, W = onehot_f.shape
+    maxv = np.max(onehot_f, axis=0)            # (H,W)
+    lbl = np.argmax(onehot_f, axis=0)          # (H,W) in [0..C-1]
+    fg = (maxv >= float(thr))
+
+    out = np.zeros((C, H, W), dtype=np.uint8)
     for c in range(C):
-        out[c] = (lbl == c).astype(np.uint8)
+        out[c] = (fg & (lbl == c)).astype(np.uint8)
     return out
 
 
@@ -289,7 +305,7 @@ def onehot_to_sdf_per_channel(
     eps: float = 1e-8,
 ) -> np.ndarray:
     """
-    onehot: (C,H,W) uint8/bool (0/1)
+    onehot: (C,H,W) uint8/bool (0/1), no-bg is fine (background=all-zero)
     returns sdf: (C,H,W) float32
       sdf_c = dist_out - dist_in
     then clip to [-clip, clip], optional normalize by clip to [-1,1].
@@ -309,7 +325,6 @@ def onehot_to_sdf_per_channel(
             dist_out = distance_transform_edt(~mask)
             sdf_c = dist_out - dist_in
         else:
-            # no pixels: set to +clip everywhere
             sdf_c = np.full((H, W), fill_value=clip, dtype=np.float32)
 
         sdf_c = np.clip(sdf_c, -clip, clip).astype(np.float32)
@@ -371,8 +386,8 @@ def augment_one(
         # onehot: nearest
         onehot = _apply_affine_to_onehot(onehot, A_yx, offset_yx, order=0, mode="constant", cval=0.0)
 
-    # fix onehot to hard + mutually exclusive
-    onehot_u8 = _reonehot_argmax(onehot)
+    # ✅ fix onehot to hard + mutually exclusive, keeping background empty
+    onehot_u8 = _reonehot_argmax_no_bg(onehot, thr=cfg["onehot_thr"])
 
     # ---------- Intensity (image only) ----------
     img = _rand_brightness_contrast_gamma(
@@ -460,9 +475,9 @@ def augment_dataset(
     for img_p, onehot_p in pairs:
         img, onehot = _load_check(img_p, onehot_p)
 
-        # include original: still regenerate sdf from original onehot (ensures consistency)
+        # include original: still regenerate sdf from original onehot (no-bg safe)
         if include_original:
-            onehot_u8 = _reonehot_argmax(onehot)
+            onehot_u8 = _reonehot_argmax_no_bg(onehot, thr=cfg["onehot_thr"])
             sdf = onehot_to_sdf_per_channel(
                 onehot_u8,
                 clip=cfg["sdf_clip"],
@@ -533,15 +548,18 @@ def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         # sdf regen
         "sdf_clip": float(args.sdf_clip),
         "sdf_normalize": (not bool(args.sdf_no_norm)),
+
+        # ✅ no-bg reonehot threshold
+        "onehot_thr": float(args.onehot_thr),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--in_root", type=str, default="./dataset/DDMI/ONEHOT/train",
+    ap.add_argument("--in_root", type=str, default="./dataset/ACDC/ONEHOT/train",
                     help="Input root containing img.npy & onehot.npy")
-    ap.add_argument("--out_root", type=str, default="./dataset/DDMI/Aug/train",
+    ap.add_argument("--out_root", type=str, default="./dataset/ACDC/Aug/train",
                     help="Output root; numeric folders 000000/")
     ap.add_argument("--aug_per_sample", type=int, default=4,
                     help="Number of augmented variants per base sample")
@@ -577,6 +595,11 @@ def main():
     # ---- SDF regeneration ----
     ap.add_argument("--sdf_clip", type=float, default=10.0, help="clip SDF to [-clip, clip]")
     ap.add_argument("--sdf_no_norm", action="store_true", help="disable sdf normalization by clip")
+
+    # ✅ no-bg onehot fix threshold
+    ap.add_argument("--onehot_thr", type=float, default=0.5,
+                    help="Foreground threshold for no-bg reonehot (default 0.5). "
+                         "Pixels with max(onehot)<thr stay background(all-zero).")
 
     args = ap.parse_args()
     cfg = build_cfg_from_args(args)
