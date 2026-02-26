@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-✅ 在你给的代码基础上：删除整个 back 分支（完全移除 back 路径）
-并保持：
-- 输入 x_t 仍是 (B, xt_in_ch, H, W)
-- 输出仍是 (B, xt_in_ch, H, W)（和 xt_in_ch 保持一致）
-- cond 分支、Control 注入、HOG、FA、positional encoding 都保留
-- TriSAFuse 改为 SAFuse（只对 fore 做注入）
+✅ 按你最新要求：USA/SAFuse 改成「双核 DualBand（低通+高通）做 gate」
+- low = Gauss_large(cond)          (低通)
+- high = cond - Gauss_small(cond)  (高通)
+- gate = sigmoid(Conv1x1([low,|low|,high,|high|]))  # 可选 abs
+- 只对 fore 注入：fore = fore + fore * gate
 
-主要改动（概览）：
-1) 删除 back_stem / back_enc / back_skips / back 相关所有逻辑
-2) 主干只剩 fore 分支：stem -> fore_enc -> (可选 USA 注入) -> (可选 FA coupling) -> fore decoder -> out_v
-3) Decoder 从 “Direct(2*chs)” 改成 “Single(chs)”
-4) out_v 从 (2*base_ch -> xt_in_ch) 改为 (base_ch -> xt_in_ch)
-5) Control 注入通道同步改为 (chs -> chs)
-6) FAModule 改为 fore-only 版本（fore ↔ cond），保留 token attention 的 2D sin-cos pos enc
+并且：
+- 去掉之前“多尺度”的接口（ks_list / sigma_init_list 等）
+- 去掉 usa_gauss_ks / usa_gauss_sigma_init 等未使用接口
+- 其他逻辑（cond 分支、Control 注入、HOG、FA、positional encoding）保持不变
 """
 
 from __future__ import annotations
@@ -158,7 +154,7 @@ class ZeroConv2d(nn.Module):
 
 
 # =========================================================
-# Control processor (optional, for cond features)
+# Control processor
 # =========================================================
 class ControlResProc(nn.Module):
     def __init__(self, ch: int, time_ch: int, num_blocks: int, dropout: float):
@@ -178,12 +174,9 @@ class ControlResProc(nn.Module):
 
 
 # =========================================================
-# ViT-style patchify & unpatchify
+# Patchify / Unpatchify
 # =========================================================
 class PatchEmbed2D(nn.Module):
-    """
-    (B,C,H,W) -> (B,N,D), N=(H/P)*(W/P)
-    """
     def __init__(self, in_ch: int, embed_dim: int, patch: int):
         super().__init__()
         self.in_ch = int(in_ch)
@@ -196,16 +189,13 @@ class PatchEmbed2D(nn.Module):
         p = self.patch
         if (h % p) != 0 or (w % p) != 0:
             raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h,w)}")
-        x = self.proj(x)  # (B, D, Hp, Wp)
+        x = self.proj(x)
         hp, wp = x.shape[-2], x.shape[-1]
-        x = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, D)
+        x = x.flatten(2).transpose(1, 2).contiguous()
         return x, (hp, wp)
 
 
 class Unpatch2D(nn.Module):
-    """
-    (B,N,D) -> (B,C,H,W)
-    """
     def __init__(self, embed_dim: int, out_ch: int, patch: int):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -220,7 +210,7 @@ class Unpatch2D(nn.Module):
         if n != hp * wp:
             raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp*wp}")
 
-        x = self.to_patch(tokens)  # (B, N, C*P*P)
+        x = self.to_patch(tokens)
         x = x.view(b, hp, wp, self.out_ch, p, p)
         x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
         x = x.view(b, self.out_ch, hp * p, wp * p)
@@ -248,14 +238,9 @@ class TokenCrossAttention(nn.Module):
 
 
 # =========================================================
-# Learnable Gaussian (per-channel depthwise conv)
+# Learnable Gaussian
 # =========================================================
 class LearnableGaussianBlur2d(nn.Module):
-    """
-    kGauss：逐通道 depthwise（groups=C）
-    - w = softplus(raw) 保证非负
-    - per-channel normalize: sum=1
-    """
     def __init__(self, channels: int, kernel_size: int = 7, sigma_init: float = 1.5, eps: float = 1e-8):
         super().__init__()
         if kernel_size % 2 == 0:
@@ -281,55 +266,77 @@ class LearnableGaussianBlur2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 4 or x.shape[1] != self.channels:
             raise ValueError(f"LearnableGaussianBlur2d expects (B,{self.channels},H,W), got {tuple(x.shape)}")
-        w = F.softplus(self.raw)  # non-negative
-        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)  # per-channel sum=1
+        w = F.softplus(self.raw)
+        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)
         pad = self.kernel_size // 2
         return F.conv2d(x, w, bias=None, stride=1, padding=pad, groups=self.channels)
 
 
 # =========================================================
-# SAFuse（替代 TriSAFuse，只对 fore 做注入）
+# ✅ Dual-band SAFuse（低通+高通，双核 gate，fore-only）
 # =========================================================
-class SAFuse(nn.Module):
+class DualBandSAFuse(nn.Module):
     """
-    ✅ 只保留 fore gate：fore = fore + fore * sigmoid(k(|anc|))
+    low  = Gauss_low(cond)                 # 低通（大核/大sigma）
+    high = cond - Gauss_high(cond)         # 高通（小核/小sigma）
+
+    gate = sigmoid(Conv1x1([low,|low|,high,|high|]))  # 可选 abs
+    fore = fore + fore * gate
     """
     def __init__(
         self,
         ch: int,
-        gauss_ks: int = 7,
-        gauss_sigma_init: float = 1.5,
-        init_bias: float = -2.0,
+        low_ks: int = 11,
+        low_sigma: float = 2.5,
+        high_ks: int = 3,
+        high_sigma: float = 0.8,
+        init_bias: float = -10.0,
+        use_abs: bool = True,
     ):
         super().__init__()
         self.ch = int(ch)
-        self.gauss = LearnableGaussianBlur2d(self.ch, gauss_ks, gauss_sigma_init)
-        self.k_fore = nn.Conv2d(self.ch, 1, 1, bias=True)
+        self.use_abs = bool(use_abs)
+
+        self.gauss_low = LearnableGaussianBlur2d(self.ch, kernel_size=low_ks, sigma_init=low_sigma)
+        self.gauss_high = LearnableGaussianBlur2d(self.ch, kernel_size=high_ks, sigma_init=high_sigma)
+
+        terms = 0
+        terms += 2 if self.use_abs else 1  # low (+|low|)
+        terms += 2 if self.use_abs else 1  # high (+|high|)
+        gate_in_ch = terms * self.ch
+
+        self.k_fore = nn.Conv2d(gate_in_ch, self.ch, 1, bias=True)
         nn.init.zeros_(self.k_fore.weight)
         nn.init.constant_(self.k_fore.bias, init_bias)
 
     def forward(self, f_cond: torch.Tensor, f_fore: torch.Tensor) -> torch.Tensor:
         if f_cond.shape != f_fore.shape:
-            raise ValueError("SAFuse requires f_cond/f_fore same shape (B,C,H,W)")
-        f_blur = self.gauss(f_cond)
-        f_hp = f_cond - f_blur
-        f_anc = torch.maximum(f_hp, f_cond)
-        g = torch.sigmoid(self.k_fore(f_anc.abs()))
+            raise ValueError("DualBandSAFuse requires f_cond/f_fore same shape (B,C,H,W)")
+
+        low = self.gauss_low(f_cond)
+        high = f_cond - self.gauss_high(f_cond)
+
+        feats = [low]
+        if self.use_abs:
+            feats.append(low.abs())
+
+        feats.append(high)
+        if self.use_abs:
+            feats.append(high.abs())
+
+        anc = torch.cat(feats, dim=1)
+        g = torch.sigmoid(self.k_fore(anc))  # (B,1,H,W)
         return f_fore + f_fore * g
 
 
 # =========================================================
-# ✅ Dense frequency-domain HOG on feature maps
+# Dense frequency-domain HOG
 # =========================================================
 def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
     return (x + math.pi) % (2.0 * math.pi) - math.pi
 
 
 class FreqDenseHOG(nn.Module):
-    """
-    输入 x: (B,C,H,W)
-    输出 hog_map: (B, C*K, H, W)
-    """
     def __init__(
         self,
         hog_bins: int = 8,
@@ -346,7 +353,7 @@ class FreqDenseHOG(nn.Module):
         self.mag_weight = bool(mag_weight)
 
         k = torch.arange(self.hog_bins).float()
-        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)  # (K,)
+        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)
         self.register_buffer("theta", theta, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -360,7 +367,6 @@ class FreqDenseHOG(nn.Module):
 
         logits = torch.cos(delta) / max(self.hog_tau, 1e-6)
         p = F.softmax(logits, dim=-1)
-
         if self.mag_weight:
             p = p * mag.unsqueeze(-1)
 
@@ -405,13 +411,9 @@ class FreqDirectHeadFiLM(nn.Module):
 
 
 # =========================================================
-# ✅ Token FiLM block (R=2 time-conditioned gate builder)
+# Token FiLM block
 # =========================================================
 class TokenFiLMBlock(nn.Module):
-    """
-    x: (B, N, D)
-    t_emb: (B, time_ch)
-    """
     def __init__(self, dim: int, time_ch: int, mlp_hidden_mult: int = 2):
         super().__init__()
         self.dim = int(dim)
@@ -448,13 +450,13 @@ class TokenFiLMBlock(nn.Module):
 
 
 # =========================================================
-# ✅ 2D Sin-Cos positional encoding（用于 token attention）
+# 2D Sin-Cos positional encoding
 # =========================================================
 def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if dim <= 0:
         return torch.zeros((length, 0), device=device, dtype=dtype)
 
-    pos = torch.arange(length, device=device, dtype=dtype)  # (L,)
+    pos = torch.arange(length, device=device, dtype=dtype)
     half = dim // 2
 
     if half > 0:
@@ -462,7 +464,7 @@ def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) 
             -math.log(10000.0) * torch.arange(0, half, device=device, dtype=dtype) / max(half - 1, 1)
         )
         args = pos[:, None] * freq[None, :]
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (L, 2*half)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     else:
         emb = torch.zeros((length, 0), device=device, dtype=dtype)
 
@@ -477,18 +479,17 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
     dim_y = dim // 2
     dim_x = dim - dim_y
 
-    emb_y = _sincos_1d(h, dim_y, device, dtype)  # (h, dim_y)
-    emb_x = _sincos_1d(w, dim_x, device, dtype)  # (w, dim_x)
+    emb_y = _sincos_1d(h, dim_y, device, dtype)
+    emb_x = _sincos_1d(w, dim_x, device, dtype)
 
     yy = emb_y[:, None, :].expand(h, w, dim_y)
     xx = emb_x[None, :, :].expand(h, w, dim_x)
-    pos = torch.cat([yy, xx], dim=-1).reshape(1, h * w, dim)  # (1, N, dim)
+    pos = torch.cat([yy, xx], dim=-1).reshape(1, h * w, dim)
     return pos
 
 
 # =========================================================
-# ✅ FA module（fore-only：fore ↔ cond）
-# - 保留：RI tokens + pos enc + cross-attn + HOG gate + direct head
+# FA module（fore-only：fore ↔ cond）
 # =========================================================
 class FAModule(nn.Module):
     def __init__(
@@ -564,7 +565,7 @@ class FAModule(nn.Module):
         key = (hp, wp, self.token_dim, device, dtype)
         pos = self._pos_cache.get(key)
         if pos is None or pos.device != device or pos.dtype != dtype:
-            pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)  # (1,N,D)
+            pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)
             self._pos_cache[key] = pos
         return pos
 
@@ -576,43 +577,35 @@ class FAModule(nn.Module):
         hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> torch.Tensor:
-        # FFT
         Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
         Fri = self._to_ri(Fz)
         Cri = self._to_ri(Cz)
 
-        # direct head (fore updated by fore+cond)
         f_in = torch.cat([Fri, Cri], dim=1)
         Fri = Fri + self.direct_head_f(f_in, t_emb)
 
-        # tokens
         F_tok, hw_p = self.patch_f(Fri)
         C_tok, _ = self.patch_c(Cri)
 
-        # ✅ pos enc
         hp, wp = hw_p
         pos = self._get_pos(hp, wp, device=F_tok.device, dtype=F_tok.dtype)
         F_tok = F_tok + pos
         C_tok = C_tok + pos
 
-        # HOG tokens (for gating only)
         Hf_tok, _ = self.patch_hf(hog_fore)
         Hc_tok, _ = self.patch_hc(hog_cond)
 
-        # cross-attn: Q=F, KV=C
         F_tok2 = F_tok + self.attn_f(F_tok, C_tok)
         F_tok2 = F_tok2 + self.ffn_f(F_tok2)
 
-        # gate from HOG + time
         g_f = torch.cat([Hc_tok, Hf_tok], dim=-1)
         for blk in self.gate_f_blocks:
             g_f = blk(g_f, t_emb)
         gate_f = torch.tanh(self.gate_f_out(g_f))
         F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_f)
 
-        # unpatch -> iFFT
         Fri2 = self.unpatch_f(F_tok3, hw_p)
         F2c = self._to_complex(Fri2)
         F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
@@ -641,7 +634,6 @@ class EncoderStageFiLM(nn.Module):
 
 
 class DecoderStageSingle(nn.Module):
-    """单分支 decoder：输入/skip 都是 chs"""
     def __init__(
         self,
         in_ch: int,
@@ -706,8 +698,12 @@ class MainNet(nn.Module):
         fa_noise_strength: float = 1.0,
         fa_gate_scale: float = 1.0,
         fa_gate_R: int = 2,
-        usa_gauss_ks: int = 7,
-        usa_gauss_sigma_init: float = 1.5,
+        # ✅ USA（双核 low/high）参数：只保留用到的
+        usa_low_ks: int = 11,
+        usa_low_sigma: float = 2.5,
+        usa_high_ks: int = 3,
+        usa_high_sigma: float = 0.8,
+        usa_use_abs: bool = True,
         usa_init_bias: float = -10.0,
     ):
         super().__init__()
@@ -751,14 +747,12 @@ class MainNet(nn.Module):
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
-        # fore-only stem: 输入就是 xt_in_ch
         self.fore_stem = nn.Conv2d(self.xt_in_ch, self.base_ch, 3, padding=1)
         self.cond_stem = nn.Conv2d(self.img_in_ch, self.base_ch, 3, padding=1)
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
-        # encoders
         self.fore_enc = nn.ModuleList()
         self.cond_enc = nn.ModuleList()
         for i in range(n_levels):
@@ -768,7 +762,6 @@ class MainNet(nn.Module):
             self.fore_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
             self.cond_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
 
-        # main decoder (single-branch)
         self.dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
@@ -787,7 +780,6 @@ class MainNet(nn.Module):
                 )
             )
 
-        # cond decoder (single-branch)
         self.cond_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
@@ -806,14 +798,11 @@ class MainNet(nn.Module):
                 )
             )
 
-        # output: base_ch -> xt_in_ch
         self.out_v = nn.Conv2d(self.base_ch, self.xt_in_ch, 3, padding=1)
 
-        # freq-attn levels
         K_levels = min(self.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K_levels, n_levels))
 
-        # hog
         self.freq_hog = FreqDenseHOG(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
@@ -847,30 +836,29 @@ class MainNet(nn.Module):
                 )
             return mods
 
-        # per-level couplers
         self.couple_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
             self.couple_modules[str(i)] = make_fa_list(self.chs[i])
 
         self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
 
-        # control
         self.ctrl_proc_levels = nn.ModuleList(
             [
                 ControlResProc(self.chs[i], time_ch=self.time_dim, num_blocks=self.control_resblocks_per_level, dropout=self.dropout)
                 for i in range(n_levels)
             ]
         )
-
-        # control injection to decoder: chs -> chs
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
 
-        # SAFuse at level0
-        self.usa_x = SAFuse(
+        # ✅ USA：双核 low/high gate
+        self.usa_x = DualBandSAFuse(
             ch=self.chs[0],
-            gauss_ks=usa_gauss_ks,
-            gauss_sigma_init=usa_gauss_sigma_init,
+            low_ks=usa_low_ks,
+            low_sigma=usa_low_sigma,
+            high_ks=usa_high_ks,
+            high_sigma=usa_high_sigma,
             init_bias=usa_init_bias,
+            use_abs=usa_use_abs,
         )
 
     def forward(self, x_t: torch.Tensor, image: torch.Tensor, t: Union[torch.Tensor, float]) -> torch.Tensor:
@@ -883,7 +871,6 @@ class MainNet(nn.Module):
 
         t_emb = self.time_mlp(t)
 
-        # fore-only input
         fore0 = self.fore_stem(x_t)
         cond0 = self.cond_stem(image)
 
@@ -914,7 +901,7 @@ class MainNet(nn.Module):
         for level, enc_f in enumerate(self.fore_enc):
             f_skip = enc_f(fore, t_emb)
 
-            # SAFuse at level0
+            # ✅ USA at level0：双核 low/high gate
             if level == 0:
                 f_skip = self.usa_x(f_cond=cond_enc_l0, f_fore=f_skip)
 
@@ -962,7 +949,7 @@ class MainNet(nn.Module):
                     t_emb=t_emb
                 )
 
-        # main decoder (single-branch) + control injection
+        # main decoder + control injection
         h = fore
         for dec_idx, (dec, f_skip) in enumerate(zip(self.dec, reversed(fore_skips))):
             h = dec(h, f_skip, t_emb)
@@ -998,14 +985,18 @@ def build_model(
     hog_eps: float = 1e-8,
     control_resblocks_per_level: int = 1,
     control_inject_to_decoder: bool = True,
-    fa_patch: int = 2,
+    fa_patch: int = 1,
     fa_attn_dropout: float = 0.0,
     fa_token_dim: Optional[int] = None,
     fa_noise_strength: float = 1.0,
     fa_gate_scale: float = 1.0,
     fa_gate_R: int = 2,
-    usa_gauss_ks: int = 7,
-    usa_gauss_sigma_init: float = 1.5,
+    # ✅ USA 双核参数
+    usa_low_ks: int = 11,
+    usa_low_sigma: float = 2.5,
+    usa_high_ks: int = 3,
+    usa_high_sigma: float = 0.8,
+    usa_use_abs: bool = True,
     usa_init_bias: float = -10.0,
 ) -> MainNet:
     return MainNet(
@@ -1034,8 +1025,11 @@ def build_model(
         fa_noise_strength=fa_noise_strength,
         fa_gate_scale=fa_gate_scale,
         fa_gate_R=fa_gate_R,
-        usa_gauss_ks=usa_gauss_ks,
-        usa_gauss_sigma_init=usa_gauss_sigma_init,
+        usa_low_ks=usa_low_ks,
+        usa_low_sigma=usa_low_sigma,
+        usa_high_ks=usa_high_ks,
+        usa_high_sigma=usa_high_sigma,
+        usa_use_abs=usa_use_abs,
         usa_init_bias=usa_init_bias,
     )
 
@@ -1070,8 +1064,12 @@ if __name__ == "__main__":
         fa_noise_strength=1.0,
         fa_gate_scale=1.0,
         fa_gate_R=2,
-        usa_gauss_ks=7,
-        usa_gauss_sigma_init=1.5,
+        # ✅ USA 双核：大核低通 + 小核高通
+        usa_low_ks=11,
+        usa_low_sigma=2.5,
+        usa_high_ks=3,
+        usa_high_sigma=0.8,
+        usa_use_abs=True,
         usa_init_bias=-10.0,
     )
 
