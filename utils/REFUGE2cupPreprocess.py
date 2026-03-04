@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+REFUGE2 cup-only crop + normalize + onehot(no background) + SDF(no background)
+
+Your mask coding:
+- 0   = cup
+- 128 = disc
+- 255 = background
+
+Outputs per sample folder:
+- img.npy   (H,W) float32 in [-1,1]
+- onehot.npy (1,H,W) uint8   (cup only; NO background channel)
+- sdf.npy    (1,H,W) float32 (clipped; optionally normalized to [-1,1] by /clip)
+- mask_vis.png (optional) cup visualization (255=cup, 0=non-cup)
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -146,14 +162,18 @@ def random_crop_containing_bbox(
 
 
 # ============================================================
-# Mask -> onehot (YOUR coding: 0=cup, 128=disc, 255=bg)
-# cup-only => [bg, cup]
+# Mask -> onehot (NO background)
+# YOUR coding: 0=cup, 128=disc, 255=bg
+# cup-only => [cup]
 # ============================================================
-def mask_to_onehot_cup(mask2d: np.ndarray) -> np.ndarray:
+def mask_to_onehot_cup_no_bg(mask2d: np.ndarray) -> np.ndarray:
+    """
+    return: (1,H,W) uint8
+      channel 0 -> cup (label==0)
+    """
     m = mask2d.astype(np.uint8, copy=False)
     cup = (m == 0).astype(np.uint8)
-    bg = (cup == 0).astype(np.uint8)
-    return np.stack([bg, cup], axis=0)  # (2,H,W)
+    return cup[None, ...]  # (1,H,W)
 
 
 # ============================================================
@@ -165,6 +185,16 @@ def onehot_to_sdf_per_channel(
     normalize: bool = True,
     eps: float = 1e-8,
 ) -> np.ndarray:
+    """
+    onehot: (C,H,W) uint8/bool
+    sdf: (C,H,W) float32
+      inside mask  -> negative distance
+      outside mask -> positive distance
+      boundary     -> 0
+
+    If normalize=True:
+      sdf is clipped to [-clip, clip], then divided by clip -> [-1,1].
+    """
     if onehot.ndim != 3:
         raise ValueError(f"Expected (C,H,W), got {onehot.shape}")
     if normalize and clip <= 0:
@@ -382,7 +412,7 @@ def process_one_sample(
                 print(f"[Skip] no cup after resize in {mask_path.name}")
             return False
 
-    # 随机裁 256x256，必须包含 cup bbox（可选：disc覆盖率约束）
+    # 随机裁 size x size，必须包含 cup bbox（可选：disc覆盖率约束）
     img2d, msk2d, (top, left) = random_crop_containing_bbox(
         img=img,
         msk=msk,
@@ -401,9 +431,9 @@ def process_one_sample(
     # normalize image [-1,1]
     img_norm = minmax01_single(img2d, clip_percentiles=(p_lo, p_hi))
 
-    # cup-only onehot + sdf
-    onehot = mask_to_onehot_cup(msk2d).astype(np.uint8)  # (2,H,W)
-    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize).astype(np.float32)
+    # ✅ cup-only onehot (NO background) + sdf (NO background)
+    onehot = mask_to_onehot_cup_no_bg(msk2d).astype(np.uint8)  # (1,H,W)
+    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize).astype(np.float32)  # (1,H,W)
 
     _ensure_dirs(out_dir)
     np.save(out_dir / "img.npy", img_norm.astype(np.float32))
