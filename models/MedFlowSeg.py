@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-✅ 在你给的代码基础上：删除整个 back 分支（完全移除 back 路径）
-并保持：
-- 输入 x_t 仍是 (B, xt_in_ch, H, W)
-- 输出仍是 (B, xt_in_ch, H, W)（和 xt_in_ch 保持一致）
-- cond 分支、Control 注入、HOG、FA、positional encoding 都保留
-- TriSAFuse 改为 SAFuse（只对 fore 做注入）
-
-主要改动（概览）：
-1) 删除 back_stem / back_enc / back_skips / back 相关所有逻辑
-2) 主干只剩 fore 分支：stem -> fore_enc -> (可选 USA 注入) -> (可选 FA coupling) -> fore decoder -> out_v
-3) Decoder 从 “Direct(2*chs)” 改成 “Single(chs)”
-4) out_v 从 (2*base_ch -> xt_in_ch) 改为 (base_ch -> xt_in_ch)
-5) Control 注入通道同步改为 (chs -> chs)
-6) FAModule 改为 fore-only 版本（fore ↔ cond），保留 token attention 的 2D sin-cos pos enc
+✅ 在你给的代码基础上：
+1) 删除了 back 分支
+2) 注入了最新定制的独立双高斯 SAFuse:
+   - anc = f_cond * Kconv3x3
+   - low = Kgauss_low(anc), high = anc - Kgauss_high(anc)  (独立高斯核，默认 3 和 5)
+   - high/low 独立 3*3 卷积后 concat
+   - 1*1 卷积生成 gate
+3) 保留了 HOG, FA, positional encoding 等所有核心结构
 """
 
 from __future__ import annotations
@@ -288,33 +282,68 @@ class LearnableGaussianBlur2d(nn.Module):
 
 
 # =========================================================
-# SAFuse（替代 TriSAFuse，只对 fore 做注入）
+# ✅ 核心定制：SAFuse (独立双高斯核版)
 # =========================================================
 class SAFuse(nn.Module):
     """
-    ✅ 只保留 fore gate：fore = fore + fore * sigmoid(k(|anc|))
+    定制版 Spatial Gate (独立双高斯核):
+    1. anc = f_cond * Kconv3x3
+    2. low = Kgauss_low(anc), high = anc - Kgauss_high(anc)
+    3. high 和 low 分别通过独立的 3x3 卷积后做拼接
+    4. 1x1 卷积生成 gate
     """
     def __init__(
         self,
         ch: int,
-        gauss_ks: int = 7,
-        gauss_sigma_init: float = 1.5,
+        low_gauss_ks: int = 3,       # Kgauss_low 的核大小默认为 3
+        high_gauss_ks: int = 5,      # Kgauss_high 的核大小默认为 5
+        low_gauss_sigma: float = 1.5,
+        high_gauss_sigma: float = 1.5,
         init_bias: float = -2.0,
     ):
         super().__init__()
         self.ch = int(ch)
-        self.gauss = LearnableGaussianBlur2d(self.ch, gauss_ks, gauss_sigma_init)
-        self.k_fore = nn.Conv2d(self.ch, 1, 1, bias=True)
-        nn.init.zeros_(self.k_fore.weight)
-        nn.init.constant_(self.k_fore.bias, init_bias)
+        
+        # 1. 前置 3x3 卷积处理 cond
+        self.conv_anc = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
+        
+        # 2. 独立的 Learnable Gaussian (Kgauss_low 和 Kgauss_high)
+        self.gauss_low = LearnableGaussianBlur2d(self.ch, kernel_size=low_gauss_ks, sigma_init=low_gauss_sigma)
+        self.gauss_high = LearnableGaussianBlur2d(self.ch, kernel_size=high_gauss_ks, sigma_init=high_gauss_sigma)
+        
+        # 3. 独立 3x3 卷积处理 high 和 low
+        self.conv_high = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
+        self.conv_low = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
+        
+        # 4. 1x1 卷积生成 Gate
+        self.conv_gate = nn.Conv2d(self.ch * 2, 1, kernel_size=1, bias=True)
+        
+        # 零初始化，保证初始 Gate 处于健康范围并不破坏原主干
+        nn.init.zeros_(self.conv_gate.weight)
+        nn.init.constant_(self.conv_gate.bias, init_bias)
 
     def forward(self, f_cond: torch.Tensor, f_fore: torch.Tensor) -> torch.Tensor:
         if f_cond.shape != f_fore.shape:
-            raise ValueError("SAFuse requires f_cond/f_fore same shape (B,C,H,W)")
-        f_blur = self.gauss(f_cond)
-        f_hp = f_cond - f_blur
-        f_anc = torch.maximum(f_hp, f_cond)
-        g = torch.sigmoid(self.k_fore(f_anc.abs()))
+            raise ValueError("SAFuse requires f_cond/f_fore same shape")
+            
+        # 1. 提取 Anchor 特征 (相当于 anc = f_cond * Kconv3x3)
+        anc = self.conv_anc(f_cond)
+        
+        # 2. 独立高斯核频域分离
+        low = self.gauss_low(anc)
+        high = anc - self.gauss_high(anc)
+        
+        # 3. 独立 3x3 卷积特征提取
+        high_feat = self.conv_high(high)
+        low_feat = self.conv_low(low)
+        
+        # 4. 拼接 (B, 2C, H, W)
+        feat_cat = torch.cat([high_feat, low_feat], dim=1)
+        
+        # 5. 生成注意力 Gate
+        g = torch.sigmoid(self.conv_gate(feat_cat))
+        
+        # 6. 残差融合
         return f_fore + f_fore * g
 
 
@@ -413,7 +442,7 @@ class FreqDirectHeadFiLM(nn.Module):
         return out
 
 # =========================================================
-# ✅ Token FiLM block (R=2 time-conditioned gate builder)
+# Token FiLM block (R=2 time-conditioned gate builder)
 # =========================================================
 class TokenFiLMBlock(nn.Module):
     """
@@ -456,7 +485,7 @@ class TokenFiLMBlock(nn.Module):
 
 
 # =========================================================
-# ✅ 2D Sin-Cos positional encoding（用于 token attention）
+# 2D Sin-Cos positional encoding（用于 token attention）
 # =========================================================
 def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if dim <= 0:
@@ -495,8 +524,7 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
 
 
 # =========================================================
-# ✅ FA module（fore-only：fore ↔ cond）
-# - 保留：RI tokens + pos enc + cross-attn + HOG gate + direct head
+# FA module（fore-only：fore ↔ cond）
 # =========================================================
 class FAModule(nn.Module):
     def __init__(
@@ -598,7 +626,7 @@ class FAModule(nn.Module):
         F_tok, hw_p = self.patch_f(Fri)
         C_tok, _ = self.patch_c(Cri)
 
-        # ✅ pos enc
+        # pos enc
         hp, wp = hw_p
         pos = self._get_pos(hp, wp, device=F_tok.device, dtype=F_tok.dtype)
         F_tok = F_tok + pos
@@ -713,9 +741,13 @@ class MainNet(nn.Module):
         fa_noise_strength: float = 1.0,
         fa_gate_scale: float = 1.0,
         fa_gate_R: int = 2,
-        usa_gauss_ks: int = 7,
-        usa_gauss_sigma_init: float = 1.5,
-        usa_init_bias: float = -10.0,
+        
+        # ✅ SAFuse 新接口参数 (独立双高斯核)
+        usa_low_gauss_ks: int = 3,
+        usa_high_gauss_ks: int = 5,
+        usa_low_gauss_sigma: float = 1.5,
+        usa_high_gauss_sigma: float = 1.5,
+        usa_init_bias: float = -2.0,
     ):
         super().__init__()
 
@@ -872,11 +904,13 @@ class MainNet(nn.Module):
         # control injection to decoder: chs -> chs
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
 
-        # SAFuse at level0
+        # ✅ 实例化全新的 SAFuse (独立双高斯核版)
         self.usa_x = SAFuse(
             ch=self.chs[0],
-            gauss_ks=usa_gauss_ks,
-            gauss_sigma_init=usa_gauss_sigma_init,
+            low_gauss_ks=usa_low_gauss_ks,
+            high_gauss_ks=usa_high_gauss_ks,
+            low_gauss_sigma=usa_low_gauss_sigma,
+            high_gauss_sigma=usa_high_gauss_sigma,
             init_bias=usa_init_bias,
         )
 
@@ -921,7 +955,7 @@ class MainNet(nn.Module):
         for level, enc_f in enumerate(self.fore_enc):
             f_skip = enc_f(fore, t_emb)
 
-            # SAFuse at level0
+            # ✅ 在 level0 使用新定制的 SAFuse
             if level == 0:
                 f_skip = self.usa_x(f_cond=cond_enc_l0, f_fore=f_skip)
 
@@ -1011,9 +1045,13 @@ def build_model(
     fa_noise_strength: float = 1.0,
     fa_gate_scale: float = 1.0,
     fa_gate_R: int = 2,
-    usa_gauss_ks: int = 7,
-    usa_gauss_sigma_init: float = 1.5,
-    usa_init_bias: float = -10.0,
+    
+    # ✅ SAFuse 独立双高斯核接口参数
+    usa_low_gauss_ks: int = 3,
+    usa_high_gauss_ks: int = 5,
+    usa_low_gauss_sigma: float = 1.5,
+    usa_high_gauss_sigma: float = 1.5,
+    usa_init_bias: float = -2.0,
 ) -> MainNet:
     return MainNet(
         image_hw=tuple(image_hw),
@@ -1041,8 +1079,12 @@ def build_model(
         fa_noise_strength=fa_noise_strength,
         fa_gate_scale=fa_gate_scale,
         fa_gate_R=fa_gate_R,
-        usa_gauss_ks=usa_gauss_ks,
-        usa_gauss_sigma_init=usa_gauss_sigma_init,
+        
+        # ✅ 传入定制的 SAFuse 参数
+        usa_low_gauss_ks=usa_low_gauss_ks,
+        usa_high_gauss_ks=usa_high_gauss_ks,
+        usa_low_gauss_sigma=usa_low_gauss_sigma,
+        usa_high_gauss_sigma=usa_high_gauss_sigma,
         usa_init_bias=usa_init_bias,
     )
 
@@ -1077,14 +1119,23 @@ if __name__ == "__main__":
         fa_noise_strength=1.0,
         fa_gate_scale=1.0,
         fa_gate_R=2,
-        usa_gauss_ks=7,
-        usa_gauss_sigma_init=1.5,
-        usa_init_bias=-10.0,
+        
+        # ✅ SAFuse 参数测试 (默认 3 和 5)
+        usa_low_gauss_ks=3,
+        usa_high_gauss_ks=5,
+        usa_low_gauss_sigma=1.5,
+        usa_high_gauss_sigma=1.5,
+        usa_init_bias=-2.0,
     )
 
+    # Fake input data
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)
     t = torch.rand(2)
 
+    # Forward pass
     v = net(x_t, img, t)
-    print("v:", v.shape)  # (2, 4, 256, 256)
+    
+    print("✅ Build Successfully!")
+    print(f"Input x_t shape : {x_t.shape}")
+    print(f"Output v shape  : {v.shape}")  # Expected: (2, 4, 256, 256)
