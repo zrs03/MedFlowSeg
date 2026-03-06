@@ -6,7 +6,7 @@
 #     image: bilinear
 #     mask : nearest
 # - Normalize image to [-1,1] using percentile clip
-# - GT labels are {0,1,2,3} -> onehot (4,H,W) -> SDF (4,H,W)
+# - GT labels are {0,1,2,3} -> onehot WITHOUT background (3,H,W, labels 1/2/3 only) -> SDF (3,H,W)
 # - Split on patients (8:1:1) then expand into samples inside each split
 #
 # Output:
@@ -32,7 +32,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import numpy as np
 import nibabel as nib
@@ -78,13 +78,11 @@ def resize_hw(x: np.ndarray, out_hw=(256, 256), is_mask: bool = False) -> np.nda
     out_h, out_w = out_hw
 
     if is_mask:
-        # labels must be integer
         im = Image.fromarray(x2.astype(np.uint8, copy=False), mode="L")
         im = im.resize((out_w, out_h), resample=Image.NEAREST)
         y = np.asarray(im, dtype=np.uint8)
         return y
     else:
-        # float grayscale
         im = Image.fromarray(x2.astype(np.float32, copy=False), mode="F")
         im = im.resize((out_w, out_h), resample=Image.BILINEAR)
         y = np.asarray(im, dtype=np.float32)
@@ -108,19 +106,20 @@ def minmax01_single(x: np.ndarray, eps=1e-8, clip_percentiles=(1.0, 99.0)) -> np
     return (x01 * 2.0 - 1.0).astype(np.float32, copy=False)
 
 
-def to_onehot_4(mask2d: np.ndarray) -> np.ndarray:
+def to_onehot_no_bg(mask2d: np.ndarray, fg_labels=(1, 2, 3)) -> np.ndarray:
     """
     mask2d: (H,W) labels in {0,1,2,3}
-    return: (4,H,W) uint8 onehot
-      ch0 = label0 (bg)
-      ch1 = label1
-      ch2 = label2
-      ch3 = label3
+    return: (3,H,W) uint8 onehot WITHOUT background
+      ch0 = label1
+      ch1 = label2
+      ch2 = label3
     """
     m = mask2d.astype(np.int64, copy=False)
-    m = np.clip(m, 0, 3)
-    onehot = np.eye(4, dtype=np.uint8)[m]      # (H,W,4)
-    onehot = np.transpose(onehot, (2, 0, 1))   # (4,H,W)
+    C = len(fg_labels)
+    H, W = m.shape
+    onehot = np.zeros((C, H, W), dtype=np.uint8)
+    for i, lab in enumerate(fg_labels):
+        onehot[i] = (m == int(lab)).astype(np.uint8)
     return onehot
 
 
@@ -236,10 +235,9 @@ def process_one_sample(
     Output:
       out_root/split/sample_id/
         img.npy
-        onehot.npy
-        sdf.npy
+        onehot.npy   -> (3,H,W), labels 1/2/3 only
+        sdf.npy      -> (3,H,W)
     """
-    # parse sample_id
     m = re.match(r"^(patient\d{4})_(2CH|4CH)_(ED|ES)$", sample_id)
     if not m:
         if verbose:
@@ -259,19 +257,16 @@ def process_one_sample(
             print(f"[Skip] missing pair for {sample_id}")
         return False
 
-    # load nii
     img = nib.load(str(img_path)).get_fdata()
     gt = nib.load(str(gt_path)).get_fdata()
 
     img2d = _to_hw_if_needed(img).astype(np.float32)
     gt2d = _to_hw_if_needed(gt).astype(np.int16)
 
-    # ========================================================
-    # Resize to fixed size (same style as your DDTI code)
-    # ========================================================
+    # resize
     out_hw = (size, size)
-    img2d = resize_hw(img2d, out_hw=out_hw, is_mask=False)  # float bilinear
-    gt2d = resize_hw(gt2d, out_hw=out_hw, is_mask=True)     # uint8 nearest (IMPORTANT!)
+    img2d = resize_hw(img2d, out_hw=out_hw, is_mask=False)
+    gt2d = resize_hw(gt2d, out_hw=out_hw, is_mask=True)
 
     # ensure labels are 0..3
     gt2d = np.clip(gt2d.astype(np.uint8, copy=False), 0, 3)
@@ -279,11 +274,10 @@ def process_one_sample(
     # normalize image [-1,1]
     img_norm = minmax01_single(img2d, clip_percentiles=(p_lo, p_hi))
 
-    # onehot + sdf
-    onehot = to_onehot_4(gt2d)  # (4,H,W)
-    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize)  # (4,H,W)
+    # ✅ no-background onehot + sdf
+    onehot = to_onehot_no_bg(gt2d, fg_labels=(1, 2, 3))  # (3,H,W)
+    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize)  # (3,H,W)
 
-    # save
     out_dir = out_root / split_name / sample_id
     _ensure_dirs(out_dir)
     np.save(out_dir / "img.npy", img_norm.astype(np.float32))
