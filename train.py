@@ -186,9 +186,10 @@ class EMA:
 # ======================================================
 # Lightning Module
 # ======================================================
-class LitMedFlowSeg(pl.LightningModule):
+class MedFlowSeg(pl.LightningModule):
     def __init__(
         self,
+        img_in_ch: int = 1,
         num_classes: int = 3,  # ✅ now means "foreground channels count" (no bg stored)
         lr: float = 1e-4,
         sample_steps: int = 10,
@@ -206,7 +207,7 @@ class LitMedFlowSeg(pl.LightningModule):
 
         # Flow-matching model (expects x_t, image, t)
         # ✅ xt_in_ch must match GT sdf channels (no-bg): C=3
-        self.model = build_model(xt_in_ch=num_classes)
+        self.model = build_model(xt_in_ch=num_classes, img_in_ch=img_in_ch)
 
         # num_classes_fg: 3 (labels 1/2/3)
         self.num_classes_fg = int(num_classes)
@@ -406,7 +407,7 @@ def main():
     parser.add_argument("--val_root", type=str, default="./dataset/ACDC/SDF/val")
 
     # -------- Model --------
-    # ✅ IMPORTANT: this is now foreground channel count (no bg stored). For ACDC labels 1/2/3 -> 3
+    parser.add_argument("--img_in_ch", type=int, default=1)
     parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--sample_steps", type=int, default=50)
 
@@ -469,8 +470,9 @@ def main():
     )
 
     # -------- Model --------
-    model = LitMedFlowSeg(
-        num_classes=args.num_classes,  # ✅ C=3 for no-bg sdf
+    model = MedFlowSeg(
+        img_in_ch=args.img_in_ch,
+        num_classes=args.num_classes, 
         lr=args.lr,
         sample_steps=args.sample_steps,
         vis_every=args.vis_every,

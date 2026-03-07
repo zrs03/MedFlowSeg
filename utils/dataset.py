@@ -71,7 +71,7 @@ class FolderDataset(Dataset):
         d = self.sample_dirs[idx]
 
         # -------- load --------
-        img = np.load(d / self.image_file).astype(np.float32)   # (H,W) or (1,H,W) or (H,W,1)
+        img = np.load(d / self.image_file).astype(np.float32)   # (H,W) or (C,H,W) or (H,W,1)
         tgt = np.load(d / self.target_file).astype(np.float32)  # (C,H,W)
 
         # -------- normalize image shape --------

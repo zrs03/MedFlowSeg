@@ -308,12 +308,13 @@ def ovr_staple_fuse_fg_with_bg(
 # Model wrapper (same network + sampling as train)
 # ======================================================
 class MedFlowSegTester(nn.Module):
-    def __init__(self, num_classes: int = 3, sample_steps: int = 10, freq_attn_depth: int = 1):
+    def __init__(self, num_classes: int = 3, sample_steps: int = 10, freq_attn_depth: int = 1,img_in_ch: int = 1):
         super().__init__()
+        self.img_in_ch = img_in_ch
         self.num_classes = num_classes
         self.sample_steps = sample_steps
         # IMPORTANT: model outputs fg SDF channels only
-        self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth)
+        self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth, img_in_ch=img_in_ch)
 
     @torch.no_grad()
     def sample(self, image: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
@@ -391,6 +392,7 @@ def run_test(
     staple_iters: int,
     bg_thresh: float,
     base_seed: int,
+    img_in_ch: int,
     freq_attn_depth: int,
     sdf_vis_clip: float = 0.1,
     sdf_vis_fg_max: int = 3,
@@ -580,6 +582,7 @@ def main():
 
     parser.add_argument("--num_classes", type=int, default=3, help="number of FOREGROUND classes (SDF channels), bg is implicit")
     parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--img_in_ch", type=int, default=1)
     parser.add_argument("--freq_attn_depth", type=int, default=0)
 
     parser.add_argument("--thresh", type=float, default=0.01)
@@ -632,6 +635,7 @@ def main():
         staple_iters=args.staple_iters,
         bg_thresh=args.bg_thresh,
         base_seed=args.base_seed,
+        img_in_ch=args.img_in_ch,
         freq_attn_depth=args.freq_attn_depth,
         sdf_vis_clip=args.sdf_vis_clip,
         sdf_vis_fg_max=args.sdf_vis_fg_max,
