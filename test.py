@@ -417,6 +417,7 @@ def run_test(
         num_classes=num_classes,
         sample_steps=sample_steps,
         freq_attn_depth=freq_attn_depth,
+        img_in_ch=img_in_ch,
     ).to(device)
 
     load_lightning_ckpt_into_model(model, ckpt_path=ckpt, use_ema=use_ema)
