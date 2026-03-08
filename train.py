@@ -2,15 +2,7 @@
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
 # ✅ Adapted for NO-BACKGROUND channels in sdf/onehot (C=3 for ACDC labels 1/2/3)
-#
-# Changes (minimal but necessary):
-# 1) num_classes default -> 3
-# 2) Decode functions updated for "no background channel" sdf:
-#    - GT: fg_bin = (sdf <= 0) per channel; add explicit background channel for argmax
-#    - Pred: fg_bin = (sdf <= fg_factor*thresh) per channel; add explicit background channel for argmax
-#    - Background is chosen where all fg channels are 0
-#
-# Everything else kept the same (EMA/vis/resume/training logic).
+# ✅ Added sample-wise class weighting based on per-sample class pixel ratio
 # ======================================================
 
 import argparse
@@ -53,7 +45,6 @@ def sdf_to_mask_thresh_argmax_pred_no_bg(
         raise ValueError(f"sdf must be (B,C,H,W), got {tuple(sdf.shape)}")
 
     fg_bin = (sdf <= (fg_factor * thresh)).to(torch.int8)  # (B,C,H,W)
-    # background where no fg class is active
     bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)  # (B,1,H,W)
 
     m = torch.cat([bg_bin, fg_bin], dim=1)  # (B,1+C,H,W)
@@ -125,6 +116,61 @@ def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
     return out
 
 
+def compute_samplewise_class_weights_from_sdf_gt(
+    sdf_gt: torch.Tensor,
+    eps: float = 1e-6,
+    max_class_weight: float = 5.0,
+) -> torch.Tensor:
+    """
+    根据每个样本内各类别像素比例，计算每个样本自己的通道权重。
+
+    sdf_gt: (B,C,H,W), 无背景通道
+    前景定义为 sdf <= 0
+
+    返回:
+        weights: (B,C)
+
+    逻辑:
+        counts_c = 每个样本中每个类的前景像素数
+        ratio_c = counts_c / sum(counts_all_classes)
+        weight_c = 1 / (ratio_c + eps)
+
+        然后对每个样本做归一化:
+            让该样本所有出现类别的平均权重 = 1
+
+        最后截断到 max_class_weight
+    """
+    if sdf_gt.ndim != 4:
+        raise ValueError(f"sdf_gt must be (B,C,H,W), got {tuple(sdf_gt.shape)}")
+
+    fg = (sdf_gt <= 0.0).float()                 # (B,C,H,W)
+    counts = fg.sum(dim=(2, 3))                  # (B,C)
+    present = counts > 0                         # (B,C)
+
+    total_fg = counts.sum(dim=1, keepdim=True)   # (B,1)
+    ratios = counts / (total_fg + eps)           # (B,C)
+
+    weights = torch.zeros_like(ratios)           # (B,C)
+    weights[present] = 1.0 / (ratios[present] + eps)
+
+    present_count = present.sum(dim=1, keepdim=True)  # (B,1)
+    weight_sum = weights.sum(dim=1, keepdim=True)     # (B,1)
+
+    valid = present_count > 0
+    norm = torch.ones_like(weight_sum)
+    norm[valid] = weight_sum[valid] / present_count[valid].float()
+
+    weights = weights / (norm + eps)
+
+    # 如果某个样本没有任何前景，回退成全1
+    no_fg = present_count.squeeze(1) == 0
+    if no_fg.any():
+        weights[no_fg] = 1.0
+
+    weights = torch.clamp(weights, min=0.0, max=max_class_weight)
+    return weights
+
+
 class EMA:
     """
     Exponential Moving Average for model parameters.
@@ -190,7 +236,7 @@ class MedFlowSeg(pl.LightningModule):
     def __init__(
         self,
         img_in_ch: int = 1,
-        num_classes: int = 3,  # ✅ now means "foreground channels count" (no bg stored)
+        num_classes: int = 3,  # foreground channels count, no bg stored
         lr: float = 1e-4,
         sample_steps: int = 10,
         vis_every: int = 5,
@@ -198,20 +244,17 @@ class MedFlowSeg(pl.LightningModule):
         output_root: str = "./Outputs/MedFlowSeg",
         thresh: float = 0.2,
         fg_factor: float = 3.0,
-        # EMA (default ON)
         use_ema: bool = True,
         ema_decay: float = 0.9999,
+        class_weight_eps: float = 1e-6,
+        max_class_weight: float = 5.0,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        # Flow-matching model (expects x_t, image, t)
-        # ✅ xt_in_ch must match GT sdf channels (no-bg): C=3
         self.model = build_model(xt_in_ch=num_classes, img_in_ch=img_in_ch)
 
-        # num_classes_fg: 3 (labels 1/2/3)
         self.num_classes_fg = int(num_classes)
-        # num_classes_with_bg used for visualization/dice/label space after decode
         self.num_classes_with_bg = self.num_classes_fg + 1
 
         self.lr = lr
@@ -227,14 +270,15 @@ class MedFlowSeg(pl.LightningModule):
         self.thresh = float(thresh)
         self.fg_factor = float(fg_factor)
 
+        self.class_weight_eps = float(class_weight_eps)
+        self.max_class_weight = float(max_class_weight)
+
         self._val_vis_cache = []
 
-        # EMA (delay init to on_fit_start so device placement is done)
         self.use_ema = bool(use_ema)
         self.ema_decay = float(ema_decay)
         self.ema: EMA | None = None
 
-        # for resume from ckpt
         self._ema_shadow_from_ckpt = None
         self._ema_decay_from_ckpt = None
 
@@ -292,7 +336,7 @@ class MedFlowSeg(pl.LightningModule):
     # Training
     # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, x1 = batch  # x1 is sdf_gt, (B,C,H,W) where C=num_classes_fg
+        image, x1 = batch  # x1: sdf_gt, (B,C,H,W)
 
         B = image.shape[0]
         device = image.device
@@ -304,11 +348,23 @@ class MedFlowSeg(pl.LightningModule):
         x_t = (1.0 - t_) * x0 + t_ * x1
 
         v_star = x1 - x0
-
         v_pred = self.model(x_t, image, t)
-        loss = nn.functional.mse_loss(v_pred, v_star)
+
+        # 按每个样本内类别像素比例，动态计算通道权重
+        class_w = compute_samplewise_class_weights_from_sdf_gt(
+            x1,
+            eps=self.class_weight_eps,
+            max_class_weight=self.max_class_weight,
+        )  # (B,C)
+
+        per_pixel = (v_pred - v_star) ** 2        # (B,C,H,W)
+        class_w = class_w[:, :, None, None]       # (B,C,1,1)
+
+        loss = (per_pixel * class_w).mean()
 
         self.log("train/loss", loss, prog_bar=True)
+        self.log("train/class_w_mean", class_w.mean(), prog_bar=False)
+        self.log("train/class_w_max", class_w.max(), prog_bar=False)
         return loss
 
     # --------------------------------------------------
@@ -319,7 +375,6 @@ class MedFlowSeg(pl.LightningModule):
 
         sdf_pred = self.sample(image)
 
-        # ✅ decode adapted to NO-BG sdf channels
         pred_mask = sdf_to_mask_thresh_argmax_pred_no_bg(
             sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor
         )
@@ -422,15 +477,19 @@ def main():
     parser.add_argument("--vis_every", type=int, default=10)
     parser.add_argument("--vis_batches", type=int, default=2, help="visualize first N validation batches")
 
-    # threshold for pred decoding (since your sdf is normalized to [-1,1])
+    # threshold for pred decoding
     parser.add_argument("--thresh", type=float, default=1e-3)
     parser.add_argument("--fg_factor", type=float, default=1.0)
 
-    # ✅ EMA: default ON, use --no_ema to disable
+    # sample-wise class weighting
+    parser.add_argument("--class_weight_eps", type=float, default=1e-6)
+    parser.add_argument("--max_class_weight", type=float, default=5.0)
+
+    # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
-    # ✅ Resume
+    # Resume
     parser.add_argument(
         "--resume_ckpt",
         type=str,
@@ -438,7 +497,7 @@ def main():
         help="path to Lightning checkpoint (.ckpt) to resume from (empty = no resume)",
     )
 
-    # -------- System --------
+    # System
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpus", type=int, default=4)
 
@@ -449,10 +508,8 @@ def main():
     ckpt_root = output_root / "checkpoints"
     ckpt_root.mkdir(parents=True, exist_ok=True)
 
-    # -------- Logger --------
     logger = TensorBoardLogger(save_dir=output_root, name="logs")
 
-    # -------- Dataset --------
     train_loader = DataLoader(
         FolderDataset(args.train_root),
         batch_size=args.batch_size,
@@ -469,10 +526,9 @@ def main():
         pin_memory=True,
     )
 
-    # -------- Model --------
     model = MedFlowSeg(
         img_in_ch=args.img_in_ch,
-        num_classes=args.num_classes, 
+        num_classes=args.num_classes,
         lr=args.lr,
         sample_steps=args.sample_steps,
         vis_every=args.vis_every,
@@ -482,9 +538,10 @@ def main():
         fg_factor=args.fg_factor,
         use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
+        class_weight_eps=args.class_weight_eps,
+        max_class_weight=args.max_class_weight,
     )
 
-    # -------- Checkpoint --------
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_root,
         filename="epoch{epoch:03d}-dice{val_mean_dice:.4f}",
@@ -495,18 +552,15 @@ def main():
         auto_insert_metric_name=False,
     )
 
-    # -------- Trainer --------
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
-        # strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
         callbacks=[ckpt_cb],
         logger=logger,
         log_every_n_steps=20,
     )
 
-    # ✅ Resume support
     ckpt_path = args.resume_ckpt.strip() if isinstance(args.resume_ckpt, str) else ""
     if ckpt_path == "":
         ckpt_path = None
