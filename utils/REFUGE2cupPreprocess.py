@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-REFUGE2 cup-only crop + normalize + onehot(no background) + SDF(no background)
+REFUGE2 cup-only crop + RGB normalize + onehot(no background) + SDF(no background)
 
 Your mask coding:
 - 0   = cup
@@ -8,9 +8,9 @@ Your mask coding:
 - 255 = background
 
 Outputs per sample folder:
-- img.npy   (H,W) float32 in [-1,1]
-- onehot.npy (1,H,W) uint8   (cup only; NO background channel)
-- sdf.npy    (1,H,W) float32 (clipped; optionally normalized to [-1,1] by /clip)
+- img.npy      (3,H,W) float32 in [-1,1]   # RGB
+- onehot.npy   (1,H,W) uint8               # cup only; NO background channel
+- sdf.npy      (1,H,W) float32             # clipped; optionally normalized to [-1,1] by /clip
 - mask_vis.png (optional) cup visualization (255=cup, 0=non-cup)
 """
 
@@ -28,31 +28,19 @@ from scipy.ndimage import distance_transform_edt
 
 
 # ============================================================
-# Utils (normalize + bbox + random crop + optional downscale)
+# Utils
 # ============================================================
 def _ensure_dirs(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def minmax01_single(
-    x: np.ndarray, eps=1e-8, clip_percentiles=(1.0, 99.0)
-) -> np.ndarray:
+def normalize_rgb_to_minus1_1(x: np.ndarray) -> np.ndarray:
     """
-    Percentile-clip + min-max normalization to [-1,1].
-    x: (H,W) float
+    x: (H,W,3), assumed uint8-like range [0,255]
+    return: (H,W,3) float32 in [-1,1]
     """
     x = x.astype(np.float32, copy=False)
-    p_lo, p_hi = clip_percentiles
-
-    lo, hi = np.percentile(x, p_lo), np.percentile(x, p_hi)
-    if hi <= lo:
-        lo, hi = float(x.min()), float(x.max())
-        if hi <= lo:
-            return np.zeros_like(x, dtype=np.float32)
-
-    x = np.clip(x, lo, hi)
-    x01 = (x - lo) / (hi - lo + eps)
-    return (x01 * 2.0 - 1.0).astype(np.float32, copy=False)
+    return (x / 255.0 * 2.0 - 1.0).astype(np.float32, copy=False)
 
 
 def bbox_from_mask(bin_mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -69,26 +57,26 @@ def bbox_from_mask(bin_mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 
 def resize_keep_aspect(
-    img2d: np.ndarray,
+    img3d: np.ndarray,
     msk2d: np.ndarray,
     scale: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     等比例缩放 image 和 mask
-    - image: bilinear (float32)
-    - mask : nearest (uint8)
+    - image: bilinear RGB (H,W,3)
+    - mask : nearest (H,W)
     """
     if scale <= 0:
         raise ValueError("scale must be > 0")
 
-    H, W = img2d.shape
+    H, W = msk2d.shape
     new_h = max(1, int(round(H * scale)))
     new_w = max(1, int(round(W * scale)))
 
-    # image
-    im = Image.fromarray(img2d.astype(np.float32), mode="F")
+    # image RGB
+    im = Image.fromarray(img3d.astype(np.uint8), mode="RGB")
     im = im.resize((new_w, new_h), resample=Image.BILINEAR)
-    img_rs = np.asarray(im, dtype=np.float32)
+    img_rs = np.asarray(im, dtype=np.uint8)
 
     # mask
     mm = Image.fromarray(msk2d.astype(np.uint8), mode="L")
@@ -111,9 +99,11 @@ def random_crop_containing_bbox(
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     """
     在原图上随机裁 crop_size x crop_size，且裁剪窗口必须完整包含 bbox_xyxy。
+    img: (H,W,3)
+    msk: (H,W)
     可选：要求裁剪内 disc 覆盖率 >= min_disc_ratio。
     """
-    H, W = img.shape
+    H, W = msk.shape
     s = int(crop_size)
 
     if s > H or s > W:
@@ -125,7 +115,6 @@ def random_crop_containing_bbox(
     if bw > s or bh > s:
         raise ValueError(f"bbox larger than crop_size: bbox=({x0},{y0},{x1},{y1}), crop={s}")
 
-    # 合法 left/top 范围（保证窗口覆盖 bbox）
     left_min = max(0, x1 - (s - 1))
     left_max = min(x0, W - s)
     top_min = max(0, y1 - (s - 1))
@@ -141,7 +130,7 @@ def random_crop_containing_bbox(
         left = int(rng.integers(left_min, left_max + 1))
         top = int(rng.integers(top_min, top_max + 1))
 
-        img_crop = img[top:top + s, left:left + s]
+        img_crop = img[top:top + s, left:left + s, :]
         msk_crop = msk[top:top + s, left:left + s]
 
         if not require_disc:
@@ -224,16 +213,16 @@ def onehot_to_sdf_per_channel(
 # ============================================================
 # IO
 # ============================================================
-def read_image_gray_float(img_path: Path) -> np.ndarray:
+def read_image_rgb_uint8(img_path: Path) -> np.ndarray:
     with Image.open(img_path) as im:
-        im = im.convert("L")
-        return np.asarray(im, dtype=np.float32)
+        im = im.convert("RGB")
+        return np.asarray(im, dtype=np.uint8)  # (H,W,3)
 
 
 def read_mask_uint8(mask_path: Path) -> np.ndarray:
     with Image.open(mask_path) as im:
         im = im.convert("L")
-        return np.asarray(im, dtype=np.uint8)
+        return np.asarray(im, dtype=np.uint8)  # (H,W)
 
 
 def save_mask_vis_png(mask2d: np.ndarray, out_path: Path):
@@ -353,9 +342,7 @@ def process_one_sample(
     img_path: Path,
     mask_path: Path,
     out_dir: Path,
-    size: int,               # crop size (and final output) e.g. 256
-    p_lo: float,
-    p_hi: float,
+    size: int,
     sdf_clip: float,
     sdf_normalize: bool,
     save_png_mask: bool,
@@ -372,10 +359,9 @@ def process_one_sample(
             print(f"[Skip] missing pair: {img_path} / {mask_path}")
         return False
 
-    img = read_image_gray_float(img_path)
-    msk = read_mask_uint8(mask_path)
+    img = read_image_rgb_uint8(img_path)   # (H,W,3)
+    msk = read_mask_uint8(mask_path)       # (H,W)
 
-    # RNG（可复现：对每个 sample_id 固定随机）
     if deterministic:
         sid = (str(img_path) + "|" + sample_id).encode("utf-8")
         sample_seed = (zlib.crc32(sid) + int(seed)) & 0xFFFFFFFF
@@ -405,7 +391,6 @@ def process_one_sample(
 
         img, msk = resize_keep_aspect(img, msk, scale=scale)
 
-        # 重新计算 bbox
         cup_bb = bbox_from_mask(msk == 0)
         if cup_bb is None:
             if verbose:
@@ -413,7 +398,7 @@ def process_one_sample(
             return False
 
     # 随机裁 size x size，必须包含 cup bbox（可选：disc覆盖率约束）
-    img2d, msk2d, (top, left) = random_crop_containing_bbox(
+    img_crop, msk2d, (top, left) = random_crop_containing_bbox(
         img=img,
         msk=msk,
         crop_size=int(size),
@@ -425,15 +410,16 @@ def process_one_sample(
         min_disc_ratio=float(min_disc_ratio),
     )
 
-    # keep only {0,128,255}（保险）
+    # keep only {0,128,255}
     msk2d = np.where(msk2d == 0, 0, np.where(msk2d == 128, 128, 255)).astype(np.uint8)
 
-    # normalize image [-1,1]
-    img_norm = minmax01_single(img2d, clip_percentiles=(p_lo, p_hi))
+    # RGB normalize to [-1,1]
+    img_norm = normalize_rgb_to_minus1_1(img_crop)   # (H,W,3)
+    img_norm = np.transpose(img_norm, (2, 0, 1))     # -> (3,H,W)
 
-    # ✅ cup-only onehot (NO background) + sdf (NO background)
+    # cup-only onehot (NO background) + sdf (NO background)
     onehot = mask_to_onehot_cup_no_bg(msk2d).astype(np.uint8)  # (1,H,W)
-    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize).astype(np.float32)  # (1,H,W)
+    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize).astype(np.float32)
 
     _ensure_dirs(out_dir)
     np.save(out_dir / "img.npy", img_norm.astype(np.float32))
@@ -454,8 +440,6 @@ def run(
     dataset_root: Path,
     out_root: Path,
     size: int,
-    p_lo: float,
-    p_hi: float,
     sdf_clip: float,
     sdf_normalize: bool,
     save_png_mask: bool,
@@ -515,8 +499,6 @@ def run(
                     mask_path=mask_path,
                     out_dir=out_dir,
                     size=size,
-                    p_lo=p_lo,
-                    p_hi=p_hi,
                     sdf_clip=sdf_clip,
                     sdf_normalize=sdf_normalize,
                     save_png_mask=save_png_mask,
@@ -549,8 +531,6 @@ def main():
 
     ap.add_argument("--size", type=int, default=256, help="随机裁剪输出尺寸（默认256）")
 
-    ap.add_argument("--p_lo", type=float, default=1.0)
-    ap.add_argument("--p_hi", type=float, default=99.0)
     ap.add_argument("--clip", type=float, default=10.0)
     ap.add_argument("--sdf_no_norm", action="store_true")
 
@@ -574,8 +554,6 @@ def main():
         dataset_root=Path(args.dataset_root),
         out_root=Path(args.out_root),
         size=int(args.size),
-        p_lo=float(args.p_lo),
-        p_hi=float(args.p_hi),
         sdf_clip=float(args.clip),
         sdf_normalize=(not args.sdf_no_norm),
         save_png_mask=bool(args.save_png_mask),

@@ -1,17 +1,18 @@
 # ISICPreprocess.py
 #
 # Preprocess ISIC2018 dataset for segmentation with SDF:
-# 1) Load RGB image and binary GT (lesion segmentation)
-# 2) Resize to fixed size
-# 3) Normalize image by: x / 255.0 * 2.0 - 1.0
-# 4) Convert GT to one-hot (no background by default) and then to per-channel SDF
-# 5) Support both pre-defined split (via separate dirs) and random split
-# 6) Save outputs to:
+# 1) Load RGB image and binary GT (lesion segmentation) with OpenCV
+# 2) Merge all provided train/val/test files into one pool
+# 3) Randomly split all files into train/val/test with ratio 8:1:1
+# 4) Resize to fixed size with OpenCV
+# 5) Normalize image by: x / 255.0 * 2.0 - 1.0
+# 6) Convert GT to one-hot (no background by default) and then to per-channel SDF
+# 7) Save outputs to:
 #    out_root/
 #      split.json
 #      train/ISIC_xxxx/
 #         img.npy        (3,H,W) float32 in [-1,1]
-#         onehot.npy     (1,H,W) uint8   # no_bg=True
+#         onehot.npy     (1,H,W) uint8
 #         sdf.npy        (1,H,W) float32 in [-1,1]
 #      val/...
 #      test/...
@@ -21,12 +22,11 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import json
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 
+import cv2
 import numpy as np
-import imageio.v2 as imageio
 from scipy.ndimage import distance_transform_edt
-from skimage.transform import resize
 
 
 # -------------------------
@@ -37,23 +37,30 @@ def _ensure_dirs(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def resize_image(x: np.ndarray, out_hw=(256, 256), preserve_range=True):
-    """Resize (H,W) or (H,W,C) array to target out_hw."""
-    orig_ndim = x.ndim
-    if orig_ndim == 2:
-        x = x[..., None]  # (H,W,1)
+def resize_image(
+    x: np.ndarray,
+    out_hw=(256, 256),
+    is_mask: bool = False,
+):
+    """
+    Resize (H,W) or (H,W,C) array to target out_hw using OpenCV.
 
-    x_resized = resize(
-        x,
-        (out_hw[0], out_hw[1], x.shape[2] if x.ndim == 3 else 1),
-        preserve_range=preserve_range,
-        mode="reflect",
-        anti_aliasing=True,
-    )
+    Args:
+        x: input image or mask
+        out_hw: (H, W)
+        is_mask:
+            - False: use bilinear interpolation
+            - True:  use nearest neighbor
+    """
+    out_h, out_w = out_hw
+    interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
 
-    if orig_ndim == 2:
-        x_resized = x_resized[..., 0]
-    return x_resized
+    if x.ndim == 2:
+        return cv2.resize(x, (out_w, out_h), interpolation=interp)
+    elif x.ndim == 3:
+        return cv2.resize(x, (out_w, out_h), interpolation=interp)
+    else:
+        raise ValueError(f"Unsupported ndim={x.ndim}, expected 2 or 3.")
 
 
 def normalize_to_minus1_1_from_255(x: np.ndarray) -> np.ndarray:
@@ -80,11 +87,9 @@ def to_onehot_isic(gt2d: np.ndarray, num_classes: int = 2, no_bg: bool = True) -
     gt2d = np.clip(gt2d, 0, num_classes - 1)
 
     if no_bg:
-        # Only foreground channel: lesion
         onehot = np.zeros((1, gt2d.shape[0], gt2d.shape[1]), dtype=np.uint8)
         onehot[0] = (gt2d == 1).astype(np.uint8)
     else:
-        # Include background + lesion
         onehot = np.eye(num_classes, dtype=np.uint8)[gt2d]   # (H,W,C)
         onehot = np.transpose(onehot, (2, 0, 1))             # (C,H,W)
 
@@ -155,6 +160,52 @@ def list_images_from_dir(input_dir: Path, gt_dir: Path) -> List[str]:
     return images
 
 
+def build_image_source_map(
+    train_input_dir: Path,
+    train_gt_dir: Path,
+    val_input_dir: Optional[Path] = None,
+    val_gt_dir: Optional[Path] = None,
+    test_input_dir: Optional[Path] = None,
+    test_gt_dir: Optional[Path] = None,
+) -> Dict[str, Dict[str, Path]]:
+    """
+    Merge all provided directories into one image pool.
+
+    Returns:
+        source_map[image_name] = {
+            "input_dir": ...,
+            "gt_dir": ...,
+            "source_split": "train"/"val"/"test"
+        }
+
+    If duplicated names appear across directories, later ones are skipped.
+    """
+    source_map: Dict[str, Dict[str, Path]] = {}
+
+    dir_specs = [
+        ("train", train_input_dir, train_gt_dir),
+        ("val", val_input_dir, val_gt_dir),
+        ("test", test_input_dir, test_gt_dir),
+    ]
+
+    for split_name, input_dir, gt_dir in dir_specs:
+        if input_dir is None or gt_dir is None:
+            continue
+
+        names = list_images_from_dir(input_dir, gt_dir)
+        for name in names:
+            if name in source_map:
+                print(f"[WARN] Duplicate image name {name} found in multiple dirs, keeping first occurrence.")
+                continue
+            source_map[name] = {
+                "input_dir": Path(input_dir),
+                "gt_dir": Path(gt_dir),
+                "source_split": split_name,
+            }
+
+    return source_map
+
+
 def make_random_split(images: List[str], seed=42, ratios=(0.8, 0.1, 0.1)):
     assert abs(sum(ratios) - 1.0) < 1e-6
     rng = np.random.default_rng(seed)
@@ -174,9 +225,22 @@ def make_random_split(images: List[str], seed=42, ratios=(0.8, 0.1, 0.1)):
     return train, val, test
 
 
-def save_split_json(out_path: Path, seed: int, train, val, test):
+def save_split_json(out_path: Path, seed: int, train, val, test, source_map: Dict[str, Dict[str, Path]]):
+    def _decorate(names: List[str]):
+        out = []
+        for n in names:
+            src = source_map.get(n, {})
+            out.append({
+                "name": n,
+                "source_split": src.get("source_split", "unknown"),
+                "input_dir": str(src.get("input_dir", "")),
+                "gt_dir": str(src.get("gt_dir", "")),
+            })
+        return out
+
     obj = {
         "seed": seed,
+        "ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
         "counts": {
             "total": len(train) + len(val) + len(test),
             "train": len(train),
@@ -186,6 +250,9 @@ def save_split_json(out_path: Path, seed: int, train, val, test):
         "train": train,
         "val": val,
         "test": test,
+        "train_detailed": _decorate(train),
+        "val_detailed": _decorate(val),
+        "test_detailed": _decorate(test),
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -223,23 +290,37 @@ def process_one_image(
         print(f"[WARN] Missing file for {image_name}, skip.")
         return 0
 
-    # Load image (RGB)
-    img = imageio.imread(img_path)
+    # Load image with OpenCV (BGR -> RGB)
+    img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"[WARN] Failed to read image: {img_path}")
+        return 0
+
     if img.ndim == 2:
-        img = np.stack([img] * 3, axis=-1)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3 and img.shape[2] == 4:
-        img = img[..., :3]
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    elif img.ndim == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    else:
+        print(f"[WARN] Unsupported image shape {img.shape} for {img_path}, skip.")
+        return 0
+
     img = img.astype(np.float32)
 
-    # Load GT (binary mask)
-    gt = imageio.imread(gt_path)
+    # Load GT with OpenCV
+    gt = cv2.imread(str(gt_path), cv2.IMREAD_UNCHANGED)
+    if gt is None:
+        print(f"[WARN] Failed to read GT: {gt_path}")
+        return 0
+
     if gt.ndim == 3:
         gt = gt[..., 0]
     gt = (gt > 0).astype(np.uint8)
 
     # Resize
-    img = resize_image(img, out_hw=out_hw)
-    gt = resize_image(gt, out_hw=out_hw)
+    img = resize_image(img, out_hw=out_hw, is_mask=False)
+    gt = resize_image(gt, out_hw=out_hw, is_mask=True)
     gt = (gt > 0.5).astype(np.uint8)
 
     # Normalize image to [-1,1]
@@ -278,51 +359,66 @@ def run(
     out_root = Path(out_root)
     out_hw = (size, size)
 
-    # if val/test dirs are given, use predefined split
-    use_predefined = val_input_dir is not None or test_input_dir is not None
+    # Merge all provided dirs into one pool, then split 8:1:1
+    source_map = build_image_source_map(
+        train_input_dir=train_input_dir,
+        train_gt_dir=train_gt_dir,
+        val_input_dir=val_input_dir,
+        val_gt_dir=val_gt_dir,
+        test_input_dir=test_input_dir,
+        test_gt_dir=test_gt_dir,
+    )
 
-    if use_predefined:
-        if val_input_dir is None or val_gt_dir is None:
-            raise ValueError("When using predefined split, both val_input_dir and val_gt_dir must be provided.")
-        if test_input_dir is None or test_gt_dir is None:
-            raise ValueError("When using predefined split, both test_input_dir and test_gt_dir must be provided.")
+    all_images = sorted(source_map.keys())
 
-        train_images = list_images_from_dir(train_input_dir, train_gt_dir)
-        val_images = list_images_from_dir(val_input_dir, val_gt_dir)
-        test_images = list_images_from_dir(test_input_dir, test_gt_dir)
+    if len(all_images) == 0:
+        print("No valid images found. Exiting.")
+        return
 
-        train, val, test = train_images, val_images, test_images
-        seed_used = seed
-        save_split_json(out_root / "split.json", seed_used, train, val, test)
+    if split_json is not None and Path(split_json).exists():
+        with open(split_json, "r", encoding="utf-8") as f:
+            split = json.load(f)
+        train = split["train"]
+        val = split["val"]
+        test = split["test"]
+        seed_used = split.get("seed", seed)
 
-        total_samples = len(train) + len(val) + len(test)
-        print(f"Pre-defined split: {len(train)} train, {len(val)} val, {len(test)} test")
+        valid_names = set(all_images)
+        train = [x for x in train if x in valid_names]
+        val = [x for x in val if x in valid_names]
+        test = [x for x in test if x in valid_names]
+
+        used = set(train) | set(val) | set(test)
+        missing = [x for x in all_images if x not in used]
+        if len(missing) > 0:
+            print(f"[WARN] {len(missing)} images were not present in split_json; they will be ignored.")
     else:
-        if split_json is not None and Path(split_json).exists():
-            with open(split_json, "r", encoding="utf-8") as f:
-                split = json.load(f)
-            train, val, test = split["train"], split["val"], split["test"]
-            seed_used = split.get("seed", seed)
-        else:
-            all_images = list_images_from_dir(train_input_dir, train_gt_dir)
-            if not all_images:
-                print("No valid images found. Exiting.")
-                return
-            train, val, test = make_random_split(all_images, seed=seed, ratios=(0.8, 0.1, 0.1))
-            seed_used = seed
-            save_split_json(out_root / "split.json", seed_used, train, val, test)
+        train, val, test = make_random_split(all_images, seed=seed, ratios=(0.8, 0.1, 0.1))
+        seed_used = seed
+        save_split_json(out_root / "split.json", seed_used, train, val, test, source_map)
 
-        total_samples = len(train) + len(val) + len(test)
+    total_samples = len(train) + len(val) + len(test)
+
+    if not (split_json is not None and Path(split_json).exists()):
+        print(f"Merged all provided files, then random split 8:1:1 -> {len(train)} train, {len(val)} val, {len(test)} test")
+    else:
+        print(f"Loaded split_json -> {len(train)} train, {len(val)} val, {len(test)} test")
 
     total_saved = 0
     total_skipped = 0
 
-    def process_split(split_name, images, input_dir, gt_dir):
+    def process_split(split_name, images):
         nonlocal total_saved, total_skipped
         for name in images:
+            src = source_map.get(name, None)
+            if src is None:
+                print(f"[WARN] Missing source mapping for {name}, skip.")
+                total_skipped += 1
+                continue
+
             n = process_one_image(
-                input_dir=input_dir,
-                gt_dir=gt_dir,
+                input_dir=Path(src["input_dir"]),
+                gt_dir=Path(src["gt_dir"]),
                 image_name=name,
                 out_root=out_root,
                 split_name=split_name,
@@ -334,18 +430,17 @@ def run(
             else:
                 total_skipped += 1
 
-    if use_predefined:
-        process_split("train", train, train_input_dir, train_gt_dir)
-        process_split("val", val, val_input_dir, val_gt_dir)
-        process_split("test", test, test_input_dir, test_gt_dir)
-    else:
-        process_split("train", train, train_input_dir, train_gt_dir)
-        process_split("val", val, train_input_dir, train_gt_dir)
-        process_split("test", test, train_input_dir, train_gt_dir)
+    process_split("train", train)
+    process_split("val", val)
+    process_split("test", test)
+
+    if split_json is not None and Path(split_json).exists():
+        save_split_json(out_root / "split.json", seed_used, train, val, test, source_map)
 
     print(f"Done. Saved {total_saved} images from {total_samples} total in split. Skipped {total_skipped} samples.")
     print(f"Split saved at: {out_root / 'split.json'}")
     print("Image normalization: x / 255.0 * 2.0 - 1.0")
+    print("Resize backend: OpenCV")
     print("Saved onehot/sdf WITHOUT background channel.")
 
 
@@ -377,7 +472,7 @@ def main():
     ap.add_argument("--clip", type=float, default=10.0, help="SDF clip distance")
     ap.add_argument("--seed", type=int, default=42, help="Random seed for split")
     ap.add_argument("--split_json", type=str, default=None,
-                    help="Optional existing split.json to reuse (only in random split mode)")
+                    help="Optional existing split.json to reuse")
 
     args = ap.parse_args()
 
