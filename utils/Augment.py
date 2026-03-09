@@ -3,41 +3,24 @@
 ACDCAugment.py
 Offline augmentation for extracted 2D samples.
 
-CHANGED (your request + no-bg compatibility):
-- Input pairs are found by searching for:
-    img.npy
-    onehot.npy
-  under --in_root recursively.
+UPDATED:
+- If img.npy is (H,W), auto convert to (1,H,W)
+- Also supports img.npy as (C,H,W)
+- onehot.npy is (C,H,W)
 - Geometry augment: hflip/vflip + translate + scale + rotation
-- After augmentation, regenerate sdf.npy FROM onehot.npy (distance transform per channel)
-- Folder structure stays the same: numeric folders under --out_root
+- After augmentation, regenerate sdf.npy FROM onehot.npy
+- Supports no-background onehot safely
 
-IMPORTANT:
-- This version supports "no background channel" onehot:
-    onehot.npy is (C,H,W) where C=3 (labels 1/2/3 only).
-  Background is implicit = all-zero across channels.
-- We MUST NOT force every pixel to belong to some class.
-  Therefore we re-onehot with a background check.
-
-Expected input under --in_root (any nested structure is OK):
-  .../img.npy      : (H,W) float32
-  .../onehot.npy   : (C,H,W) uint8/bool/float (no-bg onehot OK)
+Expected input under --in_root:
+  .../img.npy      : (H,W) or (C,H,W) float32
+  .../onehot.npy   : (C,H,W)
 
 Output under --out_root:
-  000000/
+  0000/
     img.npy
     onehot.npy
     sdf.npy
     meta.json
-  000001/
-    ...
-
-Usage:
-  python ACDCAugment.py --in_root ./dataset/ACDC/ONEHOT/train --out_root ./dataset/ACDC/Aug/train --aug_per_sample 2 --seed 42
-
-Notes:
-- If your image is already normalized to [-1,1], keep clamp_min=-1 clamp_max=1.
-- SDF generation supports optional clip+normalize (default clip=10, normalize=True).
 """
 
 from __future__ import annotations
@@ -60,12 +43,6 @@ def _ensure_dir(p: Path):
 
 
 def _find_samples(in_root: Path) -> List[Tuple[Path, Path]]:
-    """
-    Find pairs (img.npy, onehot.npy) under in_root recursively.
-    Expect in ANY subdirectory:
-      img.npy
-      onehot.npy
-    """
     in_root = Path(in_root)
     pairs: List[Tuple[Path, Path]] = []
 
@@ -78,19 +55,25 @@ def _find_samples(in_root: Path) -> List[Tuple[Path, Path]]:
 
 
 def _load_check(img_path: Path, onehot_path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    img = np.load(img_path)       # (H,W)
-    onehot = np.load(onehot_path) # (C,H,W)
+    img = np.load(img_path)
+    onehot = np.load(onehot_path)
 
-    if img.ndim != 2:
-        raise ValueError(f"Image must be (H,W), got {img.shape} from {img_path}")
+    # img: (H,W) -> (1,H,W), or keep (C,H,W)
+    if img.ndim == 2:
+        img = img[None, ...]
+    elif img.ndim == 3:
+        pass
+    else:
+        raise ValueError(f"Image must be (H,W) or (C,H,W), got {img.shape} from {img_path}")
+
     if onehot.ndim != 3:
         raise ValueError(f"onehot must be (C,H,W), got {onehot.shape} from {onehot_path}")
-    if onehot.shape[1:] != img.shape:
+
+    if onehot.shape[1:] != img.shape[1:]:
         raise ValueError(f"Spatial mismatch img {img.shape} vs onehot {onehot.shape} for {img_path}")
 
     img = img.astype(np.float32, copy=False)
 
-    # onehot -> float32 in [0,1] for warping
     if onehot.dtype == np.bool_:
         onehot_f = onehot.astype(np.float32)
     else:
@@ -107,11 +90,13 @@ def _random_bool(rng: np.random.Generator, p: float) -> bool:
 
 
 def _hflip_img(x: np.ndarray) -> np.ndarray:
-    return x[:, ::-1]
+    # (C,H,W)
+    return x[:, :, ::-1]
 
 
 def _vflip_img(x: np.ndarray) -> np.ndarray:
-    return x[::-1, :]
+    # (C,H,W)
+    return x[:, ::-1, :]
 
 
 def _hflip_chw(x: np.ndarray) -> np.ndarray:
@@ -130,16 +115,6 @@ def _build_affine_2d_rot_scale_trans(
     ty: float = 0.0,
     rot_deg: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build affine transform for scipy.ndimage.affine_transform.
-
-    We define forward transform (input -> output) around center:
-      x_out = s * R * (x_in - c) + c + t
-    Then inverse (output -> input) used by affine_transform:
-      x_in  = (1/s) * R^T * (x_out - c - t) + c
-
-    Returns matrix and offset in (y,x) coords for scipy.
-    """
     cx = (W - 1) / 2.0
     cy = (H - 1) / 2.0
 
@@ -150,19 +125,15 @@ def _build_affine_2d_rot_scale_trans(
     c = math.cos(theta)
     sn = math.sin(theta)
 
-    # R (xy)
     R = np.array([[c, -sn],
                   [sn,  c]], dtype=np.float32)
 
-    # A = (1/s) * R^T
     A_xy = (s_inv * R.T).astype(np.float32)
 
-    # offset in xy:
     t_xy = np.array([tx, ty], dtype=np.float32)
     c_xy = np.array([cx, cy], dtype=np.float32)
     offset_xy = c_xy - A_xy @ (c_xy + t_xy)
 
-    # scipy expects (y,x) coords:
     A_yx = np.array([[A_xy[1, 1], A_xy[1, 0]],
                      [A_xy[0, 1], A_xy[0, 0]]], dtype=np.float32)
     offset_yx = np.array([offset_xy[1], offset_xy[0]], dtype=np.float32)
@@ -177,16 +148,29 @@ def _apply_affine_to_image(
     mode: str = "constant",
     cval: float = 0.0,
 ) -> np.ndarray:
-    return affine_transform(
-        img,
-        matrix=A_yx,
-        offset=offset_yx,
-        output_shape=img.shape,
-        order=order,
-        mode=mode,
-        cval=cval,
-        prefilter=(order > 1),
-    ).astype(np.float32, copy=False)
+    """
+    img: (C,H,W)
+    Apply affine channel by channel.
+    """
+    if img.ndim != 3:
+        raise ValueError(f"img must be (C,H,W), got {img.shape}")
+
+    C, H, W = img.shape
+    out = np.empty_like(img, dtype=np.float32)
+
+    for c in range(C):
+        out[c] = affine_transform(
+            img[c],
+            matrix=A_yx,
+            offset=offset_yx,
+            output_shape=(H, W),
+            order=order,
+            mode=mode,
+            cval=cval,
+            prefilter=(order > 1),
+        ).astype(np.float32, copy=False)
+
+    return out
 
 
 def _apply_affine_to_onehot(
@@ -198,8 +182,7 @@ def _apply_affine_to_onehot(
     cval: float = 0.0,
 ) -> np.ndarray:
     """
-    onehot: (C,H,W) float32 in [0,1]
-    Use nearest (order=0) to keep discrete-ish.
+    onehot: (C,H,W)
     """
     C, H, W = onehot.shape
     out = np.empty_like(onehot, dtype=np.float32)
@@ -218,24 +201,12 @@ def _apply_affine_to_onehot(
 
 
 def _reonehot_argmax_no_bg(onehot_f: np.ndarray, thr: float = 0.5) -> np.ndarray:
-    """
-    ✅ No-background safe re-onehot.
-
-    onehot_f: (C,H,W) float (may have overlaps/holes after warping)
-    Background is implicit. We keep background where "no foreground".
-    Rule:
-      fg_score = max_c onehot_f[c]
-      if fg_score < thr -> all zeros (background)
-      else -> argmax class = 1 at that pixel
-
-    Returns: (C,H,W) uint8
-    """
     if onehot_f.ndim != 3:
         raise ValueError(f"Expected (C,H,W), got {onehot_f.shape}")
 
     C, H, W = onehot_f.shape
-    maxv = np.max(onehot_f, axis=0)            # (H,W)
-    lbl = np.argmax(onehot_f, axis=0)          # (H,W) in [0..C-1]
+    maxv = np.max(onehot_f, axis=0)
+    lbl = np.argmax(onehot_f, axis=0)
     fg = (maxv >= float(thr))
 
     out = np.zeros((C, H, W), dtype=np.uint8)
@@ -254,27 +225,28 @@ def _rand_brightness_contrast_gamma(
     contrast: float,
     gamma: float,
 ) -> np.ndarray:
+    """
+    img: (C,H,W)
+    intensity transforms applied per-channel
+    """
     out = img.astype(np.float32, copy=False)
 
     if brightness > 0:
-        delta = float(rng.uniform(-brightness, brightness))
+        delta = rng.uniform(-brightness, brightness, size=(out.shape[0], 1, 1)).astype(np.float32)
         out = out + delta
 
     if contrast > 0:
-        cc = float(rng.uniform(1.0 - contrast, 1.0 + contrast))
-        m = float(out.mean())
+        cc = rng.uniform(1.0 - contrast, 1.0 + contrast, size=(out.shape[0], 1, 1)).astype(np.float32)
+        m = out.mean(axis=(1, 2), keepdims=True)
         out = (out - m) * cc + m
 
     if gamma > 1.0:
-        g = float(rng.uniform(1.0 / gamma, gamma))
-        minv = float(out.min())
-        shift = 0.0
-        if minv < 0:
-            shift = -minv
-            out = out + shift
+        g = rng.uniform(1.0 / gamma, gamma, size=(out.shape[0], 1, 1)).astype(np.float32)
+        minv = out.min(axis=(1, 2), keepdims=True)
+        shift = np.where(minv < 0, -minv, 0.0).astype(np.float32)
+        out = out + shift
         out = np.power(np.clip(out, 0, None), g)
-        if shift != 0.0:
-            out = out - shift
+        out = out - shift
 
     return out.astype(np.float32, copy=False)
 
@@ -287,12 +259,19 @@ def _rand_noise(img: np.ndarray, rng: np.random.Generator, sigma: float) -> np.n
 
 
 def _rand_blur(img: np.ndarray, rng: np.random.Generator, sigma_max: float, p: float) -> np.ndarray:
+    """
+    img: (C,H,W), blur per-channel over spatial dims
+    """
     if sigma_max <= 0 or rng.random() >= p:
         return img
     s = float(rng.uniform(0.0, sigma_max))
     if s <= 1e-6:
         return img
-    return gaussian_filter(img, sigma=s).astype(np.float32, copy=False)
+
+    out = np.empty_like(img, dtype=np.float32)
+    for c in range(img.shape[0]):
+        out[c] = gaussian_filter(img[c], sigma=s).astype(np.float32, copy=False)
+    return out
 
 
 # -------------------------
@@ -304,12 +283,6 @@ def onehot_to_sdf_per_channel(
     normalize: bool = True,
     eps: float = 1e-8,
 ) -> np.ndarray:
-    """
-    onehot: (C,H,W) uint8/bool (0/1), no-bg is fine (background=all-zero)
-    returns sdf: (C,H,W) float32
-      sdf_c = dist_out - dist_in
-    then clip to [-clip, clip], optional normalize by clip to [-1,1].
-    """
     if onehot.ndim != 3:
         raise ValueError(f"Expected onehot (C,H,W), got {onehot.shape}")
     if clip <= 0:
@@ -345,13 +318,11 @@ def augment_one(
     cfg: Dict[str, Any],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """
-    img: (H,W) float32
-    onehot: (C,H,W) float32 (soft/hard)
-    Returns augmented (img, onehot_hard_uint8, sdf_float32, meta)
+    img: (C,H,W) float32
+    onehot: (C,H,W) float32
     """
     meta: Dict[str, Any] = {"geom": {}, "intensity": {}, "sdf": {}}
 
-    # ---------- Flips ----------
     do_h = _random_bool(rng, cfg["p_hflip"])
     do_v = _random_bool(rng, cfg["p_vflip"])
     meta["geom"]["hflip"] = do_h
@@ -364,8 +335,7 @@ def augment_one(
         img = _vflip_img(img)
         onehot = _vflip_chw(onehot)
 
-    # ---------- Affine (scale/translate/rotation) ----------
-    H, W = img.shape
+    _, H, W = img.shape
 
     scale = float(rng.uniform(1.0 - cfg["scale"], 1.0 + cfg["scale"])) if cfg["scale"] > 0 else 1.0
     tx = float(rng.uniform(-cfg["trans_px"], cfg["trans_px"])) if cfg["trans_px"] > 0 else 0.0
@@ -380,16 +350,11 @@ def augment_one(
     if (abs(scale - 1.0) > 1e-6) or (abs(tx) > 1e-6) or (abs(ty) > 1e-6) or (abs(rot) > 1e-6):
         A_yx, offset_yx = _build_affine_2d_rot_scale_trans(H, W, scale=scale, tx=tx, ty=ty, rot_deg=rot)
 
-        # image: bilinear
         img = _apply_affine_to_image(img, A_yx, offset_yx, order=1, mode="constant", cval=cfg["img_cval"])
-
-        # onehot: nearest
         onehot = _apply_affine_to_onehot(onehot, A_yx, offset_yx, order=0, mode="constant", cval=0.0)
 
-    # ✅ fix onehot to hard + mutually exclusive, keeping background empty
     onehot_u8 = _reonehot_argmax_no_bg(onehot, thr=cfg["onehot_thr"])
 
-    # ---------- Intensity (image only) ----------
     img = _rand_brightness_contrast_gamma(
         img,
         rng,
@@ -408,7 +373,6 @@ def augment_one(
     img = _rand_noise(img, rng, sigma=cfg["noise_sigma"])
     meta["intensity"]["noise_sigma"] = cfg["noise_sigma"]
 
-    # clamp
     lo = cfg["clamp_min"]
     hi = cfg["clamp_max"]
     if lo is not None or hi is not None:
@@ -416,7 +380,6 @@ def augment_one(
         hi2 = np.inf if hi is None else float(hi)
         img = np.clip(img, lo2, hi2).astype(np.float32)
 
-    # ---------- Regenerate SDF from onehot ----------
     sdf = onehot_to_sdf_per_channel(
         onehot_u8,
         clip=cfg["sdf_clip"],
@@ -475,7 +438,6 @@ def augment_dataset(
     for img_p, onehot_p in pairs:
         img, onehot = _load_check(img_p, onehot_p)
 
-        # include original: still regenerate sdf from original onehot (no-bg safe)
         if include_original:
             onehot_u8 = _reonehot_argmax_no_bg(onehot, thr=cfg["onehot_thr"])
             sdf = onehot_to_sdf_per_channel(
@@ -523,17 +485,14 @@ def augment_dataset(
 # -------------------------
 def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     return {
-        # geometry
         "p_hflip": float(args.p_hflip),
         "p_vflip": float(args.p_vflip),
         "scale": float(args.scale),
         "trans_px": float(args.trans),
         "rot_deg": float(args.rot),
 
-        # padding constants
         "img_cval": float(args.img_cval),
 
-        # intensity
         "brightness": float(args.brightness),
         "contrast": float(args.contrast),
         "gamma": float(args.gamma),
@@ -541,15 +500,12 @@ def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "p_blur": float(args.p_blur),
         "blur_sigma_max": float(args.blur_sigma_max),
 
-        # clamp
         "clamp_min": None if args.clamp_min == "none" else float(args.clamp_min),
         "clamp_max": None if args.clamp_max == "none" else float(args.clamp_max),
 
-        # sdf regen
         "sdf_clip": float(args.sdf_clip),
         "sdf_normalize": (not bool(args.sdf_no_norm)),
 
-        # ✅ no-bg reonehot threshold
         "onehot_thr": float(args.onehot_thr),
     }
 
@@ -570,17 +526,17 @@ def main():
     ap.add_argument("--overwrite", action="store_true",
                     help="Overwrite output folders if exist (otherwise auto-find next id)")
 
-    # ---- Geometry ----
+    # Geometry
     ap.add_argument("--p_hflip", type=float, default=0.5)
     ap.add_argument("--p_vflip", type=float, default=0.5)
-    ap.add_argument("--scale", type=float, default=0.10, help="Scale range (default 0.10)")
-    ap.add_argument("--trans", type=float, default=8.0, help="Translation range in pixels (default 8)")
-    ap.add_argument("--rot", type=float, default=30.0, help="Rotation range in degrees (default 30)")
+    ap.add_argument("--scale", type=float, default=0.10)
+    ap.add_argument("--trans", type=float, default=8.0)
+    ap.add_argument("--rot", type=float, default=30.0)
 
-    # padding constants (image)
+    # padding constants
     ap.add_argument("--img_cval", type=float, default=0.0)
 
-    # ---- Intensity ----
+    # Intensity
     ap.add_argument("--brightness", type=float, default=0.08)
     ap.add_argument("--contrast", type=float, default=0.15)
     ap.add_argument("--gamma", type=float, default=1.20)
@@ -588,18 +544,16 @@ def main():
     ap.add_argument("--p_blur", type=float, default=0.2)
     ap.add_argument("--blur_sigma_max", type=float, default=0.8)
 
-    # clamp (allow "none")
-    ap.add_argument("--clamp_min", type=str, default="-1.0", help='e.g. -1.0 or "none"')
-    ap.add_argument("--clamp_max", type=str, default="1.0", help='e.g. 1.0 or "none"')
+    # clamp
+    ap.add_argument("--clamp_min", type=str, default="-1.0")
+    ap.add_argument("--clamp_max", type=str, default="1.0")
 
-    # ---- SDF regeneration ----
-    ap.add_argument("--sdf_clip", type=float, default=10.0, help="clip SDF to [-clip, clip]")
-    ap.add_argument("--sdf_no_norm", action="store_true", help="disable sdf normalization by clip")
+    # SDF
+    ap.add_argument("--sdf_clip", type=float, default=10.0)
+    ap.add_argument("--sdf_no_norm", action="store_true")
 
-    # ✅ no-bg onehot fix threshold
-    ap.add_argument("--onehot_thr", type=float, default=0.5,
-                    help="Foreground threshold for no-bg reonehot (default 0.5). "
-                         "Pixels with max(onehot)<thr stay background(all-zero).")
+    # no-bg reonehot threshold
+    ap.add_argument("--onehot_thr", type=float, default=0.5)
 
     args = ap.parse_args()
     cfg = build_cfg_from_args(args)
