@@ -1,8 +1,8 @@
 # ======================================================
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
-# ✅ Adapted for NO-BACKGROUND channels in sdf/onehot (C=3 for ACDC labels 1/2/3)
-# ✅ Added sample-wise class weighting based on per-sample class pixel ratio
+# ✅ OneHot version (NO-BACKGROUND channels, NO SDF)
+# ✅ Keep original EMA / vis / resume / training logic
 # ======================================================
 
 import argparse
@@ -24,48 +24,50 @@ from utils.dataset import FolderDataset
 # ======================================================
 # Utils
 # ======================================================
-def sdf_to_mask_thresh_argmax_pred_no_bg(
-    sdf: torch.Tensor, thresh: float, fg_factor: float = 3.0
+def onehot_to_mask_argmax_pred_no_bg(
+    pred: torch.Tensor, thresh: float = 0.5
 ) -> torch.Tensor:
     """
-    Pred decoding for NO-BG sdf channels.
+    Pred decoding for NO-BG onehot-style outputs.
 
-    sdf: (B, C, H, W) where C=3 corresponds to labels {1,2,3} (no background channel stored).
-    We create an explicit background channel so argmax can output {0..C}:
-      - Foreground binary per class: sdf <= fg_factor*thresh
-      - Background binary: 1 if all foreground binaries are 0 at that pixel
-      - Argmax over (bg + fg_bins) -> labels in {0..C}
-        where:
-          0 -> background
-          1 -> class-1 (ACDC label 1)
-          2 -> class-2 (ACDC label 2)
-          3 -> class-3 (ACDC label 3)
+    pred: (B, C, H, W), C=num_classes_fg, no background channel stored.
+    Values are treated as foreground scores.
+
+    Steps:
+      - clamp pred to [0,1]
+      - background score = 1 if max foreground score < thresh else 0
+      - argmax over [bg_score, fg_scores] -> labels in {0..C}
+
+    Returns:
+      (B,H,W), label map in {0..C}
+        0 -> background
+        1..C -> foreground classes
     """
-    if sdf.ndim != 4:
-        raise ValueError(f"sdf must be (B,C,H,W), got {tuple(sdf.shape)}")
+    if pred.ndim != 4:
+        raise ValueError(f"pred must be (B,C,H,W), got {tuple(pred.shape)}")
 
-    fg_bin = (sdf <= (fg_factor * thresh)).to(torch.int8)  # (B,C,H,W)
-    bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)  # (B,1,H,W)
+    fg_score = pred.clamp(0.0, 1.0)  # (B,C,H,W)
+    max_fg = fg_score.max(dim=1, keepdim=True).values  # (B,1,H,W)
+    bg_score = (max_fg < thresh).float()  # (B,1,H,W)
 
-    m = torch.cat([bg_bin, fg_bin], dim=1)  # (B,1+C,H,W)
+    m = torch.cat([bg_score, fg_score], dim=1)  # (B,1+C,H,W)
     return torch.argmax(m, dim=1)  # (B,H,W) in {0..C}
 
 
-def sdf_to_mask_thresh_argmax_gt_no_bg(sdf_gt: torch.Tensor) -> torch.Tensor:
+def onehot_to_mask_argmax_gt_no_bg(onehot_gt: torch.Tensor) -> torch.Tensor:
     """
-    GT decoding for NO-BG sdf channels.
+    GT decoding for NO-BG onehot channels.
 
-    sdf_gt: (B, C, H, W) where C=3 corresponds to labels {1,2,3}.
-    For signed distance maps: inside is negative, boundary=0, outside positive.
-    So foreground is sdf <= 0.
+    onehot_gt: (B, C, H, W), C=num_classes_fg, values in [0,1]
+    Background is defined where all foreground channels are 0.
 
-    We add explicit background channel:
-      bg=1 where all fg bins are 0.
+    Returns:
+      (B,H,W), label map in {0..C}
     """
-    if sdf_gt.ndim != 4:
-        raise ValueError(f"sdf_gt must be (B,C,H,W), got {tuple(sdf_gt.shape)}")
+    if onehot_gt.ndim != 4:
+        raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
-    fg_bin = (sdf_gt <= 0.0).to(torch.int8)  # (B,C,H,W)
+    fg_bin = (onehot_gt > 0.5).to(torch.int8)  # (B,C,H,W)
     bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)  # (B,1,H,W)
 
     m = torch.cat([bg_bin, fg_bin], dim=1)  # (B,1+C,H,W)
@@ -116,18 +118,17 @@ def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
     return out
 
 
-def compute_samplewise_class_weights_from_sdf_gt(
-    sdf_gt: torch.Tensor,
+def compute_samplewise_class_weights_from_onehot_gt(
+    onehot_gt: torch.Tensor,
     eps: float = 1e-6,
     max_class_weight: float = 5.0,
 ) -> torch.Tensor:
     """
     根据每个样本内各类别像素比例，计算每个样本自己的通道权重。
 
-    sdf_gt: (B,C,H,W), 无背景通道
-    前景定义为 sdf <= 0
+    onehot_gt: (B,C,H,W), 无背景通道, values in [0,1]
 
-    返回:
+    Returns:
         weights: (B,C)
 
     逻辑:
@@ -140,17 +141,16 @@ def compute_samplewise_class_weights_from_sdf_gt(
 
         最后截断到 max_class_weight
     """
-    if sdf_gt.ndim != 4:
-        raise ValueError(f"sdf_gt must be (B,C,H,W), got {tuple(sdf_gt.shape)}")
+    if onehot_gt.ndim != 4:
+        raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
-    fg = (sdf_gt <= 0.0).float()                 # (B,C,H,W)
-    counts = fg.sum(dim=(2, 3))                  # (B,C)
-    present = counts > 0                         # (B,C)
+    counts = onehot_gt.sum(dim=(2, 3))          # (B,C)
+    present = counts > 0                        # (B,C)
 
-    total_fg = counts.sum(dim=1, keepdim=True)   # (B,1)
-    ratios = counts / (total_fg + eps)           # (B,C)
+    total_fg = counts.sum(dim=1, keepdim=True)  # (B,1)
+    ratios = counts / (total_fg + eps)          # (B,C)
 
-    weights = torch.zeros_like(ratios)           # (B,C)
+    weights = torch.zeros_like(ratios)          # (B,C)
     weights[present] = 1.0 / (ratios[present] + eps)
 
     present_count = present.sum(dim=1, keepdim=True)  # (B,1)
@@ -242,8 +242,7 @@ class MedFlowSeg(pl.LightningModule):
         vis_every: int = 5,
         vis_batches: int = 1,
         output_root: str = "./Outputs/MedFlowSeg",
-        thresh: float = 0.2,
-        fg_factor: float = 3.0,
+        thresh: float = 0.5,  # ✅ onehot 默认阈值改为 0.5
         use_ema: bool = True,
         ema_decay: float = 0.9999,
         class_weight_eps: float = 1e-6,
@@ -268,7 +267,6 @@ class MedFlowSeg(pl.LightningModule):
         self.vis_root.mkdir(parents=True, exist_ok=True)
 
         self.thresh = float(thresh)
-        self.fg_factor = float(fg_factor)
 
         self.class_weight_eps = float(class_weight_eps)
         self.max_class_weight = float(max_class_weight)
@@ -319,7 +317,7 @@ class MedFlowSeg(pl.LightningModule):
     def sample(self, image: torch.Tensor) -> torch.Tensor:
         """
         Start from x(0) ~ N(0, I) and integrate to t=1.
-        Output sdf_pred has shape (B, C, H, W) where C=num_classes_fg (no bg stored).
+        Output pred has shape (B, C, H, W) where C=num_classes_fg (no bg stored).
         """
         B, _, H, W = image.shape
         x = torch.randn(B, self.num_classes_fg, H, W, device=image.device)
@@ -336,7 +334,8 @@ class MedFlowSeg(pl.LightningModule):
     # Training
     # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, x1 = batch  # x1: sdf_gt, (B,C,H,W)
+        image, x1 = batch  # x1: onehot_gt, (B,C,H,W)
+        x1 = x1.float()
 
         B = image.shape[0]
         device = image.device
@@ -351,7 +350,7 @@ class MedFlowSeg(pl.LightningModule):
         v_pred = self.model(x_t, image, t)
 
         # 按每个样本内类别像素比例，动态计算通道权重
-        class_w = compute_samplewise_class_weights_from_sdf_gt(
+        class_w = compute_samplewise_class_weights_from_onehot_gt(
             x1,
             eps=self.class_weight_eps,
             max_class_weight=self.max_class_weight,
@@ -371,14 +370,15 @@ class MedFlowSeg(pl.LightningModule):
     # Validation
     # --------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        image, sdf_gt = batch  # sdf_gt: (B,C,H,W), C=num_classes_fg (no bg)
+        image, onehot_gt = batch  # onehot_gt: (B,C,H,W), C=num_classes_fg (no bg)
+        onehot_gt = onehot_gt.float()
 
-        sdf_pred = self.sample(image)
+        pred = self.sample(image)
 
-        pred_mask = sdf_to_mask_thresh_argmax_pred_no_bg(
-            sdf_pred, thresh=self.thresh, fg_factor=self.fg_factor
+        pred_mask = onehot_to_mask_argmax_pred_no_bg(
+            pred, thresh=self.thresh
         )
-        gt_mask = sdf_to_mask_thresh_argmax_gt_no_bg(sdf_gt)
+        gt_mask = onehot_to_mask_argmax_gt_no_bg(onehot_gt)
 
         dice = mean_dice_foreground(pred_mask, gt_mask, self.num_classes_with_bg)
 
@@ -477,9 +477,8 @@ def main():
     parser.add_argument("--vis_every", type=int, default=10)
     parser.add_argument("--vis_batches", type=int, default=2, help="visualize first N validation batches")
 
-    # threshold for pred decoding
-    parser.add_argument("--thresh", type=float, default=1e-3)
-    parser.add_argument("--fg_factor", type=float, default=1.0)
+    # ✅ onehot 解码阈值
+    parser.add_argument("--thresh", type=float, default=0.5)
 
     # sample-wise class weighting
     parser.add_argument("--class_weight_eps", type=float, default=1e-6)
@@ -535,7 +534,6 @@ def main():
         vis_batches=args.vis_batches,
         output_root=args.output_root,
         thresh=args.thresh,
-        fg_factor=args.fg_factor,
         use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
         class_weight_eps=args.class_weight_eps,

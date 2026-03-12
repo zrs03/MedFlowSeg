@@ -27,7 +27,7 @@ class FolderDataset(Dataset):
         self,
         root: Union[str, Path],
         image_file: str = "img.npy",
-        target_file: str = "sdf.npy",
+        target_file: str = "onehot.npy",
         add_channel_dim: bool = True,   # image -> (1,H,W) if needed
         sort_numeric: bool = True,      # sort 000123 numerically if possible
     ):
