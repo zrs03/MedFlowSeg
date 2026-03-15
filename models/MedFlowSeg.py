@@ -2,12 +2,12 @@
 """
 ✅ 在你给的代码基础上：
 1) 删除了 back 分支
-2) 注入了最新定制的独立双高斯 SAFuse:
+2) 注入了最新定制的独立双高斯 DBSA:
    - anc = f_cond * Kconv3x3
    - low = Kgauss_low(anc), high = anc - Kgauss_high(anc)  (独立高斯核，默认 3 和 5)
    - high/low 独立 3*3 卷积后 concat
    - 1*1 卷积生成 gate
-3) 保留了 HOG, FA, positional encoding 等所有核心结构
+3) 保留了 HOG, FAA, positional encoding 等所有核心结构
 """
 
 from __future__ import annotations
@@ -282,9 +282,9 @@ class LearnableGaussianBlur2d(nn.Module):
 
 
 # =========================================================
-# ✅ 核心定制：SAFuse (独立双高斯核版)
+# ✅ 核心定制：DBSA (独立双高斯核版)
 # =========================================================
-class SAFuse(nn.Module):
+class DBSA(nn.Module):
     """
     定制版 Spatial Gate (独立双高斯核):
     1. anc = f_cond * Kconv3x3
@@ -324,7 +324,7 @@ class SAFuse(nn.Module):
 
     def forward(self, f_cond: torch.Tensor, f_fore: torch.Tensor) -> torch.Tensor:
         if f_cond.shape != f_fore.shape:
-            raise ValueError("SAFuse requires f_cond/f_fore same shape")
+            raise ValueError("DBSA requires f_cond/f_fore same shape")
             
         # 1. 提取 Anchor 特征 (相当于 anc = f_cond * Kconv3x3)
         anc = self.conv_anc(f_cond)
@@ -354,7 +354,7 @@ def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
     return (x + math.pi) % (2.0 * math.pi) - math.pi
 
 
-class FreqDenseHOG(nn.Module):
+class SOSX(nn.Module):
     """
     输入 x: (B,C,H,W)
     输出 hog_map: (B, C*K, H, W)
@@ -524,9 +524,9 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
 
 
 # =========================================================
-# FA module（fore-only：fore ↔ cond）
+# FAA module（fore-only：fore ↔ cond）
 # =========================================================
-class FAModule(nn.Module):
+class FAAModule(nn.Module):
     def __init__(
         self,
         ch: int,
@@ -742,7 +742,7 @@ class MainNet(nn.Module):
         fa_gate_scale: float = 1.0,
         fa_gate_R: int = 2,
         
-        # ✅ SAFuse 新接口参数 (独立双高斯核)
+        # ✅ DBSA 新接口参数 (独立双高斯核)
         usa_low_gauss_ks: int = 3,
         usa_high_gauss_ks: int = 5,
         usa_low_gauss_sigma: float = 1.5,
@@ -853,7 +853,7 @@ class MainNet(nn.Module):
         self.attn_level_set = set(range(n_levels - K_levels, n_levels))
 
         # hog
-        self.freq_hog = FreqDenseHOG(
+        self.freq_hog = SOSX(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
             eps=self.hog_eps,
@@ -870,7 +870,7 @@ class MainNet(nn.Module):
             mods = nn.ModuleList()
             for _ in range(self.fa_stacks):
                 mods.append(
-                    FAModule(
+                    FAAModule(
                         ch=ch,
                         time_ch=self.time_dim,
                         heads=self.attn_heads,
@@ -904,8 +904,8 @@ class MainNet(nn.Module):
         # control injection to decoder: chs -> chs
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
 
-        # ✅ 实例化全新的 SAFuse (独立双高斯核版)
-        self.usa_x = SAFuse(
+        # ✅ 实例化全新的 DBSA (独立双高斯核版)
+        self.usa_x = DBSA(
             ch=self.chs[0],
             low_gauss_ks=usa_low_gauss_ks,
             high_gauss_ks=usa_high_gauss_ks,
@@ -955,7 +955,7 @@ class MainNet(nn.Module):
         for level, enc_f in enumerate(self.fore_enc):
             f_skip = enc_f(fore, t_emb)
 
-            # ✅ 在 level0 使用新定制的 SAFuse
+            # ✅ 在 level0 使用新定制的 DBSA
             if level == 0:
                 f_skip = self.usa_x(f_cond=cond_enc_l0, f_fore=f_skip)
 
@@ -1046,7 +1046,7 @@ def build_model(
     fa_gate_scale: float = 1.0,
     fa_gate_R: int = 2,
     
-    # ✅ SAFuse 独立双高斯核接口参数
+    # ✅ DBSA 独立双高斯核接口参数
     usa_low_gauss_ks: int = 3,
     usa_high_gauss_ks: int = 5,
     usa_low_gauss_sigma: float = 1.5,
@@ -1080,7 +1080,7 @@ def build_model(
         fa_gate_scale=fa_gate_scale,
         fa_gate_R=fa_gate_R,
         
-        # ✅ 传入定制的 SAFuse 参数
+        # ✅ 传入定制的 DBSA 参数
         usa_low_gauss_ks=usa_low_gauss_ks,
         usa_high_gauss_ks=usa_high_gauss_ks,
         usa_low_gauss_sigma=usa_low_gauss_sigma,
@@ -1120,7 +1120,7 @@ if __name__ == "__main__":
         fa_gate_scale=1.0,
         fa_gate_R=2,
         
-        # ✅ SAFuse 参数测试 (默认 3 和 5)
+        # ✅ DBSA 参数测试 (默认 3 和 5)
         usa_low_gauss_ks=3,
         usa_high_gauss_ks=5,
         usa_low_gauss_sigma=1.5,
