@@ -2,6 +2,7 @@
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
 # ✅ OneHot version (NO-BACKGROUND channels, NO SDF)
+# ✅ Removed class-wise weighting
 # ✅ Keep original EMA / vis / resume / training logic
 # ======================================================
 
@@ -118,59 +119,6 @@ def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
     return out
 
 
-def compute_samplewise_class_weights_from_onehot_gt(
-    onehot_gt: torch.Tensor,
-    eps: float = 1e-6,
-    max_class_weight: float = 5.0,
-) -> torch.Tensor:
-    """
-    根据每个样本内各类别像素比例，计算每个样本自己的通道权重。
-
-    onehot_gt: (B,C,H,W), 无背景通道, values in [0,1]
-
-    Returns:
-        weights: (B,C)
-
-    逻辑:
-        counts_c = 每个样本中每个类的前景像素数
-        ratio_c = counts_c / sum(counts_all_classes)
-        weight_c = 1 / (ratio_c + eps)
-
-        然后对每个样本做归一化:
-            让该样本所有出现类别的平均权重 = 1
-
-        最后截断到 max_class_weight
-    """
-    if onehot_gt.ndim != 4:
-        raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
-
-    counts = onehot_gt.sum(dim=(2, 3))          # (B,C)
-    present = counts > 0                        # (B,C)
-
-    total_fg = counts.sum(dim=1, keepdim=True)  # (B,1)
-    ratios = counts / (total_fg + eps)          # (B,C)
-
-    weights = torch.zeros_like(ratios)          # (B,C)
-    weights[present] = 1.0 / (ratios[present] + eps)
-
-    present_count = present.sum(dim=1, keepdim=True)  # (B,1)
-    weight_sum = weights.sum(dim=1, keepdim=True)     # (B,1)
-
-    valid = present_count > 0
-    norm = torch.ones_like(weight_sum)
-    norm[valid] = weight_sum[valid] / present_count[valid].float()
-
-    weights = weights / (norm + eps)
-
-    # 如果某个样本没有任何前景，回退成全1
-    no_fg = present_count.squeeze(1) == 0
-    if no_fg.any():
-        weights[no_fg] = 1.0
-
-    weights = torch.clamp(weights, min=0.0, max=max_class_weight)
-    return weights
-
-
 class EMA:
     """
     Exponential Moving Average for model parameters.
@@ -242,11 +190,9 @@ class MedFlowSeg(pl.LightningModule):
         vis_every: int = 5,
         vis_batches: int = 1,
         output_root: str = "./Outputs/MedFlowSeg",
-        thresh: float = 0.5,  # ✅ onehot 默认阈值改为 0.5
+        thresh: float = 0.5,  # onehot 默认阈值
         use_ema: bool = True,
         ema_decay: float = 0.9999,
-        class_weight_eps: float = 1e-6,
-        max_class_weight: float = 5.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -267,9 +213,6 @@ class MedFlowSeg(pl.LightningModule):
         self.vis_root.mkdir(parents=True, exist_ok=True)
 
         self.thresh = float(thresh)
-
-        self.class_weight_eps = float(class_weight_eps)
-        self.max_class_weight = float(max_class_weight)
 
         self._val_vis_cache = []
 
@@ -349,21 +292,10 @@ class MedFlowSeg(pl.LightningModule):
         v_star = x1 - x0
         v_pred = self.model(x_t, image, t)
 
-        # 按每个样本内类别像素比例，动态计算通道权重
-        class_w = compute_samplewise_class_weights_from_onehot_gt(
-            x1,
-            eps=self.class_weight_eps,
-            max_class_weight=self.max_class_weight,
-        )  # (B,C)
-
-        per_pixel = (v_pred - v_star) ** 2        # (B,C,H,W)
-        class_w = class_w[:, :, None, None]       # (B,C,1,1)
-
-        loss = (per_pixel * class_w).mean()
+        # Uniform MSE without class-wise weighting
+        loss = ((v_pred - v_star) ** 2).mean()
 
         self.log("train/loss", loss, prog_bar=True)
-        self.log("train/class_w_mean", class_w.mean(), prog_bar=False)
-        self.log("train/class_w_max", class_w.max(), prog_bar=False)
         return loss
 
     # --------------------------------------------------
@@ -477,12 +409,8 @@ def main():
     parser.add_argument("--vis_every", type=int, default=10)
     parser.add_argument("--vis_batches", type=int, default=2, help="visualize first N validation batches")
 
-    # ✅ onehot 解码阈值
+    # onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
-
-    # sample-wise class weighting
-    parser.add_argument("--class_weight_eps", type=float, default=1e-6)
-    parser.add_argument("--max_class_weight", type=float, default=5.0)
 
     # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
@@ -536,8 +464,6 @@ def main():
         thresh=args.thresh,
         use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
-        class_weight_eps=args.class_weight_eps,
-        max_class_weight=args.max_class_weight,
     )
 
     ckpt_cb = ModelCheckpoint(
