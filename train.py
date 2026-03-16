@@ -2,7 +2,7 @@
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
 # ✅ OneHot version (NO-BACKGROUND channels, NO SDF)
-# ✅ Removed class-wise weighting
+# ✅ Foreground-position weighted loss
 # ✅ Keep original EMA / vis / resume / training logic
 # ======================================================
 
@@ -190,9 +190,10 @@ class MedFlowSeg(pl.LightningModule):
         vis_every: int = 5,
         vis_batches: int = 1,
         output_root: str = "./Outputs/MedFlowSeg",
-        thresh: float = 0.5,  # onehot 默认阈值
+        thresh: float = 0.5,
         use_ema: bool = True,
         ema_decay: float = 0.9999,
+        fg_boost: float = 4.0,  # foreground-position weighting: w = 1 + fg_boost * x1
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -213,6 +214,7 @@ class MedFlowSeg(pl.LightningModule):
         self.vis_root.mkdir(parents=True, exist_ok=True)
 
         self.thresh = float(thresh)
+        self.fg_boost = float(fg_boost)
 
         self._val_vis_cache = []
 
@@ -292,10 +294,19 @@ class MedFlowSeg(pl.LightningModule):
         v_star = x1 - x0
         v_pred = self.model(x_t, image, t)
 
-        # Uniform MSE without class-wise weighting
-        loss = ((v_pred - v_star) ** 2).mean()
+        # Per-pixel regression error
+        per_pixel = (v_pred - v_star) ** 2  # (B,C,H,W)
+
+        # Foreground-position weighting:
+        # background positions -> weight 1
+        # foreground positions -> weight (1 + fg_boost)
+        pos_w = 1.0 + self.fg_boost * x1  # (B,C,H,W)
+
+        loss = (per_pixel * pos_w).mean()
 
         self.log("train/loss", loss, prog_bar=True)
+        self.log("train/fg_weight_mean", pos_w.mean(), prog_bar=False)
+        self.log("train/fg_weight_max", pos_w.max(), prog_bar=False)
         return loss
 
     # --------------------------------------------------
@@ -412,6 +423,14 @@ def main():
     # onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
 
+    # foreground-position weighting
+    parser.add_argument(
+        "--fg_boost",
+        type=float,
+        default=4.0,
+        help="foreground position weight multiplier; final weight = 1 + fg_boost * x1",
+    )
+
     # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
     parser.add_argument("--ema_decay", type=float, default=0.999)
@@ -464,6 +483,7 @@ def main():
         thresh=args.thresh,
         use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
+        fg_boost=args.fg_boost,
     )
 
     ckpt_cb = ModelCheckpoint(
