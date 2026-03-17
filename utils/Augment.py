@@ -8,8 +8,8 @@ UPDATED:
 - Also supports img.npy as (C,H,W)
 - onehot.npy is (C,H,W)
 - Geometry augment: hflip/vflip + translate + scale + rotation
-- After augmentation, regenerate sdf.npy FROM onehot.npy
 - Supports no-background onehot safely
+- NO SDF OPERATIONS
 
 Expected input under --in_root:
   .../img.npy      : (H,W) or (C,H,W) float32
@@ -19,7 +19,6 @@ Output under --out_root:
   0000/
     img.npy
     onehot.npy
-    sdf.npy
     meta.json
 """
 
@@ -32,7 +31,7 @@ import math
 import numpy as np
 from typing import List, Tuple, Dict, Any
 
-from scipy.ndimage import affine_transform, gaussian_filter, distance_transform_edt
+from scipy.ndimage import affine_transform, gaussian_filter
 
 
 # -------------------------
@@ -275,40 +274,6 @@ def _rand_blur(img: np.ndarray, rng: np.random.Generator, sigma_max: float, p: f
 
 
 # -------------------------
-# Onehot -> SDF
-# -------------------------
-def onehot_to_sdf_per_channel(
-    onehot: np.ndarray,
-    clip: float = 10.0,
-    normalize: bool = True,
-    eps: float = 1e-8,
-) -> np.ndarray:
-    if onehot.ndim != 3:
-        raise ValueError(f"Expected onehot (C,H,W), got {onehot.shape}")
-    if clip <= 0:
-        raise ValueError("clip must be > 0")
-
-    C, H, W = onehot.shape
-    sdf = np.zeros((C, H, W), dtype=np.float32)
-
-    for c in range(C):
-        mask = onehot[c].astype(bool)
-        if mask.any():
-            dist_in = distance_transform_edt(mask)
-            dist_out = distance_transform_edt(~mask)
-            sdf_c = dist_out - dist_in
-        else:
-            sdf_c = np.full((H, W), fill_value=clip, dtype=np.float32)
-
-        sdf_c = np.clip(sdf_c, -clip, clip).astype(np.float32)
-        if normalize:
-            sdf_c = sdf_c / (clip + eps)
-        sdf[c] = sdf_c
-
-    return sdf
-
-
-# -------------------------
 # Main augment function
 # -------------------------
 def augment_one(
@@ -316,12 +281,12 @@ def augment_one(
     onehot: np.ndarray,
     rng: np.random.Generator,
     cfg: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     img: (C,H,W) float32
     onehot: (C,H,W) float32
     """
-    meta: Dict[str, Any] = {"geom": {}, "intensity": {}, "sdf": {}}
+    meta: Dict[str, Any] = {"geom": {}, "intensity": {}}
 
     do_h = _random_bool(rng, cfg["p_hflip"])
     do_v = _random_bool(rng, cfg["p_vflip"])
@@ -380,20 +345,9 @@ def augment_one(
         hi2 = np.inf if hi is None else float(hi)
         img = np.clip(img, lo2, hi2).astype(np.float32)
 
-    sdf = onehot_to_sdf_per_channel(
-        onehot_u8,
-        clip=cfg["sdf_clip"],
-        normalize=cfg["sdf_normalize"],
-        eps=1e-8,
-    ).astype(np.float32, copy=False)
-
-    meta["sdf"]["clip"] = float(cfg["sdf_clip"])
-    meta["sdf"]["normalize"] = bool(cfg["sdf_normalize"])
-
     img = np.ascontiguousarray(img.astype(np.float32, copy=False))
     onehot_u8 = np.ascontiguousarray(onehot_u8.astype(np.uint8, copy=False))
-    sdf = np.ascontiguousarray(sdf.astype(np.float32, copy=False))
-    return img, onehot_u8, sdf, meta
+    return img, onehot_u8, meta
 
 
 def augment_dataset(
@@ -418,7 +372,7 @@ def augment_dataset(
     rng = np.random.default_rng(seed)
     out_idx = start_index
 
-    def _write_one(img_arr: np.ndarray, onehot_arr: np.ndarray, sdf_arr: np.ndarray, meta: Dict[str, Any]):
+    def _write_one(img_arr: np.ndarray, onehot_arr: np.ndarray, meta: Dict[str, Any]):
         nonlocal out_idx
         sample_dir = out_root / str(out_idx).zfill(id_width)
 
@@ -430,7 +384,6 @@ def augment_dataset(
         _ensure_dir(sample_dir)
         np.save(sample_dir / "img.npy", img_arr.astype(np.float32, copy=False))
         np.save(sample_dir / "onehot.npy", onehot_arr.astype(np.uint8, copy=False))
-        np.save(sample_dir / "sdf.npy", sdf_arr.astype(np.float32, copy=False))
         with open(sample_dir / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         out_idx += 1
@@ -440,17 +393,9 @@ def augment_dataset(
 
         if include_original:
             onehot_u8 = _reonehot_argmax_no_bg(onehot, thr=cfg["onehot_thr"])
-            sdf = onehot_to_sdf_per_channel(
-                onehot_u8,
-                clip=cfg["sdf_clip"],
-                normalize=cfg["sdf_normalize"],
-                eps=1e-8,
-            ).astype(np.float32, copy=False)
-
             _write_one(
                 img,
                 onehot_u8,
-                sdf,
                 meta={
                     "source_image": str(img_p),
                     "source_onehot": str(onehot_p),
@@ -460,11 +405,10 @@ def augment_dataset(
             )
 
         for _ in range(aug_per_sample):
-            img_aug, onehot_aug, sdf_aug, meta_aug = augment_one(img, onehot, rng, cfg)
+            img_aug, onehot_aug, meta_aug = augment_one(img, onehot, rng, cfg)
             _write_one(
                 img_aug,
                 onehot_aug,
-                sdf_aug,
                 meta={
                     "source_image": str(img_p),
                     "source_onehot": str(onehot_p),
@@ -502,9 +446,6 @@ def build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
         "clamp_min": None if args.clamp_min == "none" else float(args.clamp_min),
         "clamp_max": None if args.clamp_max == "none" else float(args.clamp_max),
-
-        "sdf_clip": float(args.sdf_clip),
-        "sdf_normalize": (not bool(args.sdf_no_norm)),
 
         "onehot_thr": float(args.onehot_thr),
     }
@@ -547,10 +488,6 @@ def main():
     # clamp
     ap.add_argument("--clamp_min", type=str, default="-1.0")
     ap.add_argument("--clamp_max", type=str, default="1.0")
-
-    # SDF
-    ap.add_argument("--sdf_clip", type=float, default=10.0)
-    ap.add_argument("--sdf_no_norm", action="store_true")
 
     # no-bg reonehot threshold
     ap.add_argument("--onehot_thr", type=float, default=0.5)
