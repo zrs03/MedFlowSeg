@@ -1,0 +1,17 @@
+pillow
+SimpleITK
+apex
+einops
+nibabel
+numpy
+pandas
+scipy
+scikit-learn
+torch
+torchvision
+tqdm
+nibabel
+tqdm
+tensorboard
+pytorch-lightning
+matplotlib

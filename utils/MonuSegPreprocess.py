@@ -10,7 +10,7 @@
 #         masks/
 #
 # Supports image/mask files in png / tif / tiff.
-# Each image + mask pair can generate multiple random 256x256 crops.
+# Each image + mask pair can generate multiple random 128x128 crops.
 #
 # Processing:
 # - collect kmms_training + kmms_test together
@@ -18,8 +18,8 @@
 # - print all samples whose image/mask spatial sizes are different
 # - save mismatch report to out_root/mismatch_report.txt
 # - split on whole images first (8:1:1), then crop inside each split
-# - random crop to size x size
-# - if original image/mask sizes differ, resize mask to image size before crop
+# - FIRST resize both image and mask to 500x500
+# - THEN random crop to size x size (default 128x128)
 # - image: RGB kept as 3-channel, percentile clip normalize to [-1,1] per channel
 # - mask : binarize to {0,1}
 # - onehot WITHOUT background: (1,H,W)
@@ -36,7 +36,8 @@
 #   python utils/MonuSegPreprocess.py \
 #       --base_dir ./MonuSegdataset \
 #       --out_root ./dataset/MonuSeg/ONEHOT \
-#       --size 256 \
+#       --resize_to 500 \
+#       --size 128 \
 #       --crops_per_train 8 \
 #       --crops_per_val 2 \
 #       --crops_per_test 2 \
@@ -411,12 +412,9 @@ def random_crop_pair(
     h, w = mask.shape
 
     if h < crop_h or w < crop_w:
-        new_h = max(h, crop_h)
-        new_w = max(w, crop_w)
-        img = resize_hw_image_rgb(img, out_hw=(new_h, new_w))
-        mask = resize_hw_mask(mask, out_hw=(new_h, new_w))
-        mask = (mask > 0).astype(np.uint8)
-        h, w = mask.shape
+        raise ValueError(
+            f"Crop size {crop_hw} is larger than image size {(h, w)} after resize."
+        )
 
     top = rng.randint(0, h - crop_h)
     left = rng.randint(0, w - crop_w)
@@ -434,6 +432,7 @@ def process_one_image_to_crops(
     item: Dict,
     split_name: str,
     out_root: Path,
+    resize_to: int,
     size: int,
     p_lo: float,
     p_hi: float,
@@ -443,6 +442,11 @@ def process_one_image_to_crops(
 ) -> int:
     """
     For one original image/mask pair, generate multiple random crops.
+
+    New pipeline:
+      1. load original image and mask
+      2. resize BOTH to (resize_to, resize_to)
+      3. random crop (size, size)
 
     Output:
       out_root/split/sample_id_crop000/
@@ -461,15 +465,10 @@ def process_one_image_to_crops(
     img = load_rgb_image(img_path)    # (H,W,3), uint8
     mask = load_mask(mask_path)       # (H,W), uint8 {0,1}
 
-    # If mismatch, align mask to image size first, then crop together
-    if img.shape[:2] != mask.shape:
-        if verbose:
-            print(
-                f"[Warn] spatial mismatch for {sample_id}: "
-                f"image {img.shape[:2]} vs mask {mask.shape}, resize mask to image size"
-            )
-        mask = resize_hw_mask(mask, out_hw=img.shape[:2])
-        mask = (mask > 0).astype(np.uint8)
+    # First resize both image and mask to fixed size 500x500 (or user-defined resize_to)
+    img = resize_hw_image_rgb(img, out_hw=(resize_to, resize_to))
+    mask = resize_hw_mask(mask, out_hw=(resize_to, resize_to))
+    mask = (mask > 0).astype(np.uint8)
 
     total_ok = 0
     crop_hw = (size, size)
@@ -502,6 +501,7 @@ def process_one_image_to_crops(
 def run(
     base_dir: Path,
     out_root: Path,
+    resize_to: int,
     size: int,
     p_lo: float,
     p_hi: float,
@@ -523,7 +523,7 @@ def run(
 
     print(f"[Info] total paired images from all subsets: {len(items)}")
 
-    # Print and save all size-mismatch samples
+    # Print and save all original size-mismatch samples
     scan_spatial_mismatches(items, out_root=out_root, verbose=verbose)
 
     if split_json is not None and split_json.exists():
@@ -562,6 +562,7 @@ def run(
                 item=item,
                 split_name=split_name,
                 out_root=out_root,
+                resize_to=resize_to,
                 size=size,
                 p_lo=p_lo,
                 p_hi=p_hi,
@@ -584,7 +585,8 @@ def main():
     ap.add_argument("--base_dir", type=str, default="./MonuSegdataset")
     ap.add_argument("--out_root", type=str, default="./dataset/MonuSeg/ONEHOT")
 
-    ap.add_argument("--size", type=int, default=256, help="random crop size x size")
+    ap.add_argument("--resize_to", type=int, default=500, help="resize image and mask to resize_to x resize_to first")
+    ap.add_argument("--size", type=int, default=256, help="random crop size x size after resize")
     ap.add_argument("--p_lo", type=float, default=1.0, help="percentile clip low")
     ap.add_argument("--p_hi", type=float, default=99.0, help="percentile clip high")
     ap.add_argument("--seed", type=int, default=42)
@@ -607,9 +609,15 @@ def main():
 
     args = ap.parse_args()
 
+    if args.size > args.resize_to:
+        raise ValueError(
+            f"--size ({args.size}) must be <= --resize_to ({args.resize_to})"
+        )
+
     run(
         base_dir=Path(args.base_dir),
         out_root=Path(args.out_root),
+        resize_to=int(args.resize_to),
         size=int(args.size),
         p_lo=float(args.p_lo),
         p_hi=float(args.p_hi),
