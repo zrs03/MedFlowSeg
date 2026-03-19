@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-✅ 在你给的代码基础上：
+✅ 修改版说明：
 1) 删除了 back 分支
 2) 注入了最新定制的独立双高斯 DBSA:
    - anc = f_cond * Kconv3x3
@@ -8,6 +8,8 @@
    - high/low 独立 3*3 卷积后 concat
    - 1*1 卷积生成 gate
 3) 保留了 HOG, FAA, positional encoding 等所有核心结构
+4) 仅删除 cond encoder 后额外的 ctrl_proc_levels 分支，并移除其相关参数
+5) 将原来的 fore net / fore 相关命名统一改为 flow net / flow
 """
 
 from __future__ import annotations
@@ -137,7 +139,7 @@ class Upsample(nn.Module):
 
 
 # =========================================================
-# ZeroConv (ControlNet-style injection)
+# ZeroConv (ControlNet-style injection to decoder only)
 # =========================================================
 class ZeroConv2d(nn.Module):
     """1x1 conv with ZERO init."""
@@ -149,26 +151,6 @@ class ZeroConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
-
-
-# =========================================================
-# Control processor (optional, for cond features)
-# =========================================================
-class ControlResProc(nn.Module):
-    def __init__(self, ch: int, time_ch: int, num_blocks: int, dropout: float):
-        super().__init__()
-        self.num_blocks = int(num_blocks)
-        if self.num_blocks <= 0:
-            self.blocks = nn.ModuleList([])
-        else:
-            self.blocks = nn.ModuleList(
-                [ResBlockFiLM(ch, ch, time_ch=time_ch, dropout=dropout) for _ in range(self.num_blocks)]
-            )
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        for blk in self.blocks:
-            x = blk(x, t_emb)
-        return x
 
 
 # =========================================================
@@ -189,7 +171,7 @@ class PatchEmbed2D(nn.Module):
         b, c, h, w = x.shape
         p = self.patch
         if (h % p) != 0 or (w % p) != 0:
-            raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h,w)}")
+            raise ValueError(f"PatchEmbed2D requires H,W divisible by patch={p}, got {(h, w)}")
         x = self.proj(x)  # (B, D, Hp, Wp)
         hp, wp = x.shape[-2], x.shape[-1]
         x = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, D)
@@ -212,7 +194,7 @@ class Unpatch2D(nn.Module):
         hp, wp = hw_patch
         p = self.patch
         if n != hp * wp:
-            raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp*wp}")
+            raise ValueError(f"Unpatch2D got N={n} but Hp*Wp={hp * wp}")
 
         x = self.to_patch(tokens)  # (B, N, C*P*P)
         x = x.view(b, hp, wp, self.out_ch, p, p)
@@ -265,7 +247,7 @@ class LearnableGaussianBlur2d(nn.Module):
         k = self.kernel_size
         ax = torch.arange(k) - (k - 1) / 2.0
         xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-        g = torch.exp(-(xx**2 + yy**2) / (2.0 * (sigma ** 2)))
+        g = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * (sigma ** 2)))
         g = g / (g.sum() + 1e-8)
         raw = torch.log(g.clamp_min(1e-12))
         raw = raw.view(1, 1, k, k).repeat(self.channels, 1, 1, 1)
@@ -275,8 +257,8 @@ class LearnableGaussianBlur2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 4 or x.shape[1] != self.channels:
             raise ValueError(f"LearnableGaussianBlur2d expects (B,{self.channels},H,W), got {tuple(x.shape)}")
-        w = F.softplus(self.raw)  # non-negative
-        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)  # per-channel sum=1
+        w = F.softplus(self.raw)
+        w = w / (w.sum(dim=(-1, -2), keepdim=True) + self.eps)
         pad = self.kernel_size // 2
         return F.conv2d(x, w, bias=None, stride=1, padding=pad, groups=self.channels)
 
@@ -295,56 +277,43 @@ class DBSA(nn.Module):
     def __init__(
         self,
         ch: int,
-        low_gauss_ks: int = 3,       # Kgauss_low 的核大小默认为 3
-        high_gauss_ks: int = 5,      # Kgauss_high 的核大小默认为 5
+        low_gauss_ks: int = 3,
+        high_gauss_ks: int = 5,
         low_gauss_sigma: float = 1.5,
         high_gauss_sigma: float = 1.5,
         init_bias: float = -2.0,
     ):
         super().__init__()
         self.ch = int(ch)
-        
-        # 1. 前置 3x3 卷积处理 cond
+
         self.conv_anc = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
-        
-        # 2. 独立的 Learnable Gaussian (Kgauss_low 和 Kgauss_high)
         self.gauss_low = LearnableGaussianBlur2d(self.ch, kernel_size=low_gauss_ks, sigma_init=low_gauss_sigma)
         self.gauss_high = LearnableGaussianBlur2d(self.ch, kernel_size=high_gauss_ks, sigma_init=high_gauss_sigma)
-        
-        # 3. 独立 3x3 卷积处理 high 和 low
+
         self.conv_high = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
         self.conv_low = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding=1, bias=True)
-        
-        # 4. 1x1 卷积生成 Gate
+
         self.conv_gate = nn.Conv2d(self.ch * 2, 1, kernel_size=1, bias=True)
-        
-        # 零初始化，保证初始 Gate 处于健康范围并不破坏原主干
+
         nn.init.zeros_(self.conv_gate.weight)
         nn.init.constant_(self.conv_gate.bias, init_bias)
 
-    def forward(self, f_cond: torch.Tensor, f_fore: torch.Tensor) -> torch.Tensor:
-        if f_cond.shape != f_fore.shape:
-            raise ValueError("DBSA requires f_cond/f_fore same shape")
-            
-        # 1. 提取 Anchor 特征 (相当于 anc = f_cond * Kconv3x3)
+    def forward(self, f_cond: torch.Tensor, f_flow: torch.Tensor) -> torch.Tensor:
+        if f_cond.shape != f_flow.shape:
+            raise ValueError("DBSA requires f_cond/f_flow same shape")
+
         anc = self.conv_anc(f_cond)
-        
-        # 2. 独立高斯核频域分离
+
         low = self.gauss_low(anc)
         high = anc - self.gauss_high(anc)
-        
-        # 3. 独立 3x3 卷积特征提取
+
         high_feat = self.conv_high(high)
         low_feat = self.conv_low(low)
-        
-        # 4. 拼接 (B, 2C, H, W)
+
         feat_cat = torch.cat([high_feat, low_feat], dim=1)
-        
-        # 5. 生成注意力 Gate
         g = torch.sigmoid(self.conv_gate(feat_cat))
-        
-        # 6. 残差融合
-        return f_fore + f_fore * g
+
+        return f_flow + f_flow * g
 
 
 # =========================================================
@@ -375,7 +344,7 @@ class SOSX(nn.Module):
         self.mag_weight = bool(mag_weight)
 
         k = torch.arange(self.hog_bins).float()
-        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)  # (K,)
+        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)
         self.register_buffer("theta", theta, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -407,7 +376,6 @@ class FreqDirectHeadFiLM(nn.Module):
         self.ch = int(ch)
         hid = int(hidden_mult * ch)
 
-        # 输入改为 2C
         self.in_norm = GroupNorm32(2 * ch)
         self.conv_in = nn.Conv2d(2 * ch, hid, 3, padding=1)
 
@@ -424,7 +392,6 @@ class FreqDirectHeadFiLM(nn.Module):
         nn.init.zeros_(self.conv_out.bias)
 
     def forward(self, x_ri2c: torch.Tensor, t_emb: torch.Tensor):
-
         h = self.conv_in(F.silu(self.in_norm(x_ri2c)))
 
         h = self.hid_norm(h)
@@ -434,12 +401,11 @@ class FreqDirectHeadFiLM(nn.Module):
         beta = beta[:, :, None, None]
 
         h = (1.0 + gamma) * h + beta
-
         h = F.silu(self.conv_mid(F.silu(h)))
 
-        out = self.conv_out(h)  # (B,2C,H,W)
-
+        out = self.conv_out(h)
         return out
+
 
 # =========================================================
 # Token FiLM block (R=2 time-conditioned gate builder)
@@ -485,13 +451,13 @@ class TokenFiLMBlock(nn.Module):
 
 
 # =========================================================
-# 2D Sin-Cos positional encoding（用于 token attention）
+# 2D Sin-Cos positional编码
 # =========================================================
 def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if dim <= 0:
         return torch.zeros((length, 0), device=device, dtype=dtype)
 
-    pos = torch.arange(length, device=device, dtype=dtype)  # (L,)
+    pos = torch.arange(length, device=device, dtype=dtype)
     half = dim // 2
 
     if half > 0:
@@ -499,7 +465,7 @@ def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) 
             -math.log(10000.0) * torch.arange(0, half, device=device, dtype=dtype) / max(half - 1, 1)
         )
         args = pos[:, None] * freq[None, :]
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (L, 2*half)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     else:
         emb = torch.zeros((length, 0), device=device, dtype=dtype)
 
@@ -514,17 +480,17 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
     dim_y = dim // 2
     dim_x = dim - dim_y
 
-    emb_y = _sincos_1d(h, dim_y, device, dtype)  # (h, dim_y)
-    emb_x = _sincos_1d(w, dim_x, device, dtype)  # (w, dim_x)
+    emb_y = _sincos_1d(h, dim_y, device, dtype)
+    emb_x = _sincos_1d(w, dim_x, device, dtype)
 
     yy = emb_y[:, None, :].expand(h, w, dim_y)
     xx = emb_x[None, :, :].expand(h, w, dim_x)
-    pos = torch.cat([yy, xx], dim=-1).reshape(1, h * w, dim)  # (1, N, dim)
+    pos = torch.cat([yy, xx], dim=-1).reshape(1, h * w, dim)
     return pos
 
 
 # =========================================================
-# FAA module（fore-only：fore ↔ cond）
+# FAA module（flow-only：flow ↔ cond）
 # =========================================================
 class FAAModule(nn.Module):
     def __init__(
@@ -557,32 +523,32 @@ class FAAModule(nn.Module):
         ri_ch = 2 * self.ch
         hog_ch = self.ch * self.hog_bins
 
-        self.patch_f = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
-        self.patch_c = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_flow = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_cond = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.fa_patch)
 
-        self.patch_hf = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
-        self.patch_hc = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_hflow = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
+        self.patch_hcond = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.fa_patch)
 
-        self.unpatch_f = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.fa_patch)
+        self.unpatch_flow = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.fa_patch)
 
-        self.attn_f = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=fa_attn_dropout)
+        self.attn_flow = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=fa_attn_dropout)
 
-        self.ffn_f = nn.Sequential(
+        self.ffn_flow = nn.Sequential(
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, 4 * self.token_dim),
             nn.SiLU(),
             nn.Linear(4 * self.token_dim, self.token_dim),
         )
 
-        self.direct_head_f = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
+        self.direct_head_flow = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
         gate_in_dim = 2 * self.token_dim
-        self.gate_f_blocks = nn.ModuleList(
+        self.gate_flow_blocks = nn.ModuleList(
             [TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)]
         )
-        self.gate_f_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
-        nn.init.zeros_(self.gate_f_out[-1].weight)
-        nn.init.zeros_(self.gate_f_out[-1].bias)
+        self.gate_flow_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
+        nn.init.zeros_(self.gate_flow_out[-1].weight)
+        nn.init.zeros_(self.gate_flow_out[-1].bias)
 
         self._pos_cache: Dict[Tuple[int, int, int, torch.device, torch.dtype], torch.Tensor] = {}
 
@@ -600,59 +566,51 @@ class FAAModule(nn.Module):
         key = (hp, wp, self.token_dim, device, dtype)
         pos = self._pos_cache.get(key)
         if pos is None or pos.device != device or pos.dtype != dtype:
-            pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)  # (1,N,D)
+            pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)
             self._pos_cache[key] = pos
         return pos
 
     def forward(
         self,
-        fore: torch.Tensor,
+        flow: torch.Tensor,
         cond: torch.Tensor,
-        hog_fore: torch.Tensor,
+        hog_flow: torch.Tensor,
         hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> torch.Tensor:
-        # FFT
-        Fz = torch.fft.fftshift(torch.fft.fft2(fore, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
+        Fz = torch.fft.fftshift(torch.fft.fft2(flow, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
         Fri = self._to_ri(Fz)
         Cri = self._to_ri(Cz)
 
-        # direct head (fore updated by fore+cond)
-        Fri = Fri + self.direct_head_f(Fri, t_emb)
+        Fri = Fri + self.direct_head_flow(Fri, t_emb)
 
-        # tokens
-        F_tok, hw_p = self.patch_f(Fri)
-        C_tok, _ = self.patch_c(Cri)
+        F_tok, hw_p = self.patch_flow(Fri)
+        C_tok, _ = self.patch_cond(Cri)
 
-        # pos enc
         hp, wp = hw_p
         pos = self._get_pos(hp, wp, device=F_tok.device, dtype=F_tok.dtype)
         F_tok = F_tok + pos
         C_tok = C_tok + pos
 
-        # HOG tokens (for gating only)
-        Hf_tok, _ = self.patch_hf(hog_fore)
-        Hc_tok, _ = self.patch_hc(hog_cond)
+        Hf_tok, _ = self.patch_hflow(hog_flow)
+        Hc_tok, _ = self.patch_hcond(hog_cond)
 
-        # cross-attn: Q=F, KV=C
-        F_tok2 = F_tok + self.attn_f(F_tok, C_tok)
-        F_tok2 = F_tok2 + self.ffn_f(F_tok2)
+        F_tok2 = F_tok + self.attn_flow(F_tok, C_tok)
+        F_tok2 = F_tok2 + self.ffn_flow(F_tok2)
 
-        # gate from HOG + time
-        g_f = torch.cat([Hc_tok, Hf_tok], dim=-1)
-        for blk in self.gate_f_blocks:
-            g_f = blk(g_f, t_emb)
-        gate_f = torch.tanh(self.gate_f_out(g_f))
-        F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_f)
+        g_flow = torch.cat([Hc_tok, Hf_tok], dim=-1)
+        for blk in self.gate_flow_blocks:
+            g_flow = blk(g_flow, t_emb)
+        gate_flow = torch.tanh(self.gate_flow_out(g_flow))
+        F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_flow)
 
-        # unpatch -> iFFT
-        Fri2 = self.unpatch_f(F_tok3, hw_p)
+        Fri2 = self.unpatch_flow(F_tok3, hw_p)
         F2c = self._to_complex(Fri2)
         F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
-        fore_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
-        return fore_out
+        flow_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
+        return flow_out
 
 
 # =========================================================
@@ -710,7 +668,7 @@ class DecoderStageSingle(nn.Module):
 
 
 # =========================================================
-# Main UNet (fore-only)
+# Main UNet (flow-only)
 # =========================================================
 class MainNet(nn.Module):
     def __init__(
@@ -733,7 +691,6 @@ class MainNet(nn.Module):
         hog_tau: float = 0.35,
         hog_mag_weight: bool = True,
         hog_eps: float = 1e-8,
-        control_resblocks_per_level: int = 1,
         control_inject_to_decoder: bool = True,
         fa_patch: int = 8,
         fa_attn_dropout: float = 0.0,
@@ -741,8 +698,7 @@ class MainNet(nn.Module):
         fa_noise_strength: float = 1.0,
         fa_gate_scale: float = 1.0,
         fa_gate_R: int = 2,
-        
-        # ✅ DBSA 新接口参数 (独立双高斯核)
+
         usa_low_gauss_ks: int = 3,
         usa_high_gauss_ks: int = 5,
         usa_low_gauss_sigma: float = 1.5,
@@ -752,7 +708,7 @@ class MainNet(nn.Module):
         super().__init__()
 
         if xt_in_ch < 1:
-            raise ValueError("xt_in_ch must be >=1.")
+            raise ValueError("xt_in_ch must be >= 1.")
         if freq_attn_depth < 0:
             raise ValueError("freq_attn_depth must be >= 0.")
         if fa_stacks < 1:
@@ -777,7 +733,6 @@ class MainNet(nn.Module):
         self.hog_eps = float(hog_eps)
         self.hog_mag_weight = bool(hog_mag_weight)
 
-        self.control_resblocks_per_level = int(control_resblocks_per_level)
         self.control_inject_to_decoder = bool(control_inject_to_decoder)
 
         self.fa_patch = int(fa_patch)
@@ -790,28 +745,28 @@ class MainNet(nn.Module):
 
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
-        # fore-only stem: 输入就是 xt_in_ch
-        self.fore_stem = nn.Conv2d(self.xt_in_ch, self.base_ch, 3, padding=1)
+        # flow-only stem
+        self.flow_stem = nn.Conv2d(self.xt_in_ch, self.base_ch, 3, padding=1)
         self.cond_stem = nn.Conv2d(self.img_in_ch, self.base_ch, 3, padding=1)
 
         self.chs = [self.base_ch * m for m in self.ch_mult]
         n_levels = len(self.chs)
 
         # encoders
-        self.fore_enc = nn.ModuleList()
+        self.flow_enc = nn.ModuleList()
         self.cond_enc = nn.ModuleList()
         for i in range(n_levels):
             in_ch = self.chs[i - 1] if i > 0 else self.base_ch
             out_ch = self.chs[i]
             down = i < (n_levels - 1)
-            self.fore_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
+            self.flow_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
             self.cond_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
 
         # main decoder (single-branch)
         self.dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
-            in_ch = (self.chs[i + 1]) if i < (n_levels - 1) else (self.chs[i])
+            in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
             self.dec.append(
@@ -830,7 +785,7 @@ class MainNet(nn.Module):
         self.cond_dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
-            in_ch = (self.chs[i + 1]) if i < (n_levels - 1) else (self.chs[i])
+            in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
             self.cond_dec.append(
@@ -845,14 +800,11 @@ class MainNet(nn.Module):
                 )
             )
 
-        # output: base_ch -> xt_in_ch
         self.out_v = nn.Conv2d(self.base_ch, self.xt_in_ch, 3, padding=1)
 
-        # freq-attn levels
         K_levels = min(self.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K_levels, n_levels))
 
-        # hog
         self.freq_hog = SOSX(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
@@ -886,25 +838,15 @@ class MainNet(nn.Module):
                 )
             return mods
 
-        # per-level couplers
         self.couple_modules = nn.ModuleDict()
         for i in sorted(self.attn_level_set):
             self.couple_modules[str(i)] = make_fa_list(self.chs[i])
 
         self.bottleneck_coupler = make_fa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
 
-        # control
-        self.ctrl_proc_levels = nn.ModuleList(
-            [
-                ControlResProc(self.chs[i], time_ch=self.time_dim, num_blocks=self.control_resblocks_per_level, dropout=self.dropout)
-                for i in range(n_levels)
-            ]
-        )
-
-        # control injection to decoder: chs -> chs
+        # decoder injection only
         self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
 
-        # ✅ 实例化全新的 DBSA (独立双高斯核版)
         self.usa_x = DBSA(
             ch=self.chs[0],
             low_gauss_ks=usa_low_gauss_ks,
@@ -924,22 +866,21 @@ class MainNet(nn.Module):
 
         t_emb = self.time_mlp(t)
 
-        # fore-only input
-        fore0 = self.fore_stem(x_t)
+        # flow-only input
+        flow0 = self.flow_stem(x_t)
         cond0 = self.cond_stem(image)
 
-        # cond encoder with proc
+        # cond encoder
         cond_skips: List[torch.Tensor] = []
         cond = cond0
-        for level, enc_c in enumerate(self.cond_enc):
+        for _, enc_c in enumerate(self.cond_enc):
             c_skip = enc_c(cond, t_emb)
-            c_skip_proc = self.ctrl_proc_levels[level](c_skip, t_emb)
-            cond_skips.append(c_skip_proc)
-            cond = enc_c.down(c_skip_proc) if enc_c.down is not None else c_skip_proc
+            cond_skips.append(c_skip)
+            cond = enc_c.down(c_skip) if enc_c.down is not None else c_skip
 
         cond_enc_l0 = cond_skips[0]
 
-        # cond decoder feats for control injection
+        # cond decoder feats for decoder injection
         c_h = cond
         n_levels = len(self.chs)
         cond_dec_feats: List[torch.Tensor] = [None] * n_levels  # type: ignore
@@ -948,64 +889,63 @@ class MainNet(nn.Module):
             level = (n_levels - 1) - cdec_idx
             cond_dec_feats[level] = c_h
 
-        # fore encoder + optional coupling
-        fore_skips: List[torch.Tensor] = []
-        fore = fore0
+        # flow encoder + optional coupling
+        flow_skips: List[torch.Tensor] = []
+        flow = flow0
 
-        for level, enc_f in enumerate(self.fore_enc):
-            f_skip = enc_f(fore, t_emb)
+        for level, enc_flow in enumerate(self.flow_enc):
+            f_skip = enc_flow(flow, t_emb)
 
-            # ✅ 在 level0 使用新定制的 DBSA
             if level == 0:
-                f_skip = self.usa_x(f_cond=cond_enc_l0, f_fore=f_skip)
+                f_skip = self.usa_x(f_cond=cond_enc_l0, f_flow=f_skip)
 
-            fore_skips.append(f_skip)
+            flow_skips.append(f_skip)
 
             f_main = f_skip
             c_main = cond_skips[level]
 
             if level in self.attn_level_set:
-                hog_f = self.freq_hog(f_main)
-                hog_c = self.freq_hog(c_main)
+                hog_flow = self.freq_hog(f_main)
+                hog_cond = self.freq_hog(c_main)
 
                 norm = self.hog_norm_levels[level]
-                hog_f = norm(torch.log1p(hog_f))
-                hog_c = norm(torch.log1p(hog_c))
+                hog_flow = norm(torch.log1p(hog_flow))
+                hog_cond = norm(torch.log1p(hog_cond))
 
                 fa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for fa in fa_list:
                     f_main = fa(
-                        fore=f_main,
+                        flow=f_main,
                         cond=c_main,
-                        hog_fore=hog_f,
-                        hog_cond=hog_c,
-                        t_emb=t_emb
+                        hog_flow=hog_flow,
+                        hog_cond=hog_cond,
+                        t_emb=t_emb,
                     )
 
-            fore = enc_f.down(f_main) if enc_f.down is not None else f_main
+            flow = enc_flow.down(f_main) if enc_flow.down is not None else f_main
 
         # bottleneck coupling
         if self.bottleneck_coupler is not None:
             cond_bot = cond_skips[-1]
 
-            hog_f = self.freq_hog(fore)
-            hog_c = self.freq_hog(cond_bot)
+            hog_flow = self.freq_hog(flow)
+            hog_cond = self.freq_hog(cond_bot)
 
-            hog_f = self.hog_norm_mid(torch.log1p(hog_f))
-            hog_c = self.hog_norm_mid(torch.log1p(hog_c))
+            hog_flow = self.hog_norm_mid(torch.log1p(hog_flow))
+            hog_cond = self.hog_norm_mid(torch.log1p(hog_cond))
 
             for fa in self.bottleneck_coupler:
-                fore = fa(
-                    fore=fore,
+                flow = fa(
+                    flow=flow,
                     cond=cond_bot,
-                    hog_fore=hog_f,
-                    hog_cond=hog_c,
-                    t_emb=t_emb
+                    hog_flow=hog_flow,
+                    hog_cond=hog_cond,
+                    t_emb=t_emb,
                 )
 
-        # main decoder (single-branch) + control injection
-        h = fore
-        for dec_idx, (dec, f_skip) in enumerate(zip(self.dec, reversed(fore_skips))):
+        # main decoder + decoder injection
+        h = flow
+        for dec_idx, (dec, f_skip) in enumerate(zip(self.dec, reversed(flow_skips))):
             h = dec(h, f_skip, t_emb)
 
             if self.control_inject_to_decoder:
@@ -1037,7 +977,6 @@ def build_model(
     hog_tau: float = 0.35,
     hog_mag_weight: bool = True,
     hog_eps: float = 1e-8,
-    control_resblocks_per_level: int = 1,
     control_inject_to_decoder: bool = True,
     fa_patch: int = 2,
     fa_attn_dropout: float = 0.0,
@@ -1045,8 +984,7 @@ def build_model(
     fa_noise_strength: float = 1.0,
     fa_gate_scale: float = 1.0,
     fa_gate_R: int = 2,
-    
-    # ✅ DBSA 独立双高斯核接口参数
+
     usa_low_gauss_ks: int = 3,
     usa_high_gauss_ks: int = 5,
     usa_low_gauss_sigma: float = 1.5,
@@ -1071,7 +1009,6 @@ def build_model(
         hog_tau=hog_tau,
         hog_mag_weight=hog_mag_weight,
         hog_eps=hog_eps,
-        control_resblocks_per_level=control_resblocks_per_level,
         control_inject_to_decoder=control_inject_to_decoder,
         fa_patch=fa_patch,
         fa_attn_dropout=fa_attn_dropout,
@@ -1079,8 +1016,6 @@ def build_model(
         fa_noise_strength=fa_noise_strength,
         fa_gate_scale=fa_gate_scale,
         fa_gate_R=fa_gate_R,
-        
-        # ✅ 传入定制的 DBSA 参数
         usa_low_gauss_ks=usa_low_gauss_ks,
         usa_high_gauss_ks=usa_high_gauss_ks,
         usa_low_gauss_sigma=usa_low_gauss_sigma,
@@ -1111,7 +1046,6 @@ if __name__ == "__main__":
         hog_tau=0.35,
         hog_mag_weight=True,
         hog_eps=1e-8,
-        control_resblocks_per_level=1,
         control_inject_to_decoder=True,
         fa_patch=8,
         fa_attn_dropout=0.0,
@@ -1119,8 +1053,6 @@ if __name__ == "__main__":
         fa_noise_strength=1.0,
         fa_gate_scale=1.0,
         fa_gate_R=2,
-        
-        # ✅ DBSA 参数测试 (默认 3 和 5)
         usa_low_gauss_ks=3,
         usa_high_gauss_ks=5,
         usa_low_gauss_sigma=1.5,
@@ -1128,14 +1060,12 @@ if __name__ == "__main__":
         usa_init_bias=-2.0,
     )
 
-    # Fake input data
     x_t = torch.randn(2, 4, 256, 256)
     img = torch.randn(2, 1, 256, 256)
     t = torch.rand(2)
 
-    # Forward pass
     v = net(x_t, img, t)
-    
+
     print("✅ Build Successfully!")
     print(f"Input x_t shape : {x_t.shape}")
     print(f"Output v shape  : {v.shape}")  # Expected: (2, 4, 256, 256)
