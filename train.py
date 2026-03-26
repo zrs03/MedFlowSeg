@@ -2,8 +2,9 @@
 # train_medflowseg.py
 # Flow-Matching Medical Segmentation (Lightning v2)
 # ✅ OneHot version (NO-BACKGROUND channels, NO SDF)
-# ✅ Foreground-position weighted loss
-# ✅ Keep original EMA / vis / resume / training logic
+# ✅ Removed class-wise weighting
+# ✅ With probability seg_prob, add seg-head loss: L_dice + beta * L_ce
+# ✅ Compatible with model returning: (v_pred, seg_logits)
 # ======================================================
 
 import argparse
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
 import matplotlib.pyplot as plt
@@ -119,6 +121,36 @@ def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
     return out
 
 
+def multiclass_dice_loss_from_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+    ignore_bg: bool = True,
+) -> torch.Tensor:
+    """
+    logits: (B,K,H,W)
+    target: (B,H,W), values in {0..K-1}
+    """
+    if logits.ndim != 4:
+        raise ValueError(f"logits must be (B,K,H,W), got {tuple(logits.shape)}")
+    if target.ndim != 3:
+        raise ValueError(f"target must be (B,H,W), got {tuple(target.shape)}")
+
+    b, k, h, w = logits.shape
+    prob = torch.softmax(logits, dim=1)  # (B,K,H,W)
+    target_1h = F.one_hot(target.long(), num_classes=k).permute(0, 3, 1, 2).float()  # (B,K,H,W)
+
+    dims = (0, 2, 3)
+    inter = (prob * target_1h).sum(dim=dims)               # (K,)
+    denom = prob.sum(dim=dims) + target_1h.sum(dim=dims)   # (K,)
+    dice = (2.0 * inter + eps) / (denom + eps)             # (K,)
+
+    if ignore_bg and k > 1:
+        dice = dice[1:]
+
+    return 1.0 - dice.mean()
+
+
 class EMA:
     """
     Exponential Moving Average for model parameters.
@@ -193,7 +225,8 @@ class MedFlowSeg(pl.LightningModule):
         thresh: float = 0.5,
         use_ema: bool = True,
         ema_decay: float = 0.9999,
-        fg_boost: float = 4.0,  # foreground-position weighting: w = 1 + fg_boost * x1
+        seg_prob: float = 0.1,   # ✅ 改为默认 0.1
+        seg_ce_beta: float = 10.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -203,8 +236,8 @@ class MedFlowSeg(pl.LightningModule):
         self.num_classes_fg = int(num_classes)
         self.num_classes_with_bg = self.num_classes_fg + 1
 
-        self.lr = lr
-        self.sample_steps = sample_steps
+        self.lr = float(lr)
+        self.sample_steps = int(sample_steps)
 
         self.vis_every = int(vis_every)
         self.vis_batches = int(max(1, vis_batches))
@@ -214,7 +247,11 @@ class MedFlowSeg(pl.LightningModule):
         self.vis_root.mkdir(parents=True, exist_ok=True)
 
         self.thresh = float(thresh)
-        self.fg_boost = float(fg_boost)
+
+        self.seg_prob = float(seg_prob)
+        self.seg_ce_beta = float(seg_ce_beta)
+        if not (0.0 <= self.seg_prob <= 1.0):
+            raise ValueError("seg_prob must be in [0,1].")
 
         self._val_vis_cache = []
 
@@ -270,7 +307,7 @@ class MedFlowSeg(pl.LightningModule):
         dt = 1.0 / self.sample_steps
         for i in range(self.sample_steps):
             t = torch.full((B,), i * dt, device=image.device)
-            v = self.model(x, image, t)
+            v, _ = self.model(x, image, t)
             x = x + v * dt
 
         return x
@@ -292,21 +329,44 @@ class MedFlowSeg(pl.LightningModule):
         x_t = (1.0 - t_) * x0 + t_ * x1
 
         v_star = x1 - x0
-        v_pred = self.model(x_t, image, t)
+        v_pred, seg_logits = self.model(x_t, image, t)
 
-        # Per-pixel regression error
-        per_pixel = (v_pred - v_star) ** 2  # (B,C,H,W)
+        # 1) Flow matching loss
+        loss_fm = F.l1_loss(v_pred, v_star)
 
-        # Foreground-position weighting:
-        # background positions -> weight 1
-        # foreground positions -> weight (1 + fg_boost)
-        pos_w = 1.0 + self.fg_boost * x1  # (B,C,H,W)
+        # 2) 🌟 核心修改：计算 Seg-head loss
+        target = onehot_to_mask_argmax_gt_no_bg(x1).long()  # (B,H,W), values in {0..C}
 
-        loss = (per_pixel * pos_w).mean()
+        bg_logit = torch.zeros(
+            B, 1, seg_logits.shape[-2], seg_logits.shape[-1],
+            device=seg_logits.device,
+            dtype=seg_logits.dtype,
+        )
+        seg_logits_with_bg = torch.cat([bg_logit, seg_logits], dim=1)  # (B,1+C,H,W)
+
+        loss_seg_ce = F.cross_entropy(seg_logits_with_bg, target)
+        loss_seg_dice = multiclass_dice_loss_from_logits(
+            seg_logits_with_bg, target, ignore_bg=True
+        )
+        
+        # 计算原始的完整分割 loss
+        raw_loss_seg = loss_seg_dice + self.seg_ce_beta * loss_seg_ce
+        
+        # 🌟 以 seg_prob 概率决定是否进行反向传播
+        # 为了防止在多卡 DDP 中报 "unused parameters" 导致死锁，使用权重乘 0 或 1，保持计算图结构
+        apply_seg_weight = 0.1 if torch.rand(1).item() < self.seg_prob else 0.0
+        loss_seg = apply_seg_weight * raw_loss_seg
+        
+        # 组合 loss
+        loss = loss_fm + loss_seg
 
         self.log("train/loss", loss, prog_bar=True)
-        self.log("train/fg_weight_mean", pos_w.mean(), prog_bar=False)
-        self.log("train/fg_weight_max", pos_w.max(), prog_bar=False)
+        self.log("train/loss_fm", loss_fm, prog_bar=False)
+        self.log("train/loss_seg_effective", loss_seg, prog_bar=False) # 最终生效的seg loss
+        self.log("train/loss_seg_raw", raw_loss_seg, prog_bar=False)   # 仅用作监控真实的seg指标
+        self.log("train/loss_seg_ce", loss_seg_ce, prog_bar=False)
+        self.log("train/loss_seg_dice", loss_seg_dice, prog_bar=False)
+        
         return loss
 
     # --------------------------------------------------
@@ -423,13 +483,9 @@ def main():
     # onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
 
-    # foreground-position weighting
-    parser.add_argument(
-        "--fg_boost",
-        type=float,
-        default=4.0,
-        help="foreground position weight multiplier; final weight = 1 + fg_boost * x1",
-    )
+    # seg-head loss
+    parser.add_argument("--seg_prob", type=float, default=1.0)  # ✅ 改为默认 0.1
+    parser.add_argument("--seg_ce_beta", type=float, default=10.0)
 
     # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA (default: EMA on)")
@@ -483,7 +539,8 @@ def main():
         thresh=args.thresh,
         use_ema=(not args.no_ema),
         ema_decay=args.ema_decay,
-        fg_boost=args.fg_boost,
+        seg_prob=args.seg_prob,
+        seg_ce_beta=args.seg_ce_beta,
     )
 
     ckpt_cb = ModelCheckpoint(
@@ -497,6 +554,7 @@ def main():
     )
 
     trainer = pl.Trainer(
+        # precision='bf16-mixed',
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
         max_epochs=args.epochs,

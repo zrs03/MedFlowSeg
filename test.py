@@ -3,28 +3,7 @@
 # Flow-Matching Medical Segmentation - Test / Inference
 # ✅ Multi-sample inference + One-vs-Rest STAPLE fusion (multi-class)
 # ✅ NO-BG ONEHOT CHANNEL, BUT WITH EXPLICIT BG IN MASK
-#
-# Assumption:
-# - onehot_gt: (B,C,H,W)  C = foreground classes only (no explicit bg channel)
-# - pred:      (B,C,H,W)  same
-#
-# Key rule:
-# - Background label is explicit in final mask:
-#     0     = background
-#     1..C  = foreground classes
-#
-# Decode:
-# - GT:   fg_bin = (onehot_gt > 0.5)
-# - Pred: fg_score = clamp(pred, 0, 1)
-#         if max fg score < thresh => background(0)
-#         else argmax fg + 1
-#
-# STAPLE:
-# - Run binary STAPLE only for FG classes (1..C) (one-vs-rest).
-# - Fuse by argmax over FG probabilities; if max prob < bg_thresh => background(0)
-#
-# ✅ EMA inference supported (ema_shadow preferred)
-# ✅ Visualization: Image + GT Mask + Pred Mask
+# ✅ NEW: Simultaneously predicts and evaluates the Direct Cond Branch 
 # ======================================================
 
 import argparse
@@ -50,55 +29,35 @@ def onehot_to_mask_pred_with_bg(
     pred: torch.Tensor,
     thresh: float = 0.5,
 ) -> torch.Tensor:
-    """
-    Pred decoding with explicit background.
-
-    pred: (B,C,H,W)  (NO bg channel; C foreground classes)
-    returns: (B,H,W) int64 in [0..C]
-      0     = background
-      1..C  = foreground classes (shifted by +1)
-    """
     if pred.dim() != 4:
         raise ValueError(f"pred must be (B,C,H,W), got {tuple(pred.shape)}")
 
-    fg_score = pred.clamp(0.0, 1.0)                     # (B,C,H,W)
-    max_fg = fg_score.max(dim=1).values                 # (B,H,W)
-    fg_idx = torch.argmax(fg_score, dim=1).to(torch.int64)  # (B,H,W) in [0..C-1]
+    fg_score = pred.clamp(0.0, 1.0)                     
+    max_fg = fg_score.max(dim=1).values                 
+    fg_idx = torch.argmax(fg_score, dim=1).to(torch.int64) 
 
-    out = torch.zeros_like(fg_idx)                      # bg = 0
+    out = torch.zeros_like(fg_idx)                      
     fg_any = max_fg >= thresh
-    out[fg_any] = fg_idx[fg_any] + 1                   # shift FG to 1..C
+    out[fg_any] = fg_idx[fg_any] + 1                   
     return out
 
 
 @torch.no_grad()
 def onehot_to_mask_gt_with_bg(onehot_gt: torch.Tensor) -> torch.Tensor:
-    """
-    GT decoding with explicit background.
-
-    onehot_gt: (B,C,H,W)  (NO bg channel; C foreground classes)
-    returns: (B,H,W) int64 in [0..C]
-      0     = background
-      1..C  = foreground classes (shifted by +1)
-    """
     if onehot_gt.dim() != 4:
         raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
-    fg_bin = (onehot_gt > 0.5).to(torch.int8)          # (B,C,H,W)
-    fg_any = (fg_bin.sum(dim=1) > 0)                   # (B,H,W)
-    fg_idx = torch.argmax(fg_bin, dim=1).to(torch.int64)  # (B,H,W) in [0..C-1]
+    fg_bin = (onehot_gt > 0.5).to(torch.int8)          
+    fg_any = (fg_bin.sum(dim=1) > 0)                   
+    fg_idx = torch.argmax(fg_bin, dim=1).to(torch.int64) 
 
-    out = torch.zeros_like(fg_idx)                     # bg = 0
-    out[fg_any] = fg_idx[fg_any] + 1                   # shift FG to 1..C
+    out = torch.zeros_like(fg_idx)                     
+    out[fg_any] = fg_idx[fg_any] + 1                   
     return out
 
 
 @torch.no_grad()
 def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) -> torch.Tensor:
-    """
-    Dice for each class INCLUDING background.
-    pred, gt: (B,H,W) int in [0..num_classes_total-1]
-    """
     dices = []
     for c in range(num_classes_total):
         p = (pred == c).float()
@@ -106,15 +65,11 @@ def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int)
         inter = (p * g).sum(dim=(1, 2))
         denom = p.sum(dim=(1, 2)) + g.sum(dim=(1, 2)) + 1e-6
         dices.append((2 * inter / denom).mean())
-    return torch.stack(dices)  # (Ctot,)
+    return torch.stack(dices)  
 
 
 @torch.no_grad()
 def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) -> torch.Tensor:
-    """
-    IoU for each class INCLUDING background.
-    pred, gt: (B,H,W) int in [0..num_classes_total-1]
-    """
     ious = []
     for c in range(num_classes_total):
         p = (pred == c).float()
@@ -122,15 +77,11 @@ def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) 
         inter = (p * g).sum(dim=(1, 2))
         union = (p + g - p * g).sum(dim=(1, 2)) + 1e-6
         ious.append((inter / union).mean())
-    return torch.stack(ious)  # (Ctot,)
+    return torch.stack(ious)  
 
 
 @torch.no_grad()
 def mean_dice_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """
-    Mean Dice over FG classes only: 1..num_classes (bg=0 excluded).
-    pred, gt: (B,H,W) in [0..num_classes]
-    """
     dices = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -143,10 +94,6 @@ def mean_dice_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes:
 
 @torch.no_grad()
 def mean_iou_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """
-    Mean IoU over FG classes only: 1..num_classes (bg=0 excluded).
-    pred, gt: (B,H,W) in [0..num_classes]
-    """
     ious = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -158,14 +105,8 @@ def mean_iou_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: 
 
 
 def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarray:
-    """
-    Mask visualization with explicit BG painted black.
-    mask: (H,W) in [0..num_classes]
-      0 = bg -> black
-      1..num_classes = foreground -> colored
-    """
     H, W = mask.shape
-    out = np.zeros((H, W, 3), dtype=np.uint8)  # bg already black
+    out = np.zeros((H, W, 3), dtype=np.uint8)  
 
     if num_classes <= 0:
         return out
@@ -179,7 +120,6 @@ def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarra
 
 # ======================================================
 # STAPLE (Binary) + OVR Multi-class Fusion
-# (FG only; BG decided by threshold)
 # ======================================================
 @torch.no_grad()
 def staple_binary(
@@ -189,19 +129,13 @@ def staple_binary(
     init_s: float = 0.90,
     init_t: float = 0.90,
 ) -> torch.Tensor:
-    """
-    Binary STAPLE via EM (simplified, stable for K>=3).
-
-    masks: (K,H,W) in {0,1}
-    returns: p_fg (H,W) in [0,1]
-    """
     if masks.dim() != 3:
         raise ValueError("masks must be (K,H,W)")
     K, H, W = masks.shape
-    m = masks.reshape(K, -1).float()  # (K,N)
+    m = masks.reshape(K, -1).float()  
     N = m.shape[1]
 
-    p = m.mean(dim=0).clamp(eps, 1 - eps)  # posterior init
+    p = m.mean(dim=0).clamp(eps, 1 - eps)  
     s = torch.full((K,), float(init_s), device=m.device)
     t = torch.full((K,), float(init_t), device=m.device)
 
@@ -243,16 +177,6 @@ def ovr_staple_fuse_fg_with_bg(
     staple_iters: int = 15,
     bg_thresh: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    OVR-STAPLE for FG classes only; BG is decided if max FG prob < bg_thresh.
-
-    masks_k: (K,B,H,W) int in [0..num_classes]
-      0=bg, 1..num_classes=fg classes
-
-    returns:
-      final_mask: (B,H,W) int in [0..num_classes]
-      probs_fg:   (B,num_classes,H,W) float  # probs for fg classes 1..num_classes
-    """
     if masks_k.dim() != 4:
         raise ValueError("masks_k must be (K,B,H,W)")
     K, B, H, W = masks_k.shape
@@ -261,19 +185,19 @@ def ovr_staple_fuse_fg_with_bg(
     probs_fg = torch.zeros((B, num_classes, H, W), device=device, dtype=torch.float32)
 
     for cid in range(1, num_classes + 1):
-        bin_k = (masks_k == cid).to(torch.float32)  # (K,B,H,W)
+        bin_k = (masks_k == cid).to(torch.float32)  
         for b in range(B):
             probs_fg[b, cid - 1] = staple_binary(bin_k[:, b], iters=staple_iters)
 
-    maxp, arg = probs_fg.max(dim=1)          # (B,H,W), arg in [0..num_classes-1]
-    final = (arg + 1).to(torch.int64)        # -> [1..num_classes]
-    final[maxp < bg_thresh] = 0              # -> background
+    maxp, arg = probs_fg.max(dim=1)          
+    final = (arg + 1).to(torch.int64)        
+    final[maxp < bg_thresh] = 0              
 
     return final, probs_fg
 
 
 # ======================================================
-# Model wrapper (same network + sampling as train)
+# Model wrapper 
 # ======================================================
 class MedFlowSegTester(nn.Module):
     def __init__(self, num_classes: int = 3, sample_steps: int = 10, freq_attn_depth: int = 1, img_in_ch: int = 1):
@@ -284,10 +208,13 @@ class MedFlowSegTester(nn.Module):
         self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth, img_in_ch=img_in_ch)
 
     @torch.no_grad()
-    def sample(self, image: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
+    # ✅ NEW: Updated return signature to include direct prediction probabilities
+    def sample(self, image: torch.Tensor, seed: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Euler integrate dx/dt = v_theta(x, image, t) from x(0)~N(0,I) to t=1.
-        returns: (B,num_classes,H,W) predicted onehot-like tensor (fg only)
+        returns:
+            flow_pred: (B,num_classes,H,W) onehot-like tensor
+            direct_pred_prob: (B,num_classes,H,W) probability map from Cond branch
         """
         B, _, H, W = image.shape
 
@@ -299,11 +226,20 @@ class MedFlowSegTester(nn.Module):
             x = torch.randn(B, self.num_classes, H, W, device=image.device)
 
         dt = 1.0 / self.sample_steps
+        direct_logits = None
+
         for i in range(self.sample_steps):
             t = torch.full((B,), i * dt, device=image.device)
-            v = self.net(x, image, t)
+            # ✅ NEW: Capture both flow velocity (v) and direct seg logits (seg_logits)
+            v, seg_logits = self.net(x, image, t)
+            
+            # Since Cond branch doesn't depend on x_t or t, we just grab the logits once
+            if i == 0:
+                direct_logits = seg_logits
+
             x = x + v * dt
-        return x
+            
+        return x, torch.sigmoid(direct_logits)
 
 
 def _strip_prefixes(state: dict) -> dict:
@@ -332,11 +268,6 @@ def load_lightning_ckpt_into_model(model: MedFlowSegTester, ckpt_path: str, use_
             print("[WARN] EMA requested but ckpt has no ema_shadow. Loaded normal weights instead.")
         else:
             print("[INFO] Loaded normal (non-EMA) weights from ckpt.")
-
-    if len(missing) > 0:
-        print("[WARN] Missing keys:", missing[:10], "..." if len(missing) > 10 else "")
-    if len(unexpected) > 0:
-        print("[WARN] Unexpected keys:", unexpected[:10], "..." if len(unexpected) > 10 else "")
 
 
 # ======================================================
@@ -386,72 +317,102 @@ def run_test(
     load_lightning_ckpt_into_model(model, ckpt_path=ckpt, use_ema=use_ema)
     model.eval()
 
-    dices_fg: List[float] = []
-    ious_fg: List[float] = []
-    per_class_dices_all = []
-    per_class_ious_all = []
+    # Tracker for Flow Prediction
+    dices_flow_fg: List[float] = []
+    ious_flow_fg: List[float] = []
+    
+    # ✅ NEW: Tracker for Direct Prediction
+    dices_direct_fg: List[float] = []
+    ious_direct_fg: List[float] = []
+
+    per_class_dices_flow_all = []
+    per_class_ious_flow_all = []
     vis_count = 0
 
-    num_classes_total = num_classes + 1  # include bg(0) + fg(1..num_classes)
+    num_classes_total = num_classes + 1  
 
     for bidx, batch in enumerate(loader):
         image, onehot_gt = batch
         image = image.to(device, non_blocking=True)
-        onehot_gt = onehot_gt.to(device, non_blocking=True).float()  # (B,num_classes,H,W) no-bg-onehot
+        onehot_gt = onehot_gt.to(device, non_blocking=True).float()  
 
-        # ---------- K samples ----------
         masks_k = []
+        direct_pred_prob = None  # ✅ NEW: Cache direct prediction per batch
 
         for k in range(staple_k):
             seed = base_seed + (bidx * 1000) + k
-            pred_k = model.sample(image) if seed is None else model.sample(image, seed=seed)  # (B,num_classes,H,W)
+            
+            # ✅ NEW: Unpack both outputs
+            if seed is None:
+                pred_k, d_prob = model.sample(image)
+            else:
+                pred_k, d_prob = model.sample(image, seed=seed)
 
-            mask_k = onehot_to_mask_pred_with_bg(pred_k, thresh=thresh)  # (B,H,W) in [0..num_classes]
+            # Direct prediction is deterministic across samples, grab it once
+            if direct_pred_prob is None:
+                direct_pred_prob = d_prob
+
+            mask_k = onehot_to_mask_pred_with_bg(pred_k, thresh=thresh)
             masks_k.append(mask_k)
 
-        masks_k = torch.stack(masks_k, dim=0)  # (K,B,H,W)
+        masks_k = torch.stack(masks_k, dim=0)  
 
-        # ---------- OVR-STAPLE over FG + BG fallback ----------
-        pred_mask, _probs_fg = ovr_staple_fuse_fg_with_bg(
+        # ---------- Predict Masks ----------
+        # 1. Flow-Matching + STAPLE
+        pred_mask_flow, _ = ovr_staple_fuse_fg_with_bg(
             masks_k=masks_k,
             num_classes=num_classes,
             staple_iters=staple_iters,
             bg_thresh=bg_thresh,
-        )  # (B,H,W) in [0..num_classes]
+        ) 
 
-        # GT mask with explicit bg
-        gt_mask = onehot_to_mask_gt_with_bg(onehot_gt)  # (B,H,W) in [0..num_classes]
+        # 2. Direct Cond Prediction (✅ NEW)
+        pred_mask_direct = onehot_to_mask_pred_with_bg(direct_pred_prob, thresh=thresh)
 
-        # Metrics (foreground-only mean)
-        dice_fg = mean_dice_foreground_only(pred_mask, gt_mask, num_classes=num_classes)
-        iou_fg = mean_iou_foreground_only(pred_mask, gt_mask, num_classes=num_classes)
-        dices_fg.append(float(dice_fg.item()))
-        ious_fg.append(float(iou_fg.item()))
+        # 3. Ground Truth Mask
+        gt_mask = onehot_to_mask_gt_with_bg(onehot_gt)  
 
-        # Per-class including bg
-        per_class_dices_all.append(per_class_dice(pred_mask, gt_mask, num_classes_total).cpu())
-        per_class_ious_all.append(per_class_iou(pred_mask, gt_mask, num_classes_total).cpu())
+        # ---------- Metrics (Flow) ----------
+        dice_flow = mean_dice_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
+        iou_flow = mean_iou_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
+        dices_flow_fg.append(float(dice_flow.item()))
+        ious_flow_fg.append(float(iou_flow.item()))
 
-        # ---------- vis ----------
+        per_class_dices_flow_all.append(per_class_dice(pred_mask_flow, gt_mask, num_classes_total).cpu())
+        per_class_ious_flow_all.append(per_class_iou(pred_mask_flow, gt_mask, num_classes_total).cpu())
+
+        # ---------- Metrics (Direct) ✅ NEW ----------
+        dice_direct = mean_dice_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
+        iou_direct = mean_iou_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
+        dices_direct_fg.append(float(dice_direct.item()))
+        ious_direct_fg.append(float(iou_direct.item()))
+
+        # ---------- Visualization (4 columns) ✅ NEW ----------
         if vis_count < max_vis:
-            img_np = image.detach().cpu().numpy()[:, 0]        # (B,H,W)
-            pred_np = pred_mask.detach().cpu().numpy()         # (B,H,W) in [0..num_classes]
-            gt_np = gt_mask.detach().cpu().numpy()             # (B,H,W) in [0..num_classes]
+            img_np = image.detach().cpu().numpy()[:, 0]        
+            gt_np = gt_mask.detach().cpu().numpy()             
+            pred_flow_np = pred_mask_flow.detach().cpu().numpy()
+            pred_dir_np = pred_mask_direct.detach().cpu().numpy() 
 
             for i in range(min(image.shape[0], max_vis - vis_count)):
-                fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+                # Expand to 4 subplots
+                fig, axs = plt.subplots(1, 4, figsize=(16, 4))
 
                 axs[0].imshow(img_np[i], cmap="gray")
                 axs[0].set_title("Image")
                 axs[0].axis("off")
 
                 axs[1].imshow(colorize_multiclass_with_bg(gt_np[i], num_classes=num_classes))
-                axs[1].set_title("GT Mask (bg=black)")
+                axs[1].set_title("GT Mask")
                 axs[1].axis("off")
 
-                axs[2].imshow(colorize_multiclass_with_bg(pred_np[i], num_classes=num_classes))
-                axs[2].set_title(f"Pred Mask (OVR-STAPLE, bg=black, K={staple_k})")
+                axs[2].imshow(colorize_multiclass_with_bg(pred_dir_np[i], num_classes=num_classes))
+                axs[2].set_title("Direct Cond Pred")
                 axs[2].axis("off")
+
+                axs[3].imshow(colorize_multiclass_with_bg(pred_flow_np[i], num_classes=num_classes))
+                axs[3].set_title(f"Flow Pred (STAPLE K={staple_k})")
+                axs[3].axis("off")
 
                 plt.tight_layout()
                 plt.savefig(out_dir / "vis" / f"sample_{vis_count:04d}.png", dpi=200)
@@ -463,21 +424,21 @@ def run_test(
         if (bidx + 1) % 10 == 0:
             print(
                 f"[{bidx+1}/{len(loader)}] "
-                f"mean Dice(FG) so far: {np.mean(dices_fg):.4f} | mean IoU(FG) so far: {np.mean(ious_fg):.4f}"
+                f"Flow Dice: {np.mean(dices_flow_fg):.4f} | "
+                f"Direct Dice: {np.mean(dices_direct_fg):.4f}" # ✅ NEW print
             )
 
-    print("\n===== TEST DONE (NO BG ONEHOT, BUT BG MASK) =====")
+    print("\n===== TEST DONE =====")
 
-    per_class_dices_all = torch.stack(per_class_dices_all)  # (N,Ctot)
-    per_class_ious_all = torch.stack(per_class_ious_all)    # (N,Ctot)
+    per_class_dices_flow_all = torch.stack(per_class_dices_flow_all)  
+    per_class_ious_flow_all = torch.stack(per_class_ious_flow_all)    
 
-    mean_dice_c = per_class_dices_all.mean(dim=0)
-    std_dice_c = per_class_dices_all.std(dim=0)
+    mean_dice_c = per_class_dices_flow_all.mean(dim=0)
+    std_dice_c = per_class_dices_flow_all.std(dim=0)
+    mean_iou_c = per_class_ious_flow_all.mean(dim=0)
+    std_iou_c = per_class_ious_flow_all.std(dim=0)
 
-    mean_iou_c = per_class_ious_all.mean(dim=0)
-    std_iou_c = per_class_ious_all.std(dim=0)
-
-    print("\n===== Per-class Results (including BG=0) =====")
+    print("\n===== Flow Prediction Per-class Results (including BG=0) =====")
     for c in range(num_classes_total):
         name = "BG" if c == 0 else f"FG{c}"
         print(
@@ -486,14 +447,17 @@ def run_test(
             f"IoU:  {mean_iou_c[c]:.4f} ± {std_iou_c[c]:.4f}"
         )
 
-    print(f"\nBatches: {len(dices_fg)}")
-    print(f"Mean Dice (FG only 1..{num_classes}): {np.mean(dices_fg):.4f} ± {np.std(dices_fg):.4f}")
-    print(f"Mean IoU  (FG only 1..{num_classes}): {np.mean(ious_fg):.4f} ± {np.std(ious_fg):.4f}")
+    print(f"\nBatches: {len(dices_flow_fg)}")
+    # ✅ NEW: Print Comparison Report
+    print(f"Mean Direct Dice (FG 1..{num_classes}): {np.mean(dices_direct_fg):.4f} ± {np.std(dices_direct_fg):.4f}")
+    print(f"Mean Flow Dice   (FG 1..{num_classes}): {np.mean(dices_flow_fg):.4f} ± {np.std(dices_flow_fg):.4f}")
+    print(f"Mean Direct IoU  (FG 1..{num_classes}): {np.mean(ious_direct_fg):.4f} ± {np.std(ious_direct_fg):.4f}")
+    print(f"Mean Flow IoU    (FG 1..{num_classes}): {np.mean(ious_flow_fg):.4f} ± {np.std(ious_flow_fg):.4f}")
     print(f"Saved vis to: {out_dir / 'vis'}")
 
 
 def main():
-    parser = argparse.ArgumentParser("MedFlowSeg Test (Multi-sample + OVR-STAPLE) - NO BG ONEHOT, BUT BG MASK")
+    parser = argparse.ArgumentParser("MedFlowSeg Test - NO BG ONEHOT, BUT BG MASK (Flow + Direct Prediction)")
 
     parser.add_argument("--ckpt", type=str, required=True, help="path to lightning .ckpt")
     parser.add_argument("--data_root", type=str, default="./dataset/ACDC/SDF/test")
@@ -504,7 +468,6 @@ def main():
     parser.add_argument("--img_in_ch", type=int, default=1)
     parser.add_argument("--freq_attn_depth", type=int, default=0)
 
-    # ✅ onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
 
     parser.add_argument("--batch_size", type=int, default=4)
@@ -512,10 +475,8 @@ def main():
 
     parser.add_argument("--max_vis", type=int, default=16)
 
-    # EMA
     parser.add_argument("--no_ema", action="store_true", help="disable EMA inference (default: EMA on)")
 
-    # STAPLE
     parser.add_argument("--staple_k", type=int, default=10, help="number of stochastic samples per image (>=3 recommended)")
     parser.add_argument("--staple_iters", type=int, default=15, help="STAPLE EM iterations")
     parser.add_argument("--bg_thresh", type=float, default=0.5, help="if max FG prob < bg_thresh => background(0)")
