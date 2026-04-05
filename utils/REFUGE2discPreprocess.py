@@ -8,7 +8,6 @@ from typing import Tuple, List, Optional, Dict
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import distance_transform_edt
 
 
 # ============================================================
@@ -18,46 +17,35 @@ def _ensure_dirs(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def minmax01_single(
-    x: np.ndarray, eps=1e-8, clip_percentiles=(1.0, 99.0)
-) -> np.ndarray:
+def normalize_rgb_to_minus1_1(x: np.ndarray) -> np.ndarray:
     """
-    Percentile-clip + min-max normalization to [-1,1].
-    x: (H,W) float
+    Normalize RGB image to [-1,1].
+    x: (H,W,3) uint8 array
+    return: (H,W,3) float32 in [-1,1]
     """
     x = x.astype(np.float32, copy=False)
-    p_lo, p_hi = clip_percentiles
-
-    lo, hi = np.percentile(x, p_lo), np.percentile(x, p_hi)
-    if hi <= lo:
-        lo, hi = float(x.min()), float(x.max())
-        if hi <= lo:
-            return np.zeros_like(x, dtype=np.float32)
-
-    x = np.clip(x, lo, hi)
-    x01 = (x - lo) / (hi - lo + eps)
-    return (x01 * 2.0 - 1.0).astype(np.float32, copy=False)
+    return (x / 255.0 * 2.0 - 1.0).astype(np.float32, copy=False)
 
 
 def resize_to_fixed_hw(
-    img2d: np.ndarray,
-    msk2d: np.ndarray,
+    img: np.ndarray,
+    msk: np.ndarray,
     out_hw: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Resize image+mask to fixed (H,W).
-    - image: bilinear (float32)
+    - image: bilinear (RGB uint8)
     - mask : nearest (uint8)
     """
     out_h, out_w = int(out_hw[0]), int(out_hw[1])
 
-    # image (float32)
-    im = Image.fromarray(img2d.astype(np.float32), mode="F")
+    # image (RGB)
+    im = Image.fromarray(img.astype(np.uint8), mode="RGB")
     im = im.resize((out_w, out_h), resample=Image.BILINEAR)
-    img_rs = np.asarray(im, dtype=np.float32)
+    img_rs = np.asarray(im, dtype=np.uint8)
 
     # mask (uint8)
-    mm = Image.fromarray(msk2d.astype(np.uint8), mode="L")
+    mm = Image.fromarray(msk.astype(np.uint8), mode="L")
     mm = mm.resize((out_w, out_h), resample=Image.NEAREST)
     msk_rs = np.asarray(mm, dtype=np.uint8)
 
@@ -65,59 +53,22 @@ def resize_to_fixed_hw(
 
 
 # ============================================================
-# Mask -> onehot (YOUR coding: 0=cup, 128=disc, 255=bg)
-# disc-only => [bg, disc]
+# Mask -> single channel (disc only, no background)
 # ============================================================
 def mask_to_onehot_disc(mask2d: np.ndarray, disc_value: int = 128) -> np.ndarray:
     m = mask2d.astype(np.uint8, copy=False)
-    disc = (m == np.uint8(disc_value)).astype(np.uint8)
-    bg = (disc == 0).astype(np.uint8)
-    return np.stack([bg, disc], axis=0)  # (2,H,W)
-
-
-# ============================================================
-# Onehot -> SDF (per channel)
-# ============================================================
-def onehot_to_sdf_per_channel(
-    onehot: np.ndarray,
-    clip: float = 10.0,
-    normalize: bool = True,
-    eps: float = 1e-8,
-) -> np.ndarray:
-    if onehot.ndim != 3:
-        raise ValueError(f"Expected (C,H,W), got {onehot.shape}")
-    if normalize and clip <= 0:
-        raise ValueError("clip must be > 0 when normalize=True")
-
-    C, H, W = onehot.shape
-    sdf = np.zeros((C, H, W), dtype=np.float32)
-
-    for c in range(C):
-        mask = onehot[c].astype(bool)
-        if mask.any():
-            dist_in = distance_transform_edt(mask)
-            dist_out = distance_transform_edt(~mask)
-            sdf_c = dist_out - dist_in
-        else:
-            # no pixels for this class: fill with +clip (after normalize -> +1)
-            sdf_c = np.full((H, W), fill_value=clip, dtype=np.float32)
-
-        sdf_c = np.clip(sdf_c, -clip, clip).astype(np.float32)
-        if normalize:
-            sdf_c = sdf_c / (float(clip) + eps)
-
-        sdf[c] = sdf_c
-
-    return sdf
+    disc = (m != np.uint8(255)).astype(np.uint8)
+    # 直接扩展维度，返回单通道前景，形状为 (1, H, W)
+    return np.expand_dims(disc, axis=0)
 
 
 # ============================================================
 # IO
 # ============================================================
-def read_image_gray_float(img_path: Path) -> np.ndarray:
+def read_image_rgb_uint8(img_path: Path) -> np.ndarray:
     with Image.open(img_path) as im:
-        im = im.convert("L")
-        return np.asarray(im, dtype=np.float32)
+        im = im.convert("RGB")
+        return np.asarray(im, dtype=np.uint8)
 
 
 def read_mask_uint8(mask_path: Path) -> np.ndarray:
@@ -236,7 +187,7 @@ def save_split_json(out_path: Path, seed: int, train: List[str], val: List[str],
 
 
 # ============================================================
-# Processing (NEW: resize full image to 256x256; disc-only mask)
+# Processing
 # ============================================================
 def process_one_sample(
     sample_id: str,
@@ -244,10 +195,6 @@ def process_one_sample(
     mask_path: Path,
     out_dir: Path,
     size: int,               # final output size, e.g. 256
-    p_lo: float,
-    p_hi: float,
-    sdf_clip: float,
-    sdf_normalize: bool,
     save_png_mask: bool,
     verbose: bool,
     disc_value: int = 128,
@@ -257,26 +204,25 @@ def process_one_sample(
             print(f"[Skip] missing pair: {img_path} / {mask_path}")
         return False
 
-    img = read_image_gray_float(img_path)   # (H,W) float32
+    img = read_image_rgb_uint8(img_path)    # (H,W,3) uint8
     msk = read_mask_uint8(mask_path)        # (H,W) uint8
 
-    # keep only {0,128,255}（保险清洗）
+    # keep only {0,128,255}
     msk = np.where(msk == 0, 0, np.where(msk == disc_value, disc_value, 255)).astype(np.uint8)
 
     # resize full image+mask to size x size
     img_rs, msk_rs = resize_to_fixed_hw(img, msk, out_hw=(int(size), int(size)))
 
-    # normalize image [-1,1]
-    img_norm = minmax01_single(img_rs, clip_percentiles=(p_lo, p_hi))
+    # RGB normalize to [-1,1] and transpose to (3,H,W)
+    img_norm = normalize_rgb_to_minus1_1(img_rs)     # (H,W,3) float32
+    img_norm = np.transpose(img_norm, (2, 0, 1))     # -> (3,H,W)
 
-    # disc-only onehot + sdf
-    onehot = mask_to_onehot_disc(msk_rs, disc_value=disc_value).astype(np.uint8)  # (2,H,W)
-    sdf = onehot_to_sdf_per_channel(onehot, clip=sdf_clip, normalize=sdf_normalize).astype(np.float32)
+    # disc-only onehot (1,H,W)
+    onehot = mask_to_onehot_disc(msk_rs, disc_value=disc_value).astype(np.uint8)
 
     _ensure_dirs(out_dir)
     np.save(out_dir / "img.npy", img_norm.astype(np.float32))
     np.save(out_dir / "onehot.npy", onehot)
-    np.save(out_dir / "sdf.npy", sdf)
 
     if save_png_mask:
         disc_vis = (msk_rs == disc_value).astype(np.uint8) * 255
@@ -292,10 +238,6 @@ def run(
     dataset_root: Path,
     out_root: Path,
     size: int,
-    p_lo: float,
-    p_hi: float,
-    sdf_clip: float,
-    sdf_normalize: bool,
     save_png_mask: bool,
     seed: int,
     split_json: Optional[Path],
@@ -349,10 +291,6 @@ def run(
                     mask_path=mask_path,
                     out_dir=out_dir,
                     size=size,
-                    p_lo=p_lo,
-                    p_hi=p_hi,
-                    sdf_clip=sdf_clip,
-                    sdf_normalize=sdf_normalize,
                     save_png_mask=save_png_mask,
                     verbose=verbose,
                     disc_value=128,
@@ -374,15 +312,9 @@ def run(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_root", type=str, default="./REFUGE2dataset")
-    ap.add_argument("--out_root", type=str, default="./dataset/REFUGE2_disc/SDF")
+    ap.add_argument("--out_root", type=str, default="./dataset/REFUGE2_disc/ONEHOT")
 
     ap.add_argument("--size", type=int, default=256, help="整图 resize 输出尺寸（默认256）")
-
-    ap.add_argument("--p_lo", type=float, default=1.0)
-    ap.add_argument("--p_hi", type=float, default=99.0)
-    ap.add_argument("--clip", type=float, default=10.0)
-    ap.add_argument("--sdf_no_norm", action="store_true")
-
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--split_json", type=str, default=None)
 
@@ -394,10 +326,6 @@ def main():
         dataset_root=Path(args.dataset_root),
         out_root=Path(args.out_root),
         size=int(args.size),
-        p_lo=float(args.p_lo),
-        p_hi=float(args.p_hi),
-        sdf_clip=float(args.clip),
-        sdf_normalize=(not args.sdf_no_norm),
         save_png_mask=bool(args.save_png_mask),
         seed=int(args.seed),
         split_json=Path(args.split_json) if args.split_json else None,
