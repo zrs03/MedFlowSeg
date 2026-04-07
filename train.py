@@ -5,6 +5,7 @@
 # ✅ Removed class-wise weighting
 # ✅ With probability seg_prob, add seg-head loss: L_dice + beta * L_ce
 # ✅ Compatible with model returning: (v_pred, seg_logits)
+# ✅ ALIGNED VISUALIZATION: Explicit --rgb_vis, --vis_alpha, and color logic
 # ======================================================
 
 import argparse
@@ -30,22 +31,6 @@ from utils.dataset import FolderDataset
 def onehot_to_mask_argmax_pred_no_bg(
     pred: torch.Tensor, thresh: float = 0.5
 ) -> torch.Tensor:
-    """
-    Pred decoding for NO-BG onehot-style outputs.
-
-    pred: (B, C, H, W), C=num_classes_fg, no background channel stored.
-    Values are treated as foreground scores.
-
-    Steps:
-      - clamp pred to [0,1]
-      - background score = 1 if max foreground score < thresh else 0
-      - argmax over [bg_score, fg_scores] -> labels in {0..C}
-
-    Returns:
-      (B,H,W), label map in {0..C}
-        0 -> background
-        1..C -> foreground classes
-    """
     if pred.ndim != 4:
         raise ValueError(f"pred must be (B,C,H,W), got {tuple(pred.shape)}")
 
@@ -58,15 +43,6 @@ def onehot_to_mask_argmax_pred_no_bg(
 
 
 def onehot_to_mask_argmax_gt_no_bg(onehot_gt: torch.Tensor) -> torch.Tensor:
-    """
-    GT decoding for NO-BG onehot channels.
-
-    onehot_gt: (B, C, H, W), C=num_classes_fg, values in [0,1]
-    Background is defined where all foreground channels are 0.
-
-    Returns:
-      (B,H,W), label map in {0..C}
-    """
     if onehot_gt.ndim != 4:
         raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
@@ -78,12 +54,6 @@ def onehot_to_mask_argmax_gt_no_bg(onehot_gt: torch.Tensor) -> torch.Tensor:
 
 
 def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes_with_bg: int) -> torch.Tensor:
-    """
-    Mean Dice over foreground classes only (1..num_classes_with_bg-1),
-    skip classes where GT is empty.
-
-    pred, gt: (B,H,W) with labels in {0..num_classes_with_bg-1}
-    """
     dices = []
     for c in range(1, num_classes_with_bg):
         g = (gt == c).float()
@@ -100,23 +70,46 @@ def mean_dice_foreground(pred: torch.Tensor, gt: torch.Tensor, num_classes_with_
     return torch.stack(dices).mean()
 
 
-def colorize_multiclass(mask: np.ndarray, num_classes: int) -> np.ndarray:
-    """
-    通用多类别可视化
-    - background (0) 为黑色
-    - 支持任意 num_classes
-    - 自动生成不同颜色
-    """
+def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarray:
     H, W = mask.shape
-    out = np.zeros((H, W, 3), dtype=np.uint8)
+    out = np.zeros((H, W, 3), dtype=np.uint8)  
 
-    if num_classes <= 1:
+    if num_classes <= 0:
         return out
 
-    for c in range(1, num_classes):
-        hue = c / num_classes
-        color = np.array(plt.cm.hsv(hue)[:3]) * 255
-        out[mask == c] = color.astype(np.uint8)
+    for cid in range(1, num_classes + 1):
+        hue = cid / (num_classes + 1)
+        color = (np.array(plt.cm.hsv(hue)[:3]) * 255).astype(np.uint8)
+        out[mask == cid] = color
+    return out
+
+
+def overlay_mask_on_image(img_raw: np.ndarray, mask: np.ndarray, num_classes: int, alpha: float = 0.5) -> np.ndarray:
+    """
+    将 mask 按透明度 alpha 叠加到原图上。
+    自动适配单通道灰度图 (H, W) 和 三通道 RGB 图 (H, W, 3)。
+    """
+    img_min, img_max = img_raw.min(), img_raw.max()
+    if img_max > img_min:
+        img_norm = (img_raw - img_min) / (img_max - img_min) * 255.0
+    else:
+        img_norm = np.clip(img_raw * 255.0, 0, 255)
+        
+    if img_raw.ndim == 2:
+        img_base = np.stack((img_norm,) * 3, axis=-1).astype(np.uint8)
+    elif img_raw.ndim == 3 and img_raw.shape[-1] == 3:
+        img_base = img_norm.astype(np.uint8)
+    else:
+        raise ValueError(f"Unsupported image shape for overlay: {img_raw.shape}")
+
+    colored_mask = colorize_multiclass_with_bg(mask, num_classes)
+
+    out = img_base.copy()
+    fg_mask = mask > 0
+    
+    out[fg_mask] = (
+        img_base[fg_mask] * (1.0 - alpha) + colored_mask[fg_mask] * alpha
+    ).astype(np.uint8)
 
     return out
 
@@ -127,10 +120,6 @@ def multiclass_dice_loss_from_logits(
     eps: float = 1e-6,
     ignore_bg: bool = True,
 ) -> torch.Tensor:
-    """
-    logits: (B,K,H,W)
-    target: (B,H,W), values in {0..K-1}
-    """
     if logits.ndim != 4:
         raise ValueError(f"logits must be (B,K,H,W), got {tuple(logits.shape)}")
     if target.ndim != 3:
@@ -152,20 +141,6 @@ def multiclass_dice_loss_from_logits(
 
 
 class EMA:
-    """
-    Exponential Moving Average for model parameters.
-
-    Train:
-        optimizer.step()
-        ema.update(model)
-
-    Val with EMA weights:
-        ema.store(model)
-        ema.copy_to(model)
-        ... val ...
-        ema.restore(model)
-    """
-
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         if not (0.0 < decay < 1.0):
             raise ValueError("EMA decay must be in (0, 1).")
@@ -216,7 +191,7 @@ class MedFlowSeg(pl.LightningModule):
     def __init__(
         self,
         img_in_ch: int = 1,
-        num_classes: int = 3,  # foreground channels count, no bg stored
+        num_classes: int = 3,
         lr: float = 1e-4,
         sample_steps: int = 10,
         vis_every: int = 5,
@@ -225,8 +200,10 @@ class MedFlowSeg(pl.LightningModule):
         thresh: float = 0.5,
         use_ema: bool = True,
         ema_decay: float = 0.9999,
-        seg_prob: float = 0.1,   # ✅ 改为默认 0.1
+        seg_prob: float = 0.1,
         seg_ce_beta: float = 10.0,
+        rgb_vis: bool = False,      # ✅ 引入 rgb_vis 控制
+        vis_alpha: float = 0.8,     # ✅ 引入不透明度控制
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -252,6 +229,11 @@ class MedFlowSeg(pl.LightningModule):
         self.seg_ce_beta = float(seg_ce_beta)
         if not (0.0 <= self.seg_prob <= 1.0):
             raise ValueError("seg_prob must be in [0,1].")
+            
+        self.rgb_vis = rgb_vis
+        self.vis_alpha = float(vis_alpha)
+        if not (0.0 <= self.vis_alpha <= 1.0):
+            raise ValueError("vis_alpha must be between 0.0 and 1.0")
 
         self._val_vis_cache = []
 
@@ -262,9 +244,6 @@ class MedFlowSeg(pl.LightningModule):
         self._ema_shadow_from_ckpt = None
         self._ema_decay_from_ckpt = None
 
-    # -----------------------------
-    # EMA hooks
-    # -----------------------------
     def on_fit_start(self):
         if self.use_ema and self.ema is None:
             self.ema = EMA(self.model, decay=self.ema_decay)
@@ -292,15 +271,8 @@ class MedFlowSeg(pl.LightningModule):
         self._ema_shadow_from_ckpt = checkpoint.get("ema_shadow", None)
         self._ema_decay_from_ckpt = checkpoint.get("ema_decay", None)
 
-    # --------------------------------------------------
-    # Flow Matching sampling
-    # --------------------------------------------------
     @torch.no_grad()
     def sample(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Start from x(0) ~ N(0, I) and integrate to t=1.
-        Output pred has shape (B, C, H, W) where C=num_classes_fg (no bg stored).
-        """
         B, _, H, W = image.shape
         x = torch.randn(B, self.num_classes_fg, H, W, device=image.device)
 
@@ -312,11 +284,8 @@ class MedFlowSeg(pl.LightningModule):
 
         return x
 
-    # --------------------------------------------------
-    # Training
-    # --------------------------------------------------
     def training_step(self, batch, batch_idx):
-        image, x1 = batch  # x1: onehot_gt, (B,C,H,W)
+        image, x1 = batch
         x1 = x1.float()
 
         B = image.shape[0]
@@ -331,49 +300,40 @@ class MedFlowSeg(pl.LightningModule):
         v_star = x1 - x0
         v_pred, seg_logits = self.model(x_t, image, t)
 
-        # 1) Flow matching loss
         loss_fm = F.l1_loss(v_pred, v_star)
 
-        # 2) 🌟 核心修改：计算 Seg-head loss
-        target = onehot_to_mask_argmax_gt_no_bg(x1).long()  # (B,H,W), values in {0..C}
+        target = onehot_to_mask_argmax_gt_no_bg(x1).long()
 
         bg_logit = torch.zeros(
             B, 1, seg_logits.shape[-2], seg_logits.shape[-1],
             device=seg_logits.device,
             dtype=seg_logits.dtype,
         )
-        seg_logits_with_bg = torch.cat([bg_logit, seg_logits], dim=1)  # (B,1+C,H,W)
+        seg_logits_with_bg = torch.cat([bg_logit, seg_logits], dim=1)
 
         loss_seg_ce = F.cross_entropy(seg_logits_with_bg, target)
         loss_seg_dice = multiclass_dice_loss_from_logits(
             seg_logits_with_bg, target, ignore_bg=True
         )
         
-        # 计算原始的完整分割 loss
         raw_loss_seg = loss_seg_dice + self.seg_ce_beta * loss_seg_ce
         
-        # 🌟 以 seg_prob 概率决定是否进行反向传播
-        # 为了防止在多卡 DDP 中报 "unused parameters" 导致死锁，使用权重乘 0 或 1，保持计算图结构
         apply_seg_weight = 0.1 if torch.rand(1).item() < self.seg_prob else 0.0
         loss_seg = apply_seg_weight * raw_loss_seg
         
-        # 组合 loss
         loss = loss_fm + loss_seg
 
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/loss_fm", loss_fm, prog_bar=False)
-        self.log("train/loss_seg_effective", loss_seg, prog_bar=False) # 最终生效的seg loss
-        self.log("train/loss_seg_raw", raw_loss_seg, prog_bar=False)   # 仅用作监控真实的seg指标
+        self.log("train/loss_seg_effective", loss_seg, prog_bar=False)
+        self.log("train/loss_seg_raw", raw_loss_seg, prog_bar=False)
         self.log("train/loss_seg_ce", loss_seg_ce, prog_bar=False)
         self.log("train/loss_seg_dice", loss_seg_dice, prog_bar=False)
         
         return loss
 
-    # --------------------------------------------------
-    # Validation
-    # --------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        image, onehot_gt = batch  # onehot_gt: (B,C,H,W), C=num_classes_fg (no bg)
+        image, onehot_gt = batch
         onehot_gt = onehot_gt.float()
 
         pred = self.sample(image)
@@ -404,9 +364,6 @@ class MedFlowSeg(pl.LightningModule):
                 }
             )
 
-    # --------------------------------------------------
-    # End of validation epoch
-    # --------------------------------------------------
     def on_validation_epoch_end(self):
         epoch = self.current_epoch
 
@@ -418,28 +375,55 @@ class MedFlowSeg(pl.LightningModule):
                 save_dir.mkdir(parents=True, exist_ok=True)
 
                 for cache in self._val_vis_cache:
-                    img = cache["image"][:, 0].numpy()
+                    img_tensor = cache["image"]  # (B, C, H, W)
                     pred = cache["pred"].numpy()
                     gt = cache["gt"].numpy()
                     bidx = cache.get("batch_idx", 0)
+                    
+                    # ✅ 同步测试脚本逻辑：显式控制 rgb_vis
+                    is_rgb = self.rgb_vis and (img_tensor.shape[1] >= 3)
+                    
+                    if is_rgb:
+                        img = img_tensor[:, :3].permute(0, 2, 3, 1).numpy()
+                    else:
+                        img = img_tensor[:, 0].numpy()
 
                     for i in range(min(4, img.shape[0])):
-                        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+                        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
-                        axs[0].imshow(img[i], cmap="gray")
-                        axs[0].set_title("Image")
+                        img_i = img[i]
+                        gt_i = gt[i]
+                        pred_i = pred[i]
+
+                        # ✅ 传递 num_classes_fg（前景类数量）且使用配置的透明度 vis_alpha
+                        overlay_gt = overlay_mask_on_image(img_i, gt_i, self.num_classes_fg, alpha=self.vis_alpha)
+                        overlay_pred = overlay_mask_on_image(img_i, pred_i, self.num_classes_fg, alpha=self.vis_alpha)
+
+                        # 原图显示处理
+                        if is_rgb:
+                            img_disp = img_i.copy()
+                            img_min, img_max = img_disp.min(), img_disp.max()
+                            if img_max > img_min:
+                                img_disp = (img_disp - img_min) / (img_max - img_min)
+                            else:
+                                img_disp = np.clip(img_disp, 0, 1)
+                            axs[0].imshow(img_disp)
+                        else:
+                            axs[0].imshow(img_i, cmap="gray")
+                            
+                        axs[0].set_title("Raw Image" + (" (RGB)" if is_rgb else " (Gray)"))
                         axs[0].axis("off")
 
-                        axs[1].imshow(colorize_multiclass(gt[i], self.num_classes_with_bg))
-                        axs[1].set_title("GT")
+                        axs[1].imshow(overlay_gt)
+                        axs[1].set_title("Image + GT Mask")
                         axs[1].axis("off")
 
-                        axs[2].imshow(colorize_multiclass(pred[i], self.num_classes_with_bg))
-                        axs[2].set_title("Pred")
+                        axs[2].imshow(overlay_pred)
+                        axs[2].set_title("Image + Pred Mask")
                         axs[2].axis("off")
 
                         plt.tight_layout()
-                        plt.savefig(save_dir / f"batch{bidx:03d}_sample{i}.png")
+                        plt.savefig(save_dir / f"batch{bidx:03d}_sample{i}.png", dpi=200) # 统一 dpi
                         plt.close()
 
             self._val_vis_cache.clear()
@@ -447,9 +431,6 @@ class MedFlowSeg(pl.LightningModule):
         if self.use_ema and self.ema is not None:
             self.ema.restore(self.model)
 
-    # --------------------------------------------------
-    # Optimizer
-    # --------------------------------------------------
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
@@ -478,13 +459,17 @@ def main():
     # -------- Output --------
     parser.add_argument("--output_root", type=str, default="./Outputs/MedFlowSeg-ACDC")
     parser.add_argument("--vis_every", type=int, default=10)
-    parser.add_argument("--vis_batches", type=int, default=2, help="visualize first N validation batches")
+    parser.add_argument("--vis_batches", type=int, default=2)
+
+    # ✅ 新增不透明度和RGB控制参数，对齐测试代码
+    parser.add_argument("--rgb_vis", action="store_true", help="enable RGB visualization")
+    parser.add_argument("--vis_alpha", type=float, default=0.8, help="Opacity for segmentation mask overlay (0.0 to 1.0)")
 
     # onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
 
     # seg-head loss
-    parser.add_argument("--seg_prob", type=float, default=1.0)  # ✅ 改为默认 0.1
+    parser.add_argument("--seg_prob", type=float, default=1.0)
     parser.add_argument("--seg_ce_beta", type=float, default=10.0)
 
     # EMA
@@ -541,6 +526,8 @@ def main():
         ema_decay=args.ema_decay,
         seg_prob=args.seg_prob,
         seg_ce_beta=args.seg_ce_beta,
+        rgb_vis=args.rgb_vis,       
+        vis_alpha=args.vis_alpha,   
     )
 
     ckpt_cb = ModelCheckpoint(
@@ -554,7 +541,6 @@ def main():
     )
 
     trainer = pl.Trainer(
-        # precision='bf16-mixed',
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else None,
         max_epochs=args.epochs,
