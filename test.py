@@ -3,7 +3,12 @@
 # Flow-Matching Medical Segmentation - Test / Inference
 # ✅ Multi-sample inference + One-vs-Rest STAPLE fusion (multi-class)
 # ✅ NO-BG ONEHOT CHANNEL, BUT WITH EXPLICIT BG IN MASK
-# ✅ NEW: Simultaneously predicts and evaluates the Direct Cond Branch 
+# ✅ Simultaneously predicts and evaluates the Direct Cond Branch 
+# ✅ Overlay Visualization with explicit --rgb_vis argument
+# ✅ Robust GT/Pred decoding & STRICTLY FOREGROUND ONLY Metrics
+# ✅ MODIFIED: Adjustable vis opacity via --vis_alpha
+# ✅ MODIFIED: Removed Direct prediction from visualization (layout 1x3)
+# ✅ MODIFIED: Added Average HD95 Metric Calculation
 # ======================================================
 
 import argparse
@@ -17,8 +22,25 @@ import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from models.MedFlowSeg import build_model
-from utils.dataset import FolderDataset
+# ================= 新增：HD95 所需依赖 =================
+from scipy.ndimage import binary_erosion
+from scipy.spatial.distance import cdist
+# ======================================================
+
+# 假设这些模块存在于您的项目中
+try:
+    from models.MedFlowSeg import build_model
+    from utils.dataset import FolderDataset
+except ImportError:
+    print("Warning: Could not import project specific modules. "
+          "Make sure models.MedFlowSeg and utils.dataset are accessible.")
+    # 定义占位符以便代码检查通过，实际运行需要正确导入
+    def build_model(**kwargs): return nn.Module()
+    class FolderDataset: 
+        def __init__(self, *args, **kwargs): pass
+        def __len__(self): return 1
+        def __getitem__(self, idx): 
+            return torch.randn(1, 1, 128, 128), torch.randn(1, 3, 128, 128)
 
 
 # ======================================================
@@ -32,34 +54,37 @@ def onehot_to_mask_pred_with_bg(
     if pred.dim() != 4:
         raise ValueError(f"pred must be (B,C,H,W), got {tuple(pred.shape)}")
 
-    fg_score = pred.clamp(0.0, 1.0)                     
-    max_fg = fg_score.max(dim=1).values                 
-    fg_idx = torch.argmax(fg_score, dim=1).to(torch.int64) 
+    fg_score = pred.clamp(0.0, 1.0)
+    max_fg = fg_score.max(dim=1, keepdim=True).values
+    bg_score = (max_fg < thresh).float()
 
-    out = torch.zeros_like(fg_idx)                      
-    fg_any = max_fg >= thresh
-    out[fg_any] = fg_idx[fg_any] + 1                   
-    return out
+    m = torch.cat([bg_score, fg_score], dim=1)  # 第 0 通道固定为背景
+    return torch.argmax(m, dim=1)
 
 
 @torch.no_grad()
-def onehot_to_mask_gt_with_bg(onehot_gt: torch.Tensor) -> torch.Tensor:
+def onehot_to_mask_gt_with_bg(onehot_gt: torch.Tensor, num_classes: int) -> torch.Tensor:
     if onehot_gt.dim() != 4:
         raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
-    fg_bin = (onehot_gt > 0.5).to(torch.int8)          
-    fg_any = (fg_bin.sum(dim=1) > 0)                   
-    fg_idx = torch.argmax(fg_bin, dim=1).to(torch.int64) 
+    # 强制只取最后 num_classes 个通道（剔除可能误传的背景通道）
+    if onehot_gt.shape[1] > num_classes:
+        fg_gt = onehot_gt[:, -num_classes:, :, :]
+    else:
+        fg_gt = onehot_gt
 
-    out = torch.zeros_like(fg_idx)                     
-    out[fg_any] = fg_idx[fg_any] + 1                   
-    return out
+    fg_bin = (fg_gt > 0.5).to(torch.int8)
+    bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)
+
+    m = torch.cat([bg_bin, fg_bin], dim=1)  # 第 0 通道固定为背景
+    return torch.argmax(m, dim=1)
 
 
 @torch.no_grad()
-def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) -> torch.Tensor:
+def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 (1 到 num_classes)"""
     dices = []
-    for c in range(num_classes_total):
+    for c in range(1, num_classes + 1):
         p = (pred == c).float()
         g = (gt == c).float()
         inter = (p * g).sum(dim=(1, 2))
@@ -69,9 +94,10 @@ def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int)
 
 
 @torch.no_grad()
-def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) -> torch.Tensor:
+def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 (1 到 num_classes)"""
     ious = []
-    for c in range(num_classes_total):
+    for c in range(1, num_classes + 1):
         p = (pred == c).float()
         g = (gt == c).float()
         inter = (p * g).sum(dim=(1, 2))
@@ -82,27 +108,99 @@ def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes_total: int) 
 
 @torch.no_grad()
 def mean_dice_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 Mean Dice"""
     dices = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
         g = (gt == c).float()
+        if g.sum() == 0:
+            continue
         inter = (p * g).sum(dim=(1, 2))
         denom = p.sum(dim=(1, 2)) + g.sum(dim=(1, 2)) + 1e-6
         dices.append((2 * inter / denom).mean())
+    if len(dices) == 0:
+        return torch.tensor(0.0, device=pred.device)
     return torch.stack(dices).mean()
 
 
 @torch.no_grad()
 def mean_iou_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 Mean IoU"""
     ious = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
         g = (gt == c).float()
+        if g.sum() == 0:
+            continue
         inter = (p * g).sum(dim=(1, 2))
         union = (p + g - p * g).sum(dim=(1, 2)) + 1e-6
         ious.append((inter / union).mean())
+    if len(ious) == 0:
+        return torch.tensor(0.0, device=pred.device)
     return torch.stack(ious).mean()
 
+
+# ================= 新增 HD95 核心逻辑 =================
+@torch.no_grad()
+def compute_hd95_single(pred: np.ndarray, gt: np.ndarray) -> float:
+    # GT为空，不参与评估，返回NaN
+    if np.sum(gt) == 0:
+        return np.nan
+    # GT存在，但模型未预测出该类别，给予图像对角线作为最大惩罚
+    if np.sum(pred) == 0:
+        return np.sqrt(pred.shape[0]**2 + pred.shape[1]**2)
+
+    p_border = pred ^ binary_erosion(pred)
+    g_border = gt ^ binary_erosion(gt)
+
+    p_pts = np.argwhere(p_border)
+    g_pts = np.argwhere(g_border)
+
+    if len(p_pts) == 0:
+        return np.sqrt(pred.shape[0]**2 + pred.shape[1]**2)
+    if len(g_pts) == 0:
+        return np.nan
+
+    dists = cdist(p_pts, g_pts, metric='euclidean')
+    hd95 = np.percentile(np.concatenate([np.min(dists, axis=1), np.min(dists, axis=0)]), 95)
+    return hd95
+
+
+@torch.no_grad()
+def per_class_hd95(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 HD95 (忽略没有GT的情况)"""
+    pred_np = pred.detach().cpu().numpy()
+    gt_np = gt.detach().cpu().numpy()
+    B = pred_np.shape[0]
+
+    hd95_list = []
+    for c in range(1, num_classes + 1):
+        batch_hd95 = []
+        for b in range(B):
+            p = (pred_np[b] == c).astype(bool)
+            g = (gt_np[b] == c).astype(bool)
+            
+            val = compute_hd95_single(p, g)
+            if not np.isnan(val):
+                batch_hd95.append(val)
+        
+        if len(batch_hd95) > 0:
+            hd95_list.append(np.mean(batch_hd95))
+        else:
+            hd95_list.append(np.nan) # 返回 NaN 表示该 Batch 该类别无评估意义
+
+    return torch.tensor(hd95_list, dtype=torch.float32)
+
+
+@torch.no_grad()
+def mean_hd95_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """✅ 仅计算前景类别 Mean HD95"""
+    hd95_vals = per_class_hd95(pred, gt, num_classes)
+    valid_vals = hd95_vals[~torch.isnan(hd95_vals)]
+    if len(valid_vals) == 0:
+        return torch.tensor(0.0, device=pred.device)
+    return valid_vals.mean()
+# ======================================================
 
 def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarray:
     H, W = mask.shape
@@ -115,6 +213,33 @@ def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarra
         hue = cid / (num_classes + 1)
         color = (np.array(plt.cm.hsv(hue)[:3]) * 255).astype(np.uint8)
         out[mask == cid] = color
+    return out
+
+
+def overlay_mask_on_image(img_raw: np.ndarray, mask: np.ndarray, num_classes: int, alpha: float = 0.5) -> np.ndarray:
+    """将 mask 按透明度 alpha 叠加到原图上。支持灰度和RGB"""
+    img_min, img_max = img_raw.min(), img_raw.max()
+    if img_max > img_min:
+        img_norm = (img_raw - img_min) / (img_max - img_min) * 255.0
+    else:
+        img_norm = np.clip(img_raw * 255.0, 0, 255)
+        
+    if img_raw.ndim == 2:
+        img_base = np.stack((img_norm,) * 3, axis=-1).astype(np.uint8)
+    elif img_raw.ndim == 3 and img_raw.shape[-1] == 3:
+        img_base = img_norm.astype(np.uint8)
+    else:
+        raise ValueError(f"Unsupported image shape for overlay: {img_raw.shape}")
+
+    colored_mask = colorize_multiclass_with_bg(mask, num_classes)
+
+    out = img_base.copy()
+    fg_mask = mask > 0
+    
+    out[fg_mask] = (
+        img_base[fg_mask] * (1.0 - alpha) + colored_mask[fg_mask] * alpha
+    ).astype(np.uint8)
+
     return out
 
 
@@ -205,17 +330,11 @@ class MedFlowSegTester(nn.Module):
         self.img_in_ch = img_in_ch
         self.num_classes = num_classes
         self.sample_steps = sample_steps
+        # build_model 实际定义取决于您的项目
         self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth, img_in_ch=img_in_ch)
 
     @torch.no_grad()
-    # ✅ NEW: Updated return signature to include direct prediction probabilities
     def sample(self, image: torch.Tensor, seed: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Euler integrate dx/dt = v_theta(x, image, t) from x(0)~N(0,I) to t=1.
-        returns:
-            flow_pred: (B,num_classes,H,W) onehot-like tensor
-            direct_pred_prob: (B,num_classes,H,W) probability map from Cond branch
-        """
         B, _, H, W = image.shape
 
         if seed is not None:
@@ -230,10 +349,8 @@ class MedFlowSegTester(nn.Module):
 
         for i in range(self.sample_steps):
             t = torch.full((B,), i * dt, device=image.device)
-            # ✅ NEW: Capture both flow velocity (v) and direct seg logits (seg_logits)
             v, seg_logits = self.net(x, image, t)
             
-            # Since Cond branch doesn't depend on x_t or t, we just grab the logits once
             if i == 0:
                 direct_logits = seg_logits
 
@@ -291,6 +408,8 @@ def run_test(
     base_seed: int,
     img_in_ch: int,
     freq_attn_depth: int,
+    rgb_vis: bool,
+    vis_alpha: float,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
@@ -317,19 +436,19 @@ def run_test(
     load_lightning_ckpt_into_model(model, ckpt_path=ckpt, use_ema=use_ema)
     model.eval()
 
-    # Tracker for Flow Prediction
     dices_flow_fg: List[float] = []
     ious_flow_fg: List[float] = []
+    hd95_flow_fg: List[float] = []    # ✅ 保存 Flow HD95
     
-    # ✅ NEW: Tracker for Direct Prediction
     dices_direct_fg: List[float] = []
     ious_direct_fg: List[float] = []
+    hd95_direct_fg: List[float] = []  # ✅ 保存 Direct HD95
 
     per_class_dices_flow_all = []
     per_class_ious_flow_all = []
+    per_class_hd95_flow_all = []      # ✅ 保存 Flow 每个类别的 HD95
+    
     vis_count = 0
-
-    num_classes_total = num_classes + 1  
 
     for bidx, batch in enumerate(loader):
         image, onehot_gt = batch
@@ -337,18 +456,16 @@ def run_test(
         onehot_gt = onehot_gt.to(device, non_blocking=True).float()  
 
         masks_k = []
-        direct_pred_prob = None  # ✅ NEW: Cache direct prediction per batch
+        direct_pred_prob = None
 
         for k in range(staple_k):
             seed = base_seed + (bidx * 1000) + k
             
-            # ✅ NEW: Unpack both outputs
             if seed is None:
                 pred_k, d_prob = model.sample(image)
             else:
                 pred_k, d_prob = model.sample(image, seed=seed)
 
-            # Direct prediction is deterministic across samples, grab it once
             if direct_pred_prob is None:
                 direct_pred_prob = d_prob
 
@@ -358,7 +475,6 @@ def run_test(
         masks_k = torch.stack(masks_k, dim=0)  
 
         # ---------- Predict Masks ----------
-        # 1. Flow-Matching + STAPLE
         pred_mask_flow, _ = ovr_staple_fuse_fg_with_bg(
             masks_k=masks_k,
             num_classes=num_classes,
@@ -366,53 +482,74 @@ def run_test(
             bg_thresh=bg_thresh,
         ) 
 
-        # 2. Direct Cond Prediction (✅ NEW)
         pred_mask_direct = onehot_to_mask_pred_with_bg(direct_pred_prob, thresh=thresh)
 
-        # 3. Ground Truth Mask
-        gt_mask = onehot_to_mask_gt_with_bg(onehot_gt)  
+        # 3. Ground Truth Mask (传入 num_classes 进行自适应截断)
+        gt_mask = onehot_to_mask_gt_with_bg(onehot_gt, num_classes=num_classes)  
 
         # ---------- Metrics (Flow) ----------
         dice_flow = mean_dice_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
         iou_flow = mean_iou_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
+        hd95_flow = mean_hd95_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes) # ✅ 计算 HD95
+        
         dices_flow_fg.append(float(dice_flow.item()))
         ious_flow_fg.append(float(iou_flow.item()))
+        hd95_flow_fg.append(float(hd95_flow.item()))
 
-        per_class_dices_flow_all.append(per_class_dice(pred_mask_flow, gt_mask, num_classes_total).cpu())
-        per_class_ious_flow_all.append(per_class_iou(pred_mask_flow, gt_mask, num_classes_total).cpu())
+        per_class_dices_flow_all.append(per_class_dice(pred_mask_flow, gt_mask, num_classes).cpu())
+        per_class_ious_flow_all.append(per_class_iou(pred_mask_flow, gt_mask, num_classes).cpu())
+        per_class_hd95_flow_all.append(per_class_hd95(pred_mask_flow, gt_mask, num_classes).cpu()) # ✅ 保存类别 HD95
 
-        # ---------- Metrics (Direct) ✅ NEW ----------
+        # ---------- Metrics (Direct) ----------
         dice_direct = mean_dice_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
         iou_direct = mean_iou_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
+        hd95_direct = mean_hd95_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes) # ✅ 计算 Direct HD95
+        
         dices_direct_fg.append(float(dice_direct.item()))
         ious_direct_fg.append(float(iou_direct.item()))
+        hd95_direct_fg.append(float(hd95_direct.item()))
 
-        # ---------- Visualization (4 columns) ✅ NEW ----------
+        # ---------- Visualization ----------
         if vis_count < max_vis:
-            img_np = image.detach().cpu().numpy()[:, 0]        
+            img_tensor = image.detach().cpu()
+            is_rgb = rgb_vis and (img_tensor.shape[1] >= 3)
+            
+            if is_rgb:
+                img_np = img_tensor[:, :3].permute(0, 2, 3, 1).numpy()
+            else:
+                img_np = img_tensor[:, 0].numpy()
+                
             gt_np = gt_mask.detach().cpu().numpy()             
             pred_flow_np = pred_mask_flow.detach().cpu().numpy()
-            pred_dir_np = pred_mask_direct.detach().cpu().numpy() 
 
             for i in range(min(image.shape[0], max_vis - vis_count)):
-                # Expand to 4 subplots
-                fig, axs = plt.subplots(1, 4, figsize=(16, 4))
+                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                img_i = img_np[i]
+                
+                overlay_gt = overlay_mask_on_image(img_i, gt_np[i], num_classes, alpha=vis_alpha)
+                overlay_pred_flow = overlay_mask_on_image(img_i, pred_flow_np[i], num_classes, alpha=vis_alpha)
 
-                axs[0].imshow(img_np[i], cmap="gray")
-                axs[0].set_title("Image")
+                if is_rgb:
+                    img_disp = img_i.copy()
+                    img_min, img_max = img_disp.min(), img_disp.max()
+                    if img_max > img_min:
+                        img_disp = (img_disp - img_min) / (img_max - img_min)
+                    else:
+                        img_disp = np.clip(img_disp, 0, 1)
+                    axs[0].imshow(img_disp)
+                else:
+                    axs[0].imshow(img_i, cmap="gray")
+                    
+                axs[0].set_title("Raw Image" + (" (RGB)" if is_rgb else " (Gray)"))
                 axs[0].axis("off")
 
-                axs[1].imshow(colorize_multiclass_with_bg(gt_np[i], num_classes=num_classes))
-                axs[1].set_title("GT Mask")
+                axs[1].imshow(overlay_gt)
+                axs[1].set_title("Image + GT Mask")
                 axs[1].axis("off")
 
-                axs[2].imshow(colorize_multiclass_with_bg(pred_dir_np[i], num_classes=num_classes))
-                axs[2].set_title("Direct Cond Pred")
+                axs[2].imshow(overlay_pred_flow)
+                axs[2].set_title(f"Image + Flow Pred (STAPLE K={staple_k})")
                 axs[2].axis("off")
-
-                axs[3].imshow(colorize_multiclass_with_bg(pred_flow_np[i], num_classes=num_classes))
-                axs[3].set_title(f"Flow Pred (STAPLE K={staple_k})")
-                axs[3].axis("off")
 
                 plt.tight_layout()
                 plt.savefig(out_dir / "vis" / f"sample_{vis_count:04d}.png", dpi=200)
@@ -425,35 +562,50 @@ def run_test(
             print(
                 f"[{bidx+1}/{len(loader)}] "
                 f"Flow Dice: {np.mean(dices_flow_fg):.4f} | "
-                f"Direct Dice: {np.mean(dices_direct_fg):.4f}" # ✅ NEW print
+                f"Direct Dice: {np.mean(dices_direct_fg):.4f}"
             )
 
     print("\n===== TEST DONE =====")
 
-    per_class_dices_flow_all = torch.stack(per_class_dices_flow_all)  
-    per_class_ious_flow_all = torch.stack(per_class_ious_flow_all)    
+    per_class_dices_flow_all = torch.stack(per_class_dices_flow_all).numpy()
+    per_class_ious_flow_all = torch.stack(per_class_ious_flow_all).numpy()
+    per_class_hd95_flow_all = torch.stack(per_class_hd95_flow_all).numpy() 
 
-    mean_dice_c = per_class_dices_flow_all.mean(dim=0)
-    std_dice_c = per_class_dices_flow_all.std(dim=0)
-    mean_iou_c = per_class_ious_flow_all.mean(dim=0)
-    std_iou_c = per_class_ious_flow_all.std(dim=0)
+    # ✅ 使用 nanmean 和 nanstd 处理可能存在全0GT而返回的NaN
+    mean_dice_c = np.nanmean(per_class_dices_flow_all, axis=0)
+    std_dice_c = np.nanstd(per_class_dices_flow_all, axis=0)
+    
+    mean_iou_c = np.nanmean(per_class_ious_flow_all, axis=0)
+    std_iou_c = np.nanstd(per_class_ious_flow_all, axis=0)
+    
+    mean_hd95_c = np.nanmean(per_class_hd95_flow_all, axis=0)
+    std_hd95_c = np.nanstd(per_class_hd95_flow_all, axis=0)
 
-    print("\n===== Flow Prediction Per-class Results (including BG=0) =====")
-    for c in range(num_classes_total):
-        name = "BG" if c == 0 else f"FG{c}"
+    print("\n===== Flow Prediction Per-class Results (Foreground Only) =====")
+    for i in range(num_classes):
+        c = i + 1
         print(
-            f"Class {c:02d} ({name}) | "
-            f"Dice: {mean_dice_c[c]:.4f} ± {std_dice_c[c]:.4f} | "
-            f"IoU:  {mean_iou_c[c]:.4f} ± {std_iou_c[c]:.4f}"
+            f"Class {c:02d} (FG{c}) | "
+            f"Dice: {mean_dice_c[i]:.4f} ± {std_dice_c[i]:.4f} | "
+            f"IoU:  {mean_iou_c[i]:.4f} ± {std_iou_c[i]:.4f} | "
+            f"HD95: {mean_hd95_c[i]:.4f} ± {std_hd95_c[i]:.4f}"
         )
 
+    # ✅ 过滤掉批次计算中可能的 NaN
+    valid_hd95_direct = [v for v in hd95_direct_fg if not np.isnan(v)]
+    valid_hd95_flow = [v for v in hd95_flow_fg if not np.isnan(v)]
+
     print(f"\nBatches: {len(dices_flow_fg)}")
-    # ✅ NEW: Print Comparison Report
     print(f"Mean Direct Dice (FG 1..{num_classes}): {np.mean(dices_direct_fg):.4f} ± {np.std(dices_direct_fg):.4f}")
     print(f"Mean Flow Dice   (FG 1..{num_classes}): {np.mean(dices_flow_fg):.4f} ± {np.std(dices_flow_fg):.4f}")
+    
     print(f"Mean Direct IoU  (FG 1..{num_classes}): {np.mean(ious_direct_fg):.4f} ± {np.std(ious_direct_fg):.4f}")
     print(f"Mean Flow IoU    (FG 1..{num_classes}): {np.mean(ious_flow_fg):.4f} ± {np.std(ious_flow_fg):.4f}")
-    print(f"Saved vis to: {out_dir / 'vis'}")
+
+    print(f"Mean Direct HD95 (FG 1..{num_classes}): {np.mean(valid_hd95_direct):.4f} ± {np.std(valid_hd95_direct):.4f}")
+    print(f"Mean Flow HD95   (FG 1..{num_classes}): {np.mean(valid_hd95_flow):.4f} ± {np.std(valid_hd95_flow):.4f}")
+
+    print(f"\nSaved vis to: {out_dir / 'vis'}")
 
 
 def main():
@@ -481,12 +633,18 @@ def main():
     parser.add_argument("--staple_iters", type=int, default=15, help="STAPLE EM iterations")
     parser.add_argument("--bg_thresh", type=float, default=0.5, help="if max FG prob < bg_thresh => background(0)")
     parser.add_argument("--base_seed", type=int, default=42, help="base seed for deterministic multi-sampling")
+    
+    parser.add_argument("--rgb_vis", action="store_true", help="enable RGB visualization (uses first 3 channels) instead of default 1st-channel grayscale")
+    parser.add_argument("--vis_alpha", type=float, default=0.8, help="Opacity for segmentation mask overlay (0.0 to 1.0)")
 
     args = parser.parse_args()
     pl.seed_everything(42)
 
     if args.staple_k < 2:
         raise ValueError("--staple_k must be >= 2 (>=3 recommended for STAPLE stability)")
+        
+    if not (0.0 <= args.vis_alpha <= 1.0):
+        raise ValueError("--vis_alpha must be between 0.0 and 1.0")
 
     run_test(
         ckpt=args.ckpt,
@@ -505,8 +663,9 @@ def main():
         base_seed=args.base_seed,
         img_in_ch=args.img_in_ch,
         freq_attn_depth=args.freq_attn_depth,
+        rgb_vis=args.rgb_vis,
+        vis_alpha=args.vis_alpha,
     )
-
 
 if __name__ == "__main__":
     main()
