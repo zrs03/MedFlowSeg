@@ -542,6 +542,7 @@ class FAAModule(nn.Module):
         )
 
         self.direct_head_flow = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
+        self.direct_head_cond = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
         gate_in_dim = 2 * self.token_dim
         self.gate_flow_blocks = nn.ModuleList(
@@ -585,7 +586,8 @@ class FAAModule(nn.Module):
         Fri = self._to_ri(Fz)
         Cri = self._to_ri(Cz)
 
-        Fri = Fri + self.direct_head_flow(Fri, t_emb)
+        Fri = self.direct_head_flow(Fri, t_emb)
+        Cri = self.direct_head_cond(Cri, t_emb)
 
         F_tok, hw_p = self.patch_flow(Fri)
         C_tok, _ = self.patch_cond(Cri)
@@ -725,7 +727,6 @@ class MainNet(nn.Module):
     def __init__(
         self,
         *,
-        image_hw: Tuple[int, int],
         img_in_ch: int,
         xt_in_ch: int,
         base_ch: int,
@@ -746,7 +747,6 @@ class MainNet(nn.Module):
         faa_patch: int = 8,
         faa_attn_dropout: float = 0.0,
         faa_token_dim: Optional[int] = None,
-        faa_noise_strength: float = 1.0,
         faa_gate_scale: float = 1.0,
         faa_gate_R: int = 2,
 
@@ -765,7 +765,6 @@ class MainNet(nn.Module):
         if faa_stacks < 1:
             raise ValueError("faa_stacks must be >= 1")
 
-        self.image_hw = tuple(image_hw)
         self.img_in_ch = int(img_in_ch)
         self.xt_in_ch = int(xt_in_ch)
         self.base_ch = int(base_ch)
@@ -789,7 +788,6 @@ class MainNet(nn.Module):
         self.faa_patch = int(faa_patch)
         self.faa_attn_dropout = float(faa_attn_dropout)
         self.faa_token_dim = faa_token_dim
-        self.faa_noise_strength = float(faa_noise_strength)
 
         self.faa_gate_scale = float(faa_gate_scale)
         self.faa_gate_R = int(faa_gate_R)
@@ -860,18 +858,30 @@ class MainNet(nn.Module):
         K_levels = min(self.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K_levels, n_levels))
 
-        self.freq_hog = SOSX(
+        self.freq_hog_f = SOSX(
+            hog_bins=self.hog_bins,
+            hog_tau=self.hog_tau,
+            eps=self.hog_eps,
+            mag_weight=self.hog_mag_weight,
+        )
+        
+        self.freq_hog_c = SOSX(
             hog_bins=self.hog_bins,
             hog_tau=self.hog_tau,
             eps=self.hog_eps,
             mag_weight=self.hog_mag_weight,
         )
 
-        self.hog_norm_levels = nn.ModuleList([
+        self.hog_norm_levels_f = nn.ModuleList([
             GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
             for i in range(n_levels)
         ])
-        self.hog_norm_mid = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
+        self.hog_norm_levels_c = nn.ModuleList([
+            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
+            for i in range(n_levels)
+        ])
+        self.hog_norm_mid_f = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
+        self.hog_norm_mid_c = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
 
         def make_faa_list(ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
@@ -883,7 +893,6 @@ class MainNet(nn.Module):
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
                         hog_bins=self.hog_bins,
-                        noise_strength=self.faa_noise_strength,
                         faa_patch=self.faa_patch,
                         faa_attn_dropout=self.faa_attn_dropout,
                         token_dim=self.faa_token_dim,
@@ -979,16 +988,17 @@ class MainNet(nn.Module):
             c_main = cond_skips_raw[level]  # 🎈 遵循架构图：直接传入纯净的 Cond Encoder 特征给 FAA
 
             if level in self.attn_level_set:
-                hog_flow = self.freq_hog(f_main)
-                hog_cond = self.freq_hog(c_main)
+                hog_flow = self.freq_hog_f(f_main)
+                hog_cond = self.freq_hog_c(c_main)
 
-                norm = self.hog_norm_levels[level]
-                hog_flow = norm(torch.log1p(hog_flow))
-                hog_cond = norm(torch.log1p(hog_cond))
+                norm_f = self.hog_norm_levels_f[level]
+                norm_c = self.hog_norm_levels_c[level]
+                hog_flow = norm_f(torch.log1p(hog_flow))
+                hog_cond = norm_c(torch.log1p(hog_cond))
 
                 faa_list: nn.ModuleList = self.couple_modules[str(level)]
-                for fa in faa_list:
-                    f_main = fa(
+                for faa in faa_list:
+                    f_main = faa(
                         flow=f_main,
                         cond=c_main,
                         hog_flow=hog_flow,
@@ -1001,14 +1011,14 @@ class MainNet(nn.Module):
         # 2. Flow Bottleneck
         if self.bottleneck_coupler is not None:
             # 🎈 遵循架构图：Bottleneck FAA 接收 cond_bot 特征
-            hog_flow = self.freq_hog(flow)
-            hog_cond = self.freq_hog(cond_bot)
+            hog_flow = self.freq_hog_f(flow)
+            hog_cond = self.freq_hog_c(cond_bot)
 
-            hog_flow = self.hog_norm_mid(torch.log1p(hog_flow))
-            hog_cond = self.hog_norm_mid(torch.log1p(hog_cond))
+            hog_flow = self.hog_norm_mid_f(torch.log1p(hog_flow))
+            hog_cond = self.hog_norm_mid_c(torch.log1p(hog_cond))
 
-            for fa in self.bottleneck_coupler:
-                flow = fa(
+            for faa in self.bottleneck_coupler:
+                flow = faa(
                     flow=flow,
                     cond=cond_bot,
                     hog_flow=hog_flow,
@@ -1024,8 +1034,8 @@ class MainNet(nn.Module):
             if self.control_inject_to_decoder:
                 level = (n_levels - 1) - dec_idx
                 # 🎈 遵循架构图大粗蓝线：Cond Decoder 完美语义 -> ZeroConv -> Flow Decoder！
-                h = h + self.ctrl_zero_dec[level](cond_dec_feats[level])
-
+                h = h + self.ctrl_zero_dec[level](cond_dec_feats[level]) 
+                
         h = F.silu(h)
         
         return self.out_v(h), seg_logits
@@ -1034,11 +1044,10 @@ class MainNet(nn.Module):
 # build_model 
 # =========================================================
 def build_model(
-    image_hw: Tuple[int, int] = (256, 256),
     img_in_ch: int = 1,
     xt_in_ch: int = 4,
     base_ch: int = 64,
-    ch_mult: Sequence[int] = (1, 2, 4, 4),
+    ch_mult: Sequence[int] = (1, 2, 4, 8),
     num_res_blocks: int = 2,
     time_dim: int = 256,
     dropout: float = 0.0,
@@ -1056,7 +1065,6 @@ def build_model(
     faa_patch: int = 2,
     faa_attn_dropout: float = 0.0,
     faa_token_dim: Optional[int] = None,
-    faa_noise_strength: float = 1.0,
     faa_gate_scale: float = 1.0,
     faa_gate_R: int = 2,
 
@@ -1067,7 +1075,6 @@ def build_model(
     usa_init_bias: float = -2.0,
 ) -> MainNet:
     return MainNet(
-        image_hw=tuple(image_hw),
         img_in_ch=img_in_ch,
         xt_in_ch=xt_in_ch,
         base_ch=base_ch,
@@ -1088,7 +1095,6 @@ def build_model(
         faa_patch=faa_patch,
         faa_attn_dropout=faa_attn_dropout,
         faa_token_dim=faa_token_dim,
-        faa_noise_strength=faa_noise_strength,
         faa_gate_scale=faa_gate_scale,
         faa_gate_R=faa_gate_R,
         usa_low_gauss_ks=usa_low_gauss_ks,
@@ -1104,7 +1110,6 @@ def build_model(
 # =========================================================
 if __name__ == "__main__":
     net = build_model(
-        image_hw=(256, 256),
         img_in_ch=1,
         xt_in_ch=4,
         base_ch=32,
@@ -1125,7 +1130,6 @@ if __name__ == "__main__":
         faa_patch=8,
         faa_attn_dropout=0.0,
         faa_token_dim=None,
-        faa_noise_strength=1.0,
         faa_gate_scale=1.0,
         faa_gate_R=2,
         usa_low_gauss_ks=3,
