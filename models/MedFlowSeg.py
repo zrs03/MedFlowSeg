@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-✅ 严格对齐架构图 (MedFlowSeg) 的修改版：
-1) Two-Stream 双分支架构 (Cond 纯空间无时序, Flow 含时间步 t)。
-2) Encoder 端交互：
-   - Cond Enc Level 1 -> [DB-SA] -> Flow Enc Level 1
+✅ MedFlowSeg 修改版：
+1) Two-Stream 双分支架构 (Cond 纯空间无时序, Flow 含时间步 t)
+2) DBSA 改为：
+   - Cond Decoder 最后一层特征 cond_dec_feats[0] -> [DBSA] -> Flow Enc Level 1
+3) FAA 保持使用 Encoder 特征：
    - Cond Enc Deep -> [FAA] -> Flow Enc Deep
    - Cond Bottleneck -> [FAA] -> Flow Bottleneck
-3) Decoder 端交互 (Zero Conv)：
-   - Cond Dec -> [Zero Conv] -> Flow Dec (严格把 Decoder 特征注入给 Flow Decoder)
-4) 修复幻觉：彻底移除了 ctrl_proc_levels，保证传给 Flow 的 Cond 特征不被 t_emb 污染。
+4) 取消原本 Decoder 端 ZeroConv 注入
+5) Cond 特征始终不受 t_emb 污染
+6) 仅替换原 SOSX 分支：
+   - 先 patchify 得到 T_f, T_c
+   - 构造 T_a, T_d, T_r
+   - 得到 T_z = phi([T_a, T_d, T_r])
+   - 再得到 \tilde{T_f}, \tilde{T_c}
+   - 把 (\tilde{T_f}, \tilde{T_c}) 送入原固定 modulator gate 分支
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import torch.nn.functional as F
 
 
 # =========================================================
-# Time embedding + FiLM (conv) - 保留给 flow 分支
+# Time embedding + FiLM (flow branch only)
 # =========================================================
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
@@ -77,7 +83,7 @@ class GroupNorm32(nn.Module):
 
 
 # =========================================================
-# 标准的 ResBlock (无时间嵌入，用于 cond 分支)
+# Standard ResBlock (cond branch)
 # =========================================================
 class ResBlock(nn.Module):
     def __init__(
@@ -111,7 +117,7 @@ class ResBlock(nn.Module):
 
 
 class ResBlockFiLM(nn.Module):
-    """ResBlock with FiLM time conditioning (用于 flow 分支)"""
+    """ResBlock with FiLM time conditioning (flow branch)"""
     def __init__(
         self,
         in_ch: int,
@@ -172,21 +178,6 @@ class Upsample(nn.Module):
 
 
 # =========================================================
-# ZeroConv (ControlNet-style injection to decoder only)
-# =========================================================
-class ZeroConv2d(nn.Module):
-    """1x1 conv with ZERO init."""
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 1)
-        nn.init.zeros_(self.conv.weight)
-        nn.init.zeros_(self.conv.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-# =========================================================
 # ViT-style patchify & unpatchify
 # =========================================================
 class PatchEmbed2D(nn.Module):
@@ -195,7 +186,13 @@ class PatchEmbed2D(nn.Module):
         self.in_ch = int(in_ch)
         self.embed_dim = int(embed_dim)
         self.patch = int(patch)
-        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=self.patch, stride=self.patch, bias=True)
+        self.proj = nn.Conv2d(
+            in_ch,
+            embed_dim,
+            kernel_size=self.patch,
+            stride=self.patch,
+            bias=True,
+        )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
         b, c, h, w = x.shape
@@ -217,7 +214,7 @@ class Unpatch2D(nn.Module):
         self.to_patch = nn.Linear(embed_dim, out_ch * patch * patch, bias=True)
 
     def forward(self, tokens: torch.Tensor, hw_patch: Tuple[int, int]) -> torch.Tensor:
-        b, n, d = tokens.shape
+        b, n, _ = tokens.shape
         hp, wp = hw_patch
         p = self.patch
         if n != hp * wp:
@@ -238,7 +235,12 @@ class TokenCrossAttention(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.heads = int(heads)
-        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.heads, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=self.dim,
+            num_heads=self.heads,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.ln_q = nn.LayerNorm(self.dim)
         self.ln_kv = nn.LayerNorm(self.dim)
         self.proj = nn.Sequential(nn.Linear(self.dim, self.dim), nn.Dropout(dropout))
@@ -284,7 +286,7 @@ class LearnableGaussianBlur2d(nn.Module):
 
 
 # =========================================================
-# DBSA (独立双高斯核版)
+# DBSA
 # =========================================================
 class DBSA(nn.Module):
     def __init__(
@@ -329,52 +331,39 @@ class DBSA(nn.Module):
         return f_flow + f_flow * g
 
 
-# =========================================================
-# Dense frequency-domain HOG on feature maps
-# =========================================================
-def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
-    return (x + math.pi) % (2.0 * math.pi) - math.pi
-
-class SOSX(nn.Module):
-    def __init__(
-        self,
-        hog_bins: int = 8,
-        hog_tau: float = 0.35,
-        eps: float = 1e-8,
-        mag_weight: bool = True,
-    ):
+class SpatialDirectHeadFiLM(nn.Module):
+    def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
         super().__init__()
-        self.hog_bins = int(hog_bins)
-        self.hog_tau = float(hog_tau)
-        self.eps = float(eps)
-        self.mag_weight = bool(mag_weight)
+        hid = int(hidden_mult * ch)
+        self.in_norm = GroupNorm32(ch)
+        self.conv_in = nn.Conv2d(ch, hid, 3, padding=1)
 
-        k = torch.arange(self.hog_bins).float()
-        theta = -math.pi + (2.0 * math.pi) * k / float(self.hog_bins)
-        self.register_buffer("theta", theta, persistent=False)
+        self.hid_norm = GroupNorm32(hid)
+        self.to_film = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_ch, 2 * hid)
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        X = torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        mag = X.abs().clamp_min(self.eps)
-        phi = torch.angle(X)
+        self.conv_mid = nn.Conv2d(hid, hid, 3, padding=1)
+        self.conv_out = nn.Conv2d(hid, ch, 1)
 
-        theta = self.theta.view(1, 1, 1, 1, self.hog_bins).to(device=x.device, dtype=phi.dtype)
-        delta = _wrap_pi(phi.unsqueeze(-1) - theta)
+        nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.conv_out.bias)
 
-        logits = torch.cos(delta) / max(self.hog_tau, 1e-6)
-        p = F.softmax(logits, dim=-1)
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv_in(F.silu(self.in_norm(x)))
+        h = self.hid_norm(h)
 
-        if self.mag_weight:
-            p = p * mag.unsqueeze(-1)
+        gamma, beta = self.to_film(t_emb).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
 
-        p = p.permute(0, 1, 4, 2, 3).contiguous()
-        hog_map = p.view(b, c * self.hog_bins, h, w)
-        return hog_map
-
+        h = (1.0 + gamma) * h + beta
+        h = F.silu(self.conv_mid(F.silu(h)))
+        return self.conv_out(h)
 
 # =========================================================
-# direct frequency update head with FiLM
+# Direct frequency update head with FiLM
 # =========================================================
 class FreqDirectHeadFiLM(nn.Module):
     def __init__(self, ch: int, time_ch: int, hidden_mult: int = 2):
@@ -453,7 +442,7 @@ class TokenFiLMBlock(nn.Module):
 
 
 # =========================================================
-# 2D Sin-Cos positional编码
+# 2D Sin-Cos positional encoding
 # =========================================================
 def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if dim <= 0:
@@ -477,6 +466,7 @@ def _sincos_1d(length: int, dim: int, device: torch.device, dtype: torch.dtype) 
         emb = emb[:, :dim]
     return emb
 
+
 def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     dim_y = dim // 2
     dim_x = dim - dim_y
@@ -491,6 +481,128 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
 
 
 # =========================================================
+# Token Discrepancy Preparation
+# =========================================================
+class TokenDiscrepancyExtractor(nn.Module):
+    """
+    方案 A（去掉 confidence）:
+    1) patchify 得到 T_f, T_c
+    2) 构造 agreement / difference / residual
+    3) 三路分别编码
+    4) 融合得到 T_z
+    5) 用 T_z 重整 T_f, T_c
+    """
+    def __init__(
+        self,
+        ch: int,
+        token_dim: int,
+        patch: int,
+        hidden_mult: int = 2,
+        time_ch: int,
+    ):
+        super().__init__()
+        self.ch = int(ch)
+        self.token_dim = int(token_dim)
+        self.patch = int(patch)
+        hidden_dim = int(hidden_mult * token_dim)
+
+        self.patch_flow = PatchEmbed2D(
+            in_ch=self.ch,
+            embed_dim=self.token_dim,
+            patch=self.patch,
+        )
+        self.patch_cond = PatchEmbed2D(
+            in_ch=self.ch,
+            embed_dim=self.token_dim,
+            patch=self.patch,
+        )
+        
+        self.flow_direct = SpatialDirectHeadFiLM(ch, time_ch)
+        self.cond_direct = SpatialDirectHeadFiLM(ch, time_ch)
+
+        # 三路 token 分别编码
+        self.enc_a = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.token_dim),
+        )
+        self.enc_d = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.token_dim),
+        )
+        self.enc_r = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.token_dim),
+        )
+
+        # fuse 成最终证据 token
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(3 * self.token_dim),
+            nn.Linear(3 * self.token_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.token_dim),
+        )
+
+        # 用证据 token 去重整 flow / cond token
+        self.g_flow = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, self.token_dim),
+        )
+        self.g_cond = nn.Sequential(
+            nn.LayerNorm(self.token_dim),
+            nn.Linear(self.token_dim, self.token_dim),
+        )
+
+        # 建议用小初始化，不要全零
+        nn.init.normal_(self.g_flow[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.g_flow[-1].bias)
+        nn.init.normal_(self.g_cond[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.g_cond[-1].bias)
+    
+
+    def forward(
+        self,
+        flow: torch.Tensor,
+        cond: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        
+        flow = flow + self.flow_direct(flow, t_emb)
+        cond = cond + self.cond_direct(cond, t_emb)
+        
+        T_f, hw_p_f = self.patch_flow(flow)
+        T_c, hw_p_c = self.patch_cond(cond)
+
+        if hw_p_f != hw_p_c:
+            raise ValueError(
+                f"TokenDiscrepancyExtractor needs same patch hw, got {hw_p_f} vs {hw_p_c}"
+            )
+
+        # 三类 patch 证据
+        T_a = T_f * T_c
+        T_d = torch.abs(T_f - T_c)
+        T_r = T_f - T_c
+
+        # 分别编码
+        T_a = self.enc_a(T_a)
+        T_d = self.enc_d(T_d)
+        T_r = self.enc_r(T_r)
+
+        # 融合得到修正证据 token
+        T_z = self.fuse(torch.cat([T_a, T_d, T_r], dim=-1))
+
+        # 重整输入 token
+        T_f_tilde = T_f + self.g_flow(T_z)
+        T_c_tilde = T_c + self.g_cond(T_z)
+
+        return T_f_tilde, T_c_tilde, hw_p_f
+
+# =========================================================
 # FAA module
 # =========================================================
 class FAAModule(nn.Module):
@@ -500,8 +612,6 @@ class FAAModule(nn.Module):
         time_ch: int,
         heads: int,
         head_dim: int,
-        hog_bins: int,
-        noise_strength: float = 1.0,
         faa_patch: int = 8,
         faa_attn_dropout: float = 0.0,
         token_dim: Optional[int] = None,
@@ -510,8 +620,6 @@ class FAAModule(nn.Module):
     ):
         super().__init__()
         self.ch = int(ch)
-        self.hog_bins = int(hog_bins)
-        self.noise_strength = float(noise_strength)
 
         self.faa_patch = int(faa_patch)
         if token_dim is None:
@@ -522,19 +630,26 @@ class FAAModule(nn.Module):
         self.gate_R = int(gate_R)
 
         ri_ch = 2 * self.ch
-        hog_ch = self.ch * self.hog_bins
 
+        # 输入分支保持不变
         self.patch_flow = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.faa_patch)
         self.patch_cond = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.faa_patch)
 
-        self.patch_hflow = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.faa_patch)
-        self.patch_hcond = PatchEmbed2D(in_ch=hog_ch, embed_dim=self.token_dim, patch=self.faa_patch)
+        # token discrepancy preparation
+        self.disc_prep = TokenDiscrepancyExtractor(
+            ch=self.ch,
+            token_dim=self.token_dim,
+            patch=self.faa_patch,
+            time_ch=time_ch,
+        )
 
-        self.unpatch_flow = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.faa_patch)
+        # 【修改点 1】：重命名并负责还原 Cond
+        self.unpatch_cond = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.faa_patch)
 
-        self.attn_flow = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=faa_attn_dropout)
+        # 【修改点 2】：交叉注意力，现在用于更新 Cond
+        self.attn_cond = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=faa_attn_dropout)
 
-        self.ffn_flow = nn.Sequential(
+        self.ffn_cond = nn.Sequential(
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, 4 * self.token_dim),
             nn.SiLU(),
@@ -544,13 +659,14 @@ class FAAModule(nn.Module):
         self.direct_head_flow = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
         self.direct_head_cond = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
+        # 门控分支的重命名
         gate_in_dim = 2 * self.token_dim
-        self.gate_flow_blocks = nn.ModuleList(
+        self.gate_cond_blocks = nn.ModuleList(
             [TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)]
         )
-        self.gate_flow_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
-        nn.init.zeros_(self.gate_flow_out[-1].weight)
-        nn.init.zeros_(self.gate_flow_out[-1].bias)
+        self.gate_cond_out = nn.Sequential(nn.LayerNorm(gate_in_dim), nn.Linear(gate_in_dim, self.token_dim))
+        nn.init.zeros_(self.gate_cond_out[-1].weight)
+        nn.init.zeros_(self.gate_cond_out[-1].bias)
 
         self._pos_cache: Dict[Tuple[int, int, int, torch.device, torch.dtype], torch.Tensor] = {}
 
@@ -560,7 +676,7 @@ class FAAModule(nn.Module):
 
     @staticmethod
     def _to_complex(ri: torch.Tensor) -> torch.Tensor:
-        b, c2, h, w = ri.shape
+        _, c2, _, _ = ri.shape
         c = c2 // 2
         return torch.complex(ri[:, :c], ri[:, c:])
 
@@ -568,6 +684,7 @@ class FAAModule(nn.Module):
         key = (hp, wp, self.token_dim, device, dtype)
         pos = self._pos_cache.get(key)
         if pos is None or pos.device != device or pos.dtype != dtype:
+            # 假设外部有 build_2d_sincos_pos_embed
             pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)
             self._pos_cache[key] = pos
         return pos
@@ -576,18 +693,19 @@ class FAAModule(nn.Module):
         self,
         flow: torch.Tensor,
         cond: torch.Tensor,
-        hog_flow: torch.Tensor,
-        hog_cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> torch.Tensor:
+        # -------------------------------------------------
+        # 傅里叶变换保持不变
+        # -------------------------------------------------
         Fz = torch.fft.fftshift(torch.fft.fft2(flow, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
         Fri = self._to_ri(Fz)
         Cri = self._to_ri(Cz)
 
-        Fri = self.direct_head_flow(Fri, t_emb)
-        Cri = self.direct_head_cond(Cri, t_emb)
+        Fri = Fri + self.direct_head_flow(Fri, t_emb)
+        Cri = Cri + self.direct_head_cond(Cri, t_emb)
 
         F_tok, hw_p = self.patch_flow(Fri)
         C_tok, _ = self.patch_cond(Cri)
@@ -597,30 +715,47 @@ class FAAModule(nn.Module):
         F_tok = F_tok + pos
         C_tok = C_tok + pos
 
-        Hf_tok, _ = self.patch_hflow(hog_flow)
-        Hc_tok, _ = self.patch_hcond(hog_cond)
+        # 【修改点 5】：C 去 Attend F，更新的是 C
+        C_tok2 = C_tok + self.attn_cond(C_tok, F_tok) 
+        C_tok2 = C_tok2 + self.ffn_cond(C_tok2)
 
-        F_tok2 = F_tok + self.attn_flow(F_tok, C_tok)
-        F_tok2 = F_tok2 + self.ffn_flow(F_tok2)
+        # -------------------------------------------------
+        # 构造 token discrepancy 保持不变
+        # -------------------------------------------------
+        T_f_tilde, T_c_tilde, hw_d = self.disc_prep(flow, cond, t_emb)
+        
+        T_f_tilde = T_f_tilde + pos
+        T_c_tilde = T_c_tilde + pos
+        
+        if hw_d != hw_p:
+            raise ValueError(f"Discrepancy token hw {hw_d} != main token hw {hw_p}")
 
-        g_flow = torch.cat([Hc_tok, Hf_tok], dim=-1)
-        for blk in self.gate_flow_blocks:
-            g_flow = blk(g_flow, t_emb)
-        gate_flow = torch.tanh(self.gate_flow_out(g_flow))
-        F_tok3 = F_tok2 * (1.0 + self.gate_scale * gate_flow)
+        # -------------------------------------------------
+        # 【修改点 6】：门控网络更新 C，拼接顺序通常将 condition 放在前面，target 放在后面，因此调换为 [T_f_tilde, T_c_tilde]
+        # -------------------------------------------------
+        g_cond = torch.cat([T_f_tilde, T_c_tilde], dim=-1)
+        for blk in self.gate_cond_blocks:
+            g_cond = blk(g_cond, t_emb)
+        gate_cond = torch.tanh(self.gate_cond_out(g_cond))
 
-        Fri2 = self.unpatch_flow(F_tok3, hw_p)
-        F2c = self._to_complex(Fri2)
-        F2c = torch.fft.ifftshift(F2c, dim=(-2, -1))
-        flow_out = torch.fft.ifft2(F2c, dim=(-2, -1), norm="ortho").real
-        return flow_out
+        # 作用于 C
+        C_tok3 = C_tok2 * (1.0 + self.gate_scale * gate_cond)
 
+        # -------------------------------------------------
+        # 【修改点 7】：逆变换输出改为处理 C
+        # -------------------------------------------------
+        Cri2 = self.unpatch_cond(C_tok3, hw_p)
+        C2c = self._to_complex(Cri2)
+        C2c = torch.fft.ifftshift(C2c, dim=(-2, -1))
+        cond_out = torch.fft.ifft2(C2c, dim=(-2, -1), norm="ortho").real
+        
+        return cond_out
 
 # =========================================================
-# Encoder/Decoder stages
+# Encoder / Decoder stages
 # =========================================================
 class EncoderStageFiLM(nn.Module):
-    """带时间控制的 EncoderStage (用于 flow 分支)"""
+    """Time-conditioned EncoderStage (flow branch)"""
     def __init__(self, in_ch: int, out_ch: int, time_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
@@ -636,8 +771,9 @@ class EncoderStageFiLM(nn.Module):
             x = blk(x, t_emb)
         return x
 
+
 class EncoderStage(nn.Module):
-    """标准的 EncoderStage (无时间嵌入，用于 cond 分支)"""
+    """Standard EncoderStage (cond branch)"""
     def __init__(self, in_ch: int, out_ch: int, num_blocks: int, down: bool, dropout: float):
         super().__init__()
         blocks: List[nn.Module] = []
@@ -655,7 +791,7 @@ class EncoderStage(nn.Module):
 
 
 class DecoderStageSingle(nn.Module):
-    """单分支 decoder with FiLM (用于 flow 分支)"""
+    """Single-branch decoder with FiLM (flow branch)"""
     def __init__(
         self,
         in_ch: int,
@@ -687,8 +823,9 @@ class DecoderStageSingle(nn.Module):
             x = blk(x, t_emb)
         return x
 
+
 class DecoderStage(nn.Module):
-    """标准单分支 decoder (无时间嵌入，用于 cond 分支)"""
+    """Standard decoder (cond branch)"""
     def __init__(
         self,
         in_ch: int,
@@ -739,17 +876,11 @@ class MainNet(nn.Module):
         freq_attn_depth: int,
         use_bottleneck_coupling: bool,
         faa_stacks: int,
-        hog_bins: int = 8,
-        hog_tau: float = 0.35,
-        hog_mag_weight: bool = True,
-        hog_eps: float = 1e-8,
-        control_inject_to_decoder: bool = True,
         faa_patch: int = 8,
         faa_attn_dropout: float = 0.0,
         faa_token_dim: Optional[int] = None,
         faa_gate_scale: float = 1.0,
         faa_gate_R: int = 2,
-
         usa_low_gauss_ks: int = 3,
         usa_high_gauss_ks: int = 5,
         usa_low_gauss_sigma: float = 1.5,
@@ -778,24 +909,14 @@ class MainNet(nn.Module):
         self.use_bottleneck_coupling = bool(use_bottleneck_coupling)
         self.faa_stacks = int(faa_stacks)
 
-        self.hog_bins = int(hog_bins)
-        self.hog_tau = float(hog_tau)
-        self.hog_eps = float(hog_eps)
-        self.hog_mag_weight = bool(hog_mag_weight)
-
-        self.control_inject_to_decoder = bool(control_inject_to_decoder)
-
         self.faa_patch = int(faa_patch)
         self.faa_attn_dropout = float(faa_attn_dropout)
         self.faa_token_dim = faa_token_dim
-
         self.faa_gate_scale = float(faa_gate_scale)
         self.faa_gate_R = int(faa_gate_R)
 
-        # 仅留给 flow 分支的时间 MLP
         self.time_mlp = TimeMLP(time_dim=self.time_dim, hidden_dim=self.time_dim)
 
-        # stems
         self.flow_stem = nn.Conv2d(self.xt_in_ch, self.base_ch, 3, padding=1)
         self.cond_stem = nn.Conv2d(self.img_in_ch, self.base_ch, 3, padding=1)
 
@@ -809,19 +930,21 @@ class MainNet(nn.Module):
             in_ch = self.chs[i - 1] if i > 0 else self.base_ch
             out_ch = self.chs[i]
             down = i < (n_levels - 1)
-            # flow 保持含时 EncoderStageFiLM
-            self.flow_enc.append(EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout))
-            # cond 替换为标准无时的 EncoderStage
-            self.cond_enc.append(EncoderStage(in_ch, out_ch, self.num_res_blocks, down, self.dropout))
 
-        # main decoder
+            self.flow_enc.append(
+                EncoderStageFiLM(in_ch, out_ch, self.time_dim, self.num_res_blocks, down, self.dropout)
+            )
+            self.cond_enc.append(
+                EncoderStage(in_ch, out_ch, self.num_res_blocks, down, self.dropout)
+            )
+
+        # flow decoder
         self.dec = nn.ModuleList()
         for i in reversed(range(n_levels)):
             skip_ch = self.chs[i]
             in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
-            # flow 保持含时 DecoderStageSingle
             self.dec.append(
                 DecoderStageSingle(
                     in_ch=in_ch,
@@ -841,7 +964,6 @@ class MainNet(nn.Module):
             in_ch = self.chs[i + 1] if i < (n_levels - 1) else self.chs[i]
             out_ch = self.chs[i]
             up = i < (n_levels - 1)
-            # cond 替换为标准无时 DecoderStage
             self.cond_dec.append(
                 DecoderStage(
                     in_ch=in_ch,
@@ -858,31 +980,6 @@ class MainNet(nn.Module):
         K_levels = min(self.freq_attn_depth, n_levels)
         self.attn_level_set = set(range(n_levels - K_levels, n_levels))
 
-        self.freq_hog_f = SOSX(
-            hog_bins=self.hog_bins,
-            hog_tau=self.hog_tau,
-            eps=self.hog_eps,
-            mag_weight=self.hog_mag_weight,
-        )
-        
-        self.freq_hog_c = SOSX(
-            hog_bins=self.hog_bins,
-            hog_tau=self.hog_tau,
-            eps=self.hog_eps,
-            mag_weight=self.hog_mag_weight,
-        )
-
-        self.hog_norm_levels_f = nn.ModuleList([
-            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
-            for i in range(n_levels)
-        ])
-        self.hog_norm_levels_c = nn.ModuleList([
-            GroupNorm32(num_channels=self.chs[i] * self.hog_bins) if (i in self.attn_level_set) else nn.Identity()
-            for i in range(n_levels)
-        ])
-        self.hog_norm_mid_f = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
-        self.hog_norm_mid_c = GroupNorm32(num_channels=self.chs[-1] * self.hog_bins) if self.use_bottleneck_coupling else nn.Identity()
-
         def make_faa_list(ch: int) -> nn.ModuleList:
             mods = nn.ModuleList()
             for _ in range(self.faa_stacks):
@@ -892,7 +989,6 @@ class MainNet(nn.Module):
                         time_ch=self.time_dim,
                         heads=self.attn_heads,
                         head_dim=self.attn_head_dim,
-                        hog_bins=self.hog_bins,
                         faa_patch=self.faa_patch,
                         faa_attn_dropout=self.faa_attn_dropout,
                         token_dim=self.faa_token_dim,
@@ -908,11 +1004,7 @@ class MainNet(nn.Module):
 
         self.bottleneck_coupler = make_faa_list(self.chs[-1]) if self.use_bottleneck_coupling else None
 
-        # ✅ 彻底移除 ControlResProc (ctrl_proc_levels)，防止 t_emb 污染 Cond Encoder 特征！
-
-        # decoder injection only: 严格负责 Cond Dec 到 Flow Dec 的特征映射
-        self.ctrl_zero_dec = nn.ModuleList([ZeroConv2d(self.chs[i], self.chs[i]) for i in range(n_levels)])
-
+        # DBSA now uses cond decoder final feature -> flow encoder first feature
         self.dbsa = DBSA(
             ch=self.chs[0],
             low_gauss_ks=usa_low_gauss_ks,
@@ -921,8 +1013,7 @@ class MainNet(nn.Module):
             high_gauss_sigma=usa_high_gauss_sigma,
             init_bias=usa_init_bias,
         )
-        
-        # cond segmentation head
+
         self.cond_seg_head = nn.Sequential(
             GroupNorm32(self.chs[0]),
             nn.SiLU(),
@@ -943,105 +1034,80 @@ class MainNet(nn.Module):
         cond0 = self.cond_stem(image)
 
         # ====================================================
-        # 第一阶段：独立运行纯空间 Cond 网络 (Encoder -> Decoder)
+        # Stage 1: Cond branch
         # ====================================================
-        
-        # 1. Cond Encoder
-        cond_skips_raw: List[torch.Tensor] = []  # 保存 Cond Encoder 层级特征
+        cond_enc_feats: List[torch.Tensor] = []
         cond = cond0
         for enc_c in self.cond_enc:
-            c_skip_raw = enc_c(cond) # 完全独立于时间 t
-            cond_skips_raw.append(c_skip_raw)
-            cond = enc_c.down(c_skip_raw) if enc_c.down is not None else c_skip_raw
+            c_feat = enc_c(cond)
+            cond_enc_feats.append(c_feat)
+            cond = enc_c.down(c_feat) if enc_c.down is not None else c_feat
 
-        cond_bot = cond  # Cond 网络的 Bottleneck 特征！
+        cond_bot = cond
 
-        # 2. Cond Decoder
         c_h = cond_bot
         n_levels = len(self.chs)
         cond_dec_feats: List[torch.Tensor] = [None] * n_levels  # type: ignore
-        for cdec_idx, (cdec, c_skip_raw) in enumerate(zip(self.cond_dec, reversed(cond_skips_raw))):
-            c_h = cdec(c_h, c_skip_raw) 
+        for cdec_idx, (cdec, c_skip) in enumerate(zip(self.cond_dec, reversed(cond_enc_feats))):
+            c_h = cdec(c_h, c_skip)
             level = (n_levels - 1) - cdec_idx
-            cond_dec_feats[level] = c_h  # 🎈 保存每一层干净的 Decoder 特征
+            cond_dec_feats[level] = c_h
 
-        # 生成 分割预测 (主要为了监督纯空间网络的形态学学习)
         seg_logits = self.cond_seg_head(cond_dec_feats[0])
 
         # ====================================================
-        # 第二阶段：Flow 分支 (结合 DB-SA, FAA, 和 ZeroConv)
+        # Stage 2: Flow branch
         # ====================================================
-        
-        # 1. Flow Encoder 
         flow_skips: List[torch.Tensor] = []
         flow = flow0
 
         for level, enc_flow in enumerate(self.flow_enc):
             f_skip = enc_flow(flow, t_emb)
 
+            # DBSA: cond decoder final feature -> flow encoder first feature
             if level == 0:
-                # 🎈 遵循架构图：DB-SA 接收 Cond Encoder 第一层（最干净的浅层）特征
-                f_skip = self.dbsa(f_cond=cond_skips_raw[0], f_flow=f_skip)
+                f_skip = self.dbsa(f_cond=cond_dec_feats[0], f_flow=f_skip)
 
             flow_skips.append(f_skip)
             f_main = f_skip
-            c_main = cond_skips_raw[level]  # 🎈 遵循架构图：直接传入纯净的 Cond Encoder 特征给 FAA
 
+            # FAA uses encoder features only
+            tmp = cond_enc_feats[level]
+            
             if level in self.attn_level_set:
-                hog_flow = self.freq_hog_f(f_main)
-                hog_cond = self.freq_hog_c(c_main)
-
-                norm_f = self.hog_norm_levels_f[level]
-                norm_c = self.hog_norm_levels_c[level]
-                hog_flow = norm_f(torch.log1p(hog_flow))
-                hog_cond = norm_c(torch.log1p(hog_cond))
-
                 faa_list: nn.ModuleList = self.couple_modules[str(level)]
                 for faa in faa_list:
-                    f_main = faa(
+                    tmp = faa(
                         flow=f_main,
-                        cond=c_main,
-                        hog_flow=hog_flow,
-                        hog_cond=hog_cond,
+                        cond=tmp,
                         t_emb=t_emb,
                     )
+            f_main = tmp
 
             flow = enc_flow.down(f_main) if enc_flow.down is not None else f_main
 
-        # 2. Flow Bottleneck
+        # Bottleneck FAA
         if self.bottleneck_coupler is not None:
-            # 🎈 遵循架构图：Bottleneck FAA 接收 cond_bot 特征
-            hog_flow = self.freq_hog_f(flow)
-            hog_cond = self.freq_hog_c(cond_bot)
-
-            hog_flow = self.hog_norm_mid_f(torch.log1p(hog_flow))
-            hog_cond = self.hog_norm_mid_c(torch.log1p(hog_cond))
-
+            tmp = cond_bot
             for faa in self.bottleneck_coupler:
-                flow = faa(
+                tmp = faa(
                     flow=flow,
-                    cond=cond_bot,
-                    hog_flow=hog_flow,
-                    hog_cond=hog_cond,
+                    cond=tmp,
                     t_emb=t_emb,
                 )
+            flow = tmp
 
-        # 3. Flow Decoder (核心：通过 ZeroConv 接收 Cond Decoder 特征)
+        # Flow decoder
         h = flow
         for dec_idx, (dec, f_skip) in enumerate(zip(self.dec, reversed(flow_skips))):
             h = dec(h, f_skip, t_emb)
 
-            if self.control_inject_to_decoder:
-                level = (n_levels - 1) - dec_idx
-                # 🎈 遵循架构图大粗蓝线：Cond Decoder 完美语义 -> ZeroConv -> Flow Decoder！
-                h = h + self.ctrl_zero_dec[level](cond_dec_feats[level]) 
-                
         h = F.silu(h)
-        
         return self.out_v(h), seg_logits
 
+
 # =========================================================
-# build_model 
+# build_model
 # =========================================================
 def build_model(
     img_in_ch: int = 1,
@@ -1056,18 +1122,11 @@ def build_model(
     freq_attn_depth: int = 0,
     use_bottleneck_coupling: bool = True,
     faa_stacks: int = 4,
-    hog_bins: int = 8,
-    hog_tau: float = 0.35,
-    hog_mag_weight: bool = True,
-    hog_eps: float = 1e-8,
-    # control_resblocks_per_level 被废弃，已从此函数参数中移除。
-    control_inject_to_decoder: bool = True,
     faa_patch: int = 2,
     faa_attn_dropout: float = 0.0,
     faa_token_dim: Optional[int] = None,
     faa_gate_scale: float = 1.0,
     faa_gate_R: int = 2,
-
     usa_low_gauss_ks: int = 3,
     usa_high_gauss_ks: int = 5,
     usa_low_gauss_sigma: float = 1.5,
@@ -1087,11 +1146,6 @@ def build_model(
         freq_attn_depth=freq_attn_depth,
         use_bottleneck_coupling=use_bottleneck_coupling,
         faa_stacks=faa_stacks,
-        hog_bins=hog_bins,
-        hog_tau=hog_tau,
-        hog_mag_weight=hog_mag_weight,
-        hog_eps=hog_eps,
-        control_inject_to_decoder=control_inject_to_decoder,
         faa_patch=faa_patch,
         faa_attn_dropout=faa_attn_dropout,
         faa_token_dim=faa_token_dim,
@@ -1122,11 +1176,6 @@ if __name__ == "__main__":
         freq_attn_depth=1,
         use_bottleneck_coupling=True,
         faa_stacks=2,
-        hog_bins=8,
-        hog_tau=0.35,
-        hog_mag_weight=True,
-        hog_eps=1e-8,
-        control_inject_to_decoder=True,
         faa_patch=8,
         faa_attn_dropout=0.0,
         faa_token_dim=None,
@@ -1145,7 +1194,7 @@ if __name__ == "__main__":
 
     v, seg_logits = net(x_t, img, t)
 
-    print("✅ Build Successfully with Perfect Architectural Alignment!")
+    print("✅ Build Successfully with Token Discrepancy Preparation!")
     print(f"Input x_t shape : {x_t.shape}")
     print(f"Output v shape  : {v.shape}")
     print(f"Seg Logits shape: {seg_logits.shape}")
