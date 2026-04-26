@@ -494,11 +494,11 @@ class TokenDiscrepancyExtractor(nn.Module):
     """
     def __init__(
         self,
+        time_ch: int,
         ch: int,
         token_dim: int,
         patch: int,
         hidden_mult: int = 2,
-        time_ch: int,
     ):
         super().__init__()
         self.ch = int(ch)
