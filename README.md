@@ -113,19 +113,3 @@ To run evaluation on a single GPU:
 ```bash
 python  test.py     --output_dir=exp_out/prompt     --prompt     --is_saveout
 ```
-
-## ©️ Citation
-
-If you use this baseline or find our work helpful, please consider citing:
-
-```bibtex
-@misc{chen2025ultraupconvnetupernetconvnextbasedmultitask,
-      title={UltraUPConvNet: A UPerNet- and ConvNeXt-Based Multi-Task Network for Ultrasound Tissue Segmentation and Disease Prediction}, 
-      author={Zhi Chen and Le Zhang},
-      year={2025},
-      eprint={2509.11108},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV},
-      url={https://arxiv.org/abs/2509.11108}, 
-}
-```
