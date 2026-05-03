@@ -452,7 +452,7 @@ def main():
 
     # -------- Optimization --------
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=12)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=144)
 
@@ -486,7 +486,7 @@ def main():
 
     # System
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gpus", type=int, default=4)
+    parser.add_argument("--gpus", type=int, default=1)
 
     args = parser.parse_args()
     pl.seed_everything(args.seed)

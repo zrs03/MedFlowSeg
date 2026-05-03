@@ -344,7 +344,7 @@ def main():
     ap.add_argument("--p_hi", type=float, default=99.0, help="percentile clip high")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--split_json", type=str, default=None, help="可选：复用已有 split.json")
-    ap.add_argument("--use_classes", nargs="+", default=["benign", "malignant", "normal"], choices=["benign", "malignant", "normal"])
+    ap.add_argument("--use_classes", nargs="+", default=["benign", "malignant"], choices=["benign", "malignant", "normal"])
     ap.add_argument("--quiet", action="store_true", help="不打印日志")
     args = ap.parse_args()
 
