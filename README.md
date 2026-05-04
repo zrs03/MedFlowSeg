@@ -14,7 +14,7 @@ MedFlowSeg formulates medical image segmentation as a conditional flow matching 
 
 The framework adopts a two-stream architecture, consisting of a Flow Network and a Condition Network. The Condition Network provides clean semantic guidance, while the Flow Network models the generative trajectory from noisy intermediate states to segmentation masks.
 
-## 🏋️‍♀️ Example Training
+## 🏋️‍♀️ Guideline
 
 ### 1. Clone Repository
 
@@ -72,13 +72,13 @@ ACDCdataset/
 └── (other documents)
 ~~~
 
-2.  Preprocess Dataset
+2.  Preprocess and Augment Dataset
 
     ```bash
     bash PrepareACDCDataset.sh
     ```
     This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
-    You can find the preprocessed dataset in /dataset/ACDC.
+    You can find the preprocessed dataset in ``/dataset/ACDC``.
 
 **Gland Segmentation in Histology from GlaS dataset**
 
@@ -99,13 +99,18 @@ GlaSdataset/
 └── Grade.csv
 ~~~
 
-2.  Preprocess Dataset
+2.  Preprocess and Augment Dataset
 
     ```bash
     bash PrepareGlaSDataset.sh
     ```
     This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
-    You can find the preprocessed dataset in /dataset/GlaS.
+    You can find the preprocessed dataset in ``/dataset/GlaS``.
+
+**Run on your own dataset**
+
+It is simple to run MedFlowSeg on the other datasets. You can refer to our ``/utils/REFUGE2cupPreprocess.py`` for RGB images and ``/utils/COVID19Preprecoss.py`` for single-channel image.
+If your dataset is preprocessed correctly, our ``/utils/Augment.py`` can help you with the dataset augmentation.
 
 
 ### 4. Model Training
