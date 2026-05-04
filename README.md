@@ -6,6 +6,10 @@ This repository hosts the official PyTorch implementation for our paper,
 
 ## 🎯 Overview
 
+<p align="center">
+  <img src="https://github.com/yyxl123/MedFlowSeg/blob/new/assets/framework.png" width="600">
+</p>
+
 MedFlowSeg formulates medical image segmentation as a conditional flow matching problem. Instead of relying on iterative denoising as in diffusion-based segmentation methods, MedFlowSeg learns a time-dependent velocity field that transports a simple noise prior to the target segmentation distribution.
 
 The framework adopts a two-stream architecture, consisting of a Flow Network and a Condition Network. The Condition Network provides clean semantic guidance, while the Flow Network models the generative trajectory from noisy intermediate states to segmentation masks.
@@ -39,7 +43,7 @@ pip install -r requirements.txt
 
 1. Download the ACDC dataset from [ACDC Challenge](https://www.creatis.insa-lyon.fr/Challenge/acdc/databases.html).
 
-   Your final `dataset` directory structure should look similar to this:
+   Your final `ACDCdataset` directory structure should look similar to this:
 
 ~~~
 ACDCdataset/
@@ -74,12 +78,13 @@ ACDCdataset/
     bash PrepareACDCDataset.sh
     ```
     This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
+    You can find the preprocessed dataset in /dataset/ACDC.
 
-**gland segmentation in histology from GlaS dataset**
+**Gland Segmentation in Histology from GlaS dataset**
 
 1. Download the GlaS dataset from [GlaS dataset](https://www.kaggle.com/datasets/sani84/glasmiccai2015-gland-segmentation).
 
-   Your final `dataset` directory structure should look similar to this:
+   Your final `GlaSdataset` directory structure should look similar to this:
 
 ~~~
 GlaSdataset/
@@ -100,6 +105,7 @@ GlaSdataset/
     bash PrepareGlaSDataset.sh
     ```
     This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
+    You can find the preprocessed dataset in /dataset/GlaS.
 
 
 ### 4. Model Training
