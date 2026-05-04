@@ -2,7 +2,7 @@
 
 This repository hosts the official PyTorch implementation for our paper,  
 
-**"MedFlowSeg: Flow Matching for General Medical Image Segmentation"**.
+**"MedFlowSeg: Flow Matching for Medical Image Segmentation with Frequency-Aware Attention"**.
 
 ## 🎯 Overview
 
@@ -10,7 +10,7 @@ MedFlowSeg formulates medical image segmentation as a conditional flow matching 
 
 The framework adopts a two-stream architecture, consisting of a Flow Network and a Condition Network. The Condition Network provides clean semantic guidance, while the Flow Network models the generative trajectory from noisy intermediate states to segmentation masks.
 
-
+## 🏋️‍♀️ Example Training
 
 ### 1. Clone Repository
 
@@ -35,81 +35,101 @@ pip install -r requirements.txt
 
 ### 3. Prepare Datasets
 
-The data structure is crucial for the data loaders to work correctly.
+**Cardiac Structures Segmentation from ACDC dataset**
 
-Your final `data` directory structure should look similar to this:
+1. Download the ACDC dataset from [ACDC Challenge](https://www.creatis.insa-lyon.fr/Challenge/acdc/databases.html).
 
-    ```
-    data/
-    ├── classification
-    │   ├── Appendix
-    │   ├── BUS-BRA
-    │   ... (other public datasets)
-    │   ├── private_Appendix
-    │   ├── private_Breast
-    │   └── ... (other prefixed private datasets)
-    ├── segmentation
-    │   ├── BUS-BRA
-    │   ... (other public datasets)
-    │   ├── private_Breast
-    │   └── ... (other prefixed private datasets)
-    └── Val
-        ├── classification
-        └── segmentation
+   Your final `dataset` directory structure should look similar to this:
 
-2.  **Generate File Lists**: After organizing the data, you need to generate `train.txt`, `val.txt`, and `test.txt` for each dataset. We provide a script to do this automatically.
+~~~
+ACDCdataset/
+├── training
+│   ├── patient001
+│   │   ├──patient001_frame01.nii.gz
+│   |   ├──patient001_frame01_gt.nii.gz
+│   |   ├──patient001_frame12.nii.gz
+│   |   ├──patient001_frame12_gt.nii.gz
+│   │   └── (other documents)
+│   ├── patient002
+│   ... 
+│   ├── patient100
+│   └── MANDATORY_CITATION.md
+├── testing
+│   ├── patient101
+│   │   ├──patient101_frame01.nii.gz
+│   |   ├──patient101_frame01_gt.nii.gz
+│   |   ├──patient101_frame14.nii.gz
+│   |   ├──patient101_frame14_gt.nii.gz
+│   │   └── (other documents)
+│   ├── patient102
+│   ... 
+│   ├── patient150
+│   └── MANDATORY_CITATION.md
+└── (other documents)
+~~~
+
+2.  Preprocess Dataset
 
     ```bash
-    python ./datasets/generate_txt.py
+    bash PrepareACDCDataset.sh
     ```
-    This script will scan the `data/` directory, split the files into 70% training, 20% validation, and 10% testing sets, and write the file paths into the corresponding `.txt` files.
+    This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
 
-### 4. Download Pre-trained Weights (Optional)
+**gland segmentation in histology from GlaS dataset**
 
-To get started quickly or if you want to download ConvNeXt weight, you can follow:
+1. Download the GlaS dataset from [GlaS dataset](https://www.kaggle.com/datasets/sani84/glasmiccai2015-gland-segmentation).
 
-1.  **Download Model Weights**: Go to the official [**GitHub page**](https://github.com/facebookresearch/ConvNeXt) and download the `ConvNeXt-T 224*224` file.
-2.  **Prepare Experiment Directory**: Create a directory for your experiment output: `mkdir pretrained_ckpt`.
-3.  **Place and Rename Weights**: Move the downloaded `*.pth` file into this folder.
+   Your final `dataset` directory structure should look similar to this:
+
+~~~
+GlaSdataset/
+├── train_85.bmp
+├── train_85_anno.bmp
+... 
+├── testA_2.bmp
+├── testA_2_anno.bmp
+...
+├── testB_15.bmp
+├── testB_15_anno.bmp
+└── Grade.csv
+~~~
+
+2.  Preprocess Dataset
+
+    ```bash
+    bash PrepareGlaSDataset.sh
+    ```
+    This script will preprocess and augment the dataset, split the files into 80% training, 10% validation, and 10% testing sets.
 
 
-## 🏋️‍♀️ Model Training
+### 4. Model Training
 
-The training process is handled by `train.py`, which leverages `trainer.py`. It uses a sophisticated weighted sampler to balance learning between different datasets and tasks (segmentation and classification).
-
-To start training, run the provided shell script:
-
-```bash
-bash train.sh
+Taking the ACDC dataset as an example, the training command is as follows:
+```
+python train.py \
+    --train_root ./dataset/ACDC/Aug/train \
+    --val_root ./dataset/ACDC/SDF/val \
+    --img_in_ch 1 \
+    --num_classes 3 \
+    --sample_steps 50 \
+    --lr 1e-4 \
+    --batch_size 8 \
+    --epochs 1000 \
+    --output_root ./Outputs/MedFlowSeg-ACDC \
+    --gpus 4
 ```
 
-Alternatively, you can run the command directly.
 
-```bash
-python train.py --output_dir=exp_out/prompt \
-                --prompt \
-                --base_lr=3e-5 \
-                --use_pretrained \
-                --pretrained_path=./pretrained_ckpt/convnext_tiny_22k_1k_224.pth \
-                --batch_size=16
+### 5. Model Evaluation
 
+Similarly, taking the ACDC dataset as an example:
+```
+python test.py \
+    --ckpt ./Outputs/MedFlowSeg-ACDC/checkpoints/your_best.ckpt \
+    --data_root ./dataset/ACDC/SDF/test \
+    --out_dir ./Outputs/MedFlowSeg_test_ACDC \
+    --num_classes 3 \
+    --sample_steps 50 \
+    --img_in_ch 1 \
 ```
 
-**Key Arguments**:
-- `--output_dir`: Directory to save logs, checkpoints, and validation results.
-- `--prompt`: Enables the prompt-based learning mechanism.
-- `--batch_size`: batch size.
-- `--max_epochs`: Total number of training epochs.
-- `--pretrain_ckpt`: Path to a pretrained ConvNeXt checkpoint (`.pth`) to initialize the encoder. The baseline will automatically load from `pretrained_ckpt/convnext_tiny_22k_1k_224.pth`.
-
-Checkpoints and logs will be saved in the specified `--output_dir`.
-
-## 🧪 Inference and Evaluation
-
-After training, you can evaluate your model on the test sets using `test.py`.
-
-To run evaluation on a single GPU:
-
-```bash
-python  test.py     --output_dir=exp_out/prompt     --prompt     --is_saveout
-```
