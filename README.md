@@ -18,7 +18,7 @@ The framework adopts a two-stream architecture, consisting of a Flow Network and
 
 ### 1. Clone Repository
 
-```bash
+```python
 
 cd MedFlowSeg
 
@@ -28,7 +28,7 @@ cd MedFlowSeg
 
 We recommend using Conda to manage the environment.
 
-```bash
+```python
 conda create -n medflowseg python=3.10 -y
 
 conda activate medflowseg
@@ -115,7 +115,7 @@ If your dataset is preprocessed correctly, our ``/utils/Augment.py`` can help yo
 ### 4. Model Training
 
 Taking the ACDC dataset as an example, the training command is as follows:
-```
+```python
 python train.py \
     --train_root ./dataset/ACDC/Aug/train \
     --val_root ./dataset/ACDC/SDF/val \
@@ -133,7 +133,7 @@ python train.py \
 ### 5. Model Evaluation
 
 Similarly, taking the ACDC dataset as an example:
-```
+```python
 python test.py \
     --ckpt ./Outputs/MedFlowSeg-ACDC/checkpoints/your_best.ckpt \
     --data_root ./dataset/ACDC/SDF/test \
