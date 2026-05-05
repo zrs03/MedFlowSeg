@@ -45,7 +45,7 @@ pip install -r requirements.txt
 
    Your final `ACDCdataset` directory structure should look similar to this:
 
-~~~
+```bash
 ACDCdataset/
 ├── training
 │   ├── patient001
@@ -70,7 +70,7 @@ ACDCdataset/
 │   ├── patient150
 │   └── MANDATORY_CITATION.md
 └── (other documents)
-~~~
+```
 
 2.  Preprocess and Augment Dataset
 
@@ -86,7 +86,7 @@ ACDCdataset/
 
    Your final `GlaSdataset` directory structure should look similar to this:
 
-~~~
+```bash
 GlaSdataset/
 ├── train_85.bmp
 ├── train_85_anno.bmp
@@ -97,8 +97,7 @@ GlaSdataset/
 ├── testB_15.bmp
 ├── testB_15_anno.bmp
 └── Grade.csv
-~~~
-
+```
 2.  Preprocess and Augment Dataset
 
     ```bash
