@@ -1,16 +1,3 @@
-# ======================================================
-# test_medflowseg_staple_multiclass_nobg_withbgmask.py
-# Flow-Matching Medical Segmentation - Test / Inference
-# ✅ Multi-sample inference + One-vs-Rest STAPLE fusion (multi-class)
-# ✅ NO-BG ONEHOT CHANNEL, BUT WITH EXPLICIT BG IN MASK
-# ✅ Simultaneously predicts and evaluates the Direct Cond Branch 
-# ✅ Overlay Visualization with explicit --rgb_vis argument
-# ✅ Robust GT/Pred decoding & STRICTLY FOREGROUND ONLY Metrics
-# ✅ MODIFIED: Adjustable vis opacity via --vis_alpha
-# ✅ MODIFIED: Removed Direct prediction from visualization (layout 1x3)
-# ✅ MODIFIED: Added Average HD95 Metric Calculation
-# ======================================================
-
 import argparse
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -22,19 +9,15 @@ import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-# ================= 新增：HD95 所需依赖 =================
 from scipy.ndimage import binary_erosion
 from scipy.spatial.distance import cdist
-# ======================================================
 
-# 假设这些模块存在于您的项目中
 try:
     from models.MedFlowSeg import build_model
     from utils.dataset import FolderDataset
 except ImportError:
     print("Warning: Could not import project specific modules. "
           "Make sure models.MedFlowSeg and utils.dataset are accessible.")
-    # 定义占位符以便代码检查通过，实际运行需要正确导入
     def build_model(**kwargs): return nn.Module()
     class FolderDataset: 
         def __init__(self, *args, **kwargs): pass
@@ -67,7 +50,6 @@ def onehot_to_mask_gt_with_bg(onehot_gt: torch.Tensor, num_classes: int) -> torc
     if onehot_gt.dim() != 4:
         raise ValueError(f"onehot_gt must be (B,C,H,W), got {tuple(onehot_gt.shape)}")
 
-    # 强制只取最后 num_classes 个通道（剔除可能误传的背景通道）
     if onehot_gt.shape[1] > num_classes:
         fg_gt = onehot_gt[:, -num_classes:, :, :]
     else:
@@ -76,13 +58,12 @@ def onehot_to_mask_gt_with_bg(onehot_gt: torch.Tensor, num_classes: int) -> torc
     fg_bin = (fg_gt > 0.5).to(torch.int8)
     bg_bin = (fg_bin.sum(dim=1, keepdim=True) == 0).to(torch.int8)
 
-    m = torch.cat([bg_bin, fg_bin], dim=1)  # 第 0 通道固定为背景
+    m = torch.cat([bg_bin, fg_bin], dim=1) 
     return torch.argmax(m, dim=1)
 
 
 @torch.no_grad()
 def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """✅ 仅计算前景类别 (1 到 num_classes)"""
     dices = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -95,7 +76,6 @@ def per_class_dice(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> to
 
 @torch.no_grad()
 def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """✅ 仅计算前景类别 (1 到 num_classes)"""
     ious = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -108,7 +88,6 @@ def per_class_iou(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> tor
 
 @torch.no_grad()
 def mean_dice_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """✅ 仅计算前景类别 Mean Dice"""
     dices = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -125,7 +104,6 @@ def mean_dice_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes:
 
 @torch.no_grad()
 def mean_iou_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """✅ 仅计算前景类别 Mean IoU"""
     ious = []
     for c in range(1, num_classes + 1):
         p = (pred == c).float()
@@ -140,13 +118,10 @@ def mean_iou_foreground_only(pred: torch.Tensor, gt: torch.Tensor, num_classes: 
     return torch.stack(ious).mean()
 
 
-# ================= 新增 HD95 核心逻辑 =================
 @torch.no_grad()
 def compute_hd95_single(pred: np.ndarray, gt: np.ndarray) -> float:
-    # GT为空，不参与评估，返回NaN
     if np.sum(gt) == 0:
         return np.nan
-    # GT存在，但模型未预测出该类别，给予图像对角线作为最大惩罚
     if np.sum(pred) == 0:
         return np.sqrt(pred.shape[0]**2 + pred.shape[1]**2)
 
@@ -168,7 +143,6 @@ def compute_hd95_single(pred: np.ndarray, gt: np.ndarray) -> float:
 
 @torch.no_grad()
 def per_class_hd95(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """✅ 仅计算前景类别 HD95 (忽略没有GT的情况)"""
     pred_np = pred.detach().cpu().numpy()
     gt_np = gt.detach().cpu().numpy()
     B = pred_np.shape[0]
@@ -187,7 +161,7 @@ def per_class_hd95(pred: torch.Tensor, gt: torch.Tensor, num_classes: int) -> to
         if len(batch_hd95) > 0:
             hd95_list.append(np.mean(batch_hd95))
         else:
-            hd95_list.append(np.nan) # 返回 NaN 表示该 Batch 该类别无评估意义
+            hd95_list.append(np.nan)
 
     return torch.tensor(hd95_list, dtype=torch.float32)
 
@@ -217,7 +191,6 @@ def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarra
 
 
 def overlay_mask_on_image(img_raw: np.ndarray, mask: np.ndarray, num_classes: int, alpha: float = 0.5) -> np.ndarray:
-    """将 mask 按透明度 alpha 叠加到原图上。支持灰度和RGB"""
     img_min, img_max = img_raw.min(), img_raw.max()
     if img_max > img_min:
         img_norm = (img_raw - img_min) / (img_max - img_min) * 255.0
@@ -330,7 +303,6 @@ class MedFlowSegTester(nn.Module):
         self.img_in_ch = img_in_ch
         self.num_classes = num_classes
         self.sample_steps = sample_steps
-        # build_model 实际定义取决于您的项目
         self.net = build_model(xt_in_ch=num_classes, freq_attn_depth=freq_attn_depth, img_in_ch=img_in_ch)
 
     @torch.no_grad()
@@ -438,15 +410,15 @@ def run_test(
 
     dices_flow_fg: List[float] = []
     ious_flow_fg: List[float] = []
-    hd95_flow_fg: List[float] = []    # ✅ 保存 Flow HD95
+    hd95_flow_fg: List[float] = []   
     
     dices_direct_fg: List[float] = []
     ious_direct_fg: List[float] = []
-    hd95_direct_fg: List[float] = []  # ✅ 保存 Direct HD95
+    hd95_direct_fg: List[float] = []  
 
     per_class_dices_flow_all = []
     per_class_ious_flow_all = []
-    per_class_hd95_flow_all = []      # ✅ 保存 Flow 每个类别的 HD95
+    per_class_hd95_flow_all = []      
     
     vis_count = 0
 
@@ -484,13 +456,13 @@ def run_test(
 
         pred_mask_direct = onehot_to_mask_pred_with_bg(direct_pred_prob, thresh=thresh)
 
-        # 3. Ground Truth Mask (传入 num_classes 进行自适应截断)
+        # 3. Ground Truth Mask 
         gt_mask = onehot_to_mask_gt_with_bg(onehot_gt, num_classes=num_classes)  
 
         # ---------- Metrics (Flow) ----------
         dice_flow = mean_dice_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
         iou_flow = mean_iou_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
-        hd95_flow = mean_hd95_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes) # ✅ 计算 HD95
+        hd95_flow = mean_hd95_foreground_only(pred_mask_flow, gt_mask, num_classes=num_classes)
         
         dices_flow_fg.append(float(dice_flow.item()))
         ious_flow_fg.append(float(iou_flow.item()))
@@ -498,12 +470,12 @@ def run_test(
 
         per_class_dices_flow_all.append(per_class_dice(pred_mask_flow, gt_mask, num_classes).cpu())
         per_class_ious_flow_all.append(per_class_iou(pred_mask_flow, gt_mask, num_classes).cpu())
-        per_class_hd95_flow_all.append(per_class_hd95(pred_mask_flow, gt_mask, num_classes).cpu()) # ✅ 保存类别 HD95
+        per_class_hd95_flow_all.append(per_class_hd95(pred_mask_flow, gt_mask, num_classes).cpu()) 
 
         # ---------- Metrics (Direct) ----------
         dice_direct = mean_dice_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
         iou_direct = mean_iou_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
-        hd95_direct = mean_hd95_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes) # ✅ 计算 Direct HD95
+        hd95_direct = mean_hd95_foreground_only(pred_mask_direct, gt_mask, num_classes=num_classes)
         
         dices_direct_fg.append(float(dice_direct.item()))
         ious_direct_fg.append(float(iou_direct.item()))
@@ -571,7 +543,6 @@ def run_test(
     per_class_ious_flow_all = torch.stack(per_class_ious_flow_all).numpy()
     per_class_hd95_flow_all = torch.stack(per_class_hd95_flow_all).numpy() 
 
-    # ✅ 使用 nanmean 和 nanstd 处理可能存在全0GT而返回的NaN
     mean_dice_c = np.nanmean(per_class_dices_flow_all, axis=0)
     std_dice_c = np.nanstd(per_class_dices_flow_all, axis=0)
     
@@ -591,7 +562,6 @@ def run_test(
             f"HD95: {mean_hd95_c[i]:.4f} ± {std_hd95_c[i]:.4f}"
         )
 
-    # ✅ 过滤掉批次计算中可能的 NaN
     valid_hd95_direct = [v for v in hd95_direct_fg if not np.isnan(v)]
     valid_hd95_flow = [v for v in hd95_flow_fg if not np.isnan(v)]
 

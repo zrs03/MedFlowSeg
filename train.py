@@ -1,13 +1,3 @@
-# ======================================================
-# train_medflowseg.py
-# Flow-Matching Medical Segmentation (Lightning v2)
-# ✅ OneHot version (NO-BACKGROUND channels, NO SDF)
-# ✅ Removed class-wise weighting
-# ✅ With probability seg_prob, add seg-head loss: L_dice + beta * L_ce
-# ✅ Compatible with model returning: (v_pred, seg_logits)
-# ✅ ALIGNED VISUALIZATION: Explicit --rgb_vis, --vis_alpha, and color logic
-# ======================================================
-
 import argparse
 from pathlib import Path
 
@@ -85,10 +75,6 @@ def colorize_multiclass_with_bg(mask: np.ndarray, num_classes: int) -> np.ndarra
 
 
 def overlay_mask_on_image(img_raw: np.ndarray, mask: np.ndarray, num_classes: int, alpha: float = 0.5) -> np.ndarray:
-    """
-    将 mask 按透明度 alpha 叠加到原图上。
-    自动适配单通道灰度图 (H, W) 和 三通道 RGB 图 (H, W, 3)。
-    """
     img_min, img_max = img_raw.min(), img_raw.max()
     if img_max > img_min:
         img_norm = (img_raw - img_min) / (img_max - img_min) * 255.0
@@ -202,8 +188,8 @@ class MedFlowSeg(pl.LightningModule):
         ema_decay: float = 0.9999,
         seg_prob: float = 0.1,
         seg_ce_beta: float = 10.0,
-        rgb_vis: bool = False,      # ✅ 引入 rgb_vis 控制
-        vis_alpha: float = 0.8,     # ✅ 引入不透明度控制
+        rgb_vis: bool = False,      
+        vis_alpha: float = 0.8,     
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -380,7 +366,6 @@ class MedFlowSeg(pl.LightningModule):
                     gt = cache["gt"].numpy()
                     bidx = cache.get("batch_idx", 0)
                     
-                    # ✅ 同步测试脚本逻辑：显式控制 rgb_vis
                     is_rgb = self.rgb_vis and (img_tensor.shape[1] >= 3)
                     
                     if is_rgb:
@@ -395,11 +380,9 @@ class MedFlowSeg(pl.LightningModule):
                         gt_i = gt[i]
                         pred_i = pred[i]
 
-                        # ✅ 传递 num_classes_fg（前景类数量）且使用配置的透明度 vis_alpha
                         overlay_gt = overlay_mask_on_image(img_i, gt_i, self.num_classes_fg, alpha=self.vis_alpha)
                         overlay_pred = overlay_mask_on_image(img_i, pred_i, self.num_classes_fg, alpha=self.vis_alpha)
 
-                        # 原图显示处理
                         if is_rgb:
                             img_disp = img_i.copy()
                             img_min, img_max = img_disp.min(), img_disp.max()
@@ -461,11 +444,9 @@ def main():
     parser.add_argument("--vis_every", type=int, default=10)
     parser.add_argument("--vis_batches", type=int, default=2)
 
-    # ✅ 新增不透明度和RGB控制参数，对齐测试代码
     parser.add_argument("--rgb_vis", action="store_true", help="enable RGB visualization")
     parser.add_argument("--vis_alpha", type=float, default=0.8, help="Opacity for segmentation mask overlay (0.0 to 1.0)")
 
-    # onehot 解码阈值
     parser.add_argument("--thresh", type=float, default=0.5)
 
     # seg-head loss
