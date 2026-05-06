@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-✅ MedFlowSeg 修改版：
-1) Two-Stream 双分支架构 (Cond 纯空间无时序, Flow 含时间步 t)
-2) DBSA 改为：
-   - Cond Decoder 最后一层特征 cond_dec_feats[0] -> [DBSA] -> Flow Enc Level 1
-3) FAA 保持使用 Encoder 特征：
-   - Cond Enc Deep -> [FAA] -> Flow Enc Deep
-   - Cond Bottleneck -> [FAA] -> Flow Bottleneck
-4) 取消原本 Decoder 端 ZeroConv 注入
-5) Cond 特征始终不受 t_emb 污染
-6) 仅替换原 SOSX 分支：
-   - 先 patchify 得到 T_f, T_c
-   - 构造 T_a, T_d, T_r
-   - 得到 T_z = phi([T_a, T_d, T_r])
-   - 再得到 \tilde{T_f}, \tilde{T_c}
-   - 把 (\tilde{T_f}, \tilde{T_c}) 送入原固定 modulator gate 分支
-"""
-
 from __future__ import annotations
 
 import math
@@ -484,14 +466,6 @@ def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device: torch.device, dt
 # Token Discrepancy Preparation
 # =========================================================
 class TokenDiscrepancyExtractor(nn.Module):
-    """
-    方案 A（去掉 confidence）:
-    1) patchify 得到 T_f, T_c
-    2) 构造 agreement / difference / residual
-    3) 三路分别编码
-    4) 融合得到 T_z
-    5) 用 T_z 重整 T_f, T_c
-    """
     def __init__(
         self,
         time_ch: int,
@@ -520,7 +494,6 @@ class TokenDiscrepancyExtractor(nn.Module):
         self.flow_direct = SpatialDirectHeadFiLM(ch, time_ch)
         self.cond_direct = SpatialDirectHeadFiLM(ch, time_ch)
 
-        # 三路 token 分别编码
         self.enc_a = nn.Sequential(
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, hidden_dim),
@@ -540,7 +513,6 @@ class TokenDiscrepancyExtractor(nn.Module):
             nn.Linear(hidden_dim, self.token_dim),
         )
 
-        # fuse 成最终证据 token
         self.fuse = nn.Sequential(
             nn.LayerNorm(3 * self.token_dim),
             nn.Linear(3 * self.token_dim, hidden_dim),
@@ -548,7 +520,6 @@ class TokenDiscrepancyExtractor(nn.Module):
             nn.Linear(hidden_dim, self.token_dim),
         )
 
-        # 用证据 token 去重整 flow / cond token
         self.g_flow = nn.Sequential(
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, self.token_dim),
@@ -558,7 +529,6 @@ class TokenDiscrepancyExtractor(nn.Module):
             nn.Linear(self.token_dim, self.token_dim),
         )
 
-        # 建议用小初始化，不要全零
         nn.init.normal_(self.g_flow[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.g_flow[-1].bias)
         nn.init.normal_(self.g_cond[-1].weight, mean=0.0, std=1e-3)
@@ -583,20 +553,16 @@ class TokenDiscrepancyExtractor(nn.Module):
                 f"TokenDiscrepancyExtractor needs same patch hw, got {hw_p_f} vs {hw_p_c}"
             )
 
-        # 三类 patch 证据
         T_a = T_f * T_c
         T_d = torch.abs(T_f - T_c)
         T_r = T_f - T_c
 
-        # 分别编码
         T_a = self.enc_a(T_a)
         T_d = self.enc_d(T_d)
         T_r = self.enc_r(T_r)
 
-        # 融合得到修正证据 token
         T_z = self.fuse(torch.cat([T_a, T_d, T_r], dim=-1))
 
-        # 重整输入 token
         T_f_tilde = T_f + self.g_flow(T_z)
         T_c_tilde = T_c + self.g_cond(T_z)
 
@@ -631,7 +597,6 @@ class FAAModule(nn.Module):
 
         ri_ch = 2 * self.ch
 
-        # 输入分支保持不变
         self.patch_flow = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.faa_patch)
         self.patch_cond = PatchEmbed2D(in_ch=ri_ch, embed_dim=self.token_dim, patch=self.faa_patch)
 
@@ -643,10 +608,8 @@ class FAAModule(nn.Module):
             time_ch=time_ch,
         )
 
-        # 【修改点 1】：重命名并负责还原 Cond
         self.unpatch_cond = Unpatch2D(embed_dim=self.token_dim, out_ch=ri_ch, patch=self.faa_patch)
 
-        # 【修改点 2】：交叉注意力，现在用于更新 Cond
         self.attn_cond = TokenCrossAttention(dim=self.token_dim, heads=heads, dropout=faa_attn_dropout)
 
         self.ffn_cond = nn.Sequential(
@@ -659,7 +622,6 @@ class FAAModule(nn.Module):
         self.direct_head_flow = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
         self.direct_head_cond = FreqDirectHeadFiLM(ch=self.ch, time_ch=time_ch)
 
-        # 门控分支的重命名
         gate_in_dim = 2 * self.token_dim
         self.gate_cond_blocks = nn.ModuleList(
             [TokenFiLMBlock(gate_in_dim, time_ch, mlp_hidden_mult=2) for _ in range(self.gate_R)]
@@ -684,7 +646,6 @@ class FAAModule(nn.Module):
         key = (hp, wp, self.token_dim, device, dtype)
         pos = self._pos_cache.get(key)
         if pos is None or pos.device != device or pos.dtype != dtype:
-            # 假设外部有 build_2d_sincos_pos_embed
             pos = build_2d_sincos_pos_embed(hp, wp, self.token_dim, device=device, dtype=dtype)
             self._pos_cache[key] = pos
         return pos
@@ -695,9 +656,6 @@ class FAAModule(nn.Module):
         cond: torch.Tensor,
         t_emb: torch.Tensor,
     ) -> torch.Tensor:
-        # -------------------------------------------------
-        # 傅里叶变换保持不变
-        # -------------------------------------------------
         Fz = torch.fft.fftshift(torch.fft.fft2(flow, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
         Cz = torch.fft.fftshift(torch.fft.fft2(cond, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
@@ -715,13 +673,9 @@ class FAAModule(nn.Module):
         F_tok = F_tok + pos
         C_tok = C_tok + pos
 
-        # 【修改点 5】：C 去 Attend F，更新的是 C
         C_tok2 = C_tok + self.attn_cond(C_tok, F_tok) 
         C_tok2 = C_tok2 + self.ffn_cond(C_tok2)
 
-        # -------------------------------------------------
-        # 构造 token discrepancy 保持不变
-        # -------------------------------------------------
         T_f_tilde, T_c_tilde, hw_d = self.disc_prep(flow, cond, t_emb)
         
         T_f_tilde = T_f_tilde + pos
@@ -730,20 +684,13 @@ class FAAModule(nn.Module):
         if hw_d != hw_p:
             raise ValueError(f"Discrepancy token hw {hw_d} != main token hw {hw_p}")
 
-        # -------------------------------------------------
-        # 【修改点 6】：门控网络更新 C，拼接顺序通常将 condition 放在前面，target 放在后面，因此调换为 [T_f_tilde, T_c_tilde]
-        # -------------------------------------------------
         g_cond = torch.cat([T_f_tilde, T_c_tilde], dim=-1)
         for blk in self.gate_cond_blocks:
             g_cond = blk(g_cond, t_emb)
         gate_cond = torch.tanh(self.gate_cond_out(g_cond))
 
-        # 作用于 C
         C_tok3 = C_tok2 * (1.0 + self.gate_scale * gate_cond)
 
-        # -------------------------------------------------
-        # 【修改点 7】：逆变换输出改为处理 C
-        # -------------------------------------------------
         Cri2 = self.unpatch_cond(C_tok3, hw_p)
         C2c = self._to_complex(Cri2)
         C2c = torch.fft.ifftshift(C2c, dim=(-2, -1))
@@ -1194,7 +1141,7 @@ if __name__ == "__main__":
 
     v, seg_logits = net(x_t, img, t)
 
-    print("✅ Build Successfully with Token Discrepancy Preparation!")
+    print("Build Successfully with Token Discrepancy Preparation!")
     print(f"Input x_t shape : {x_t.shape}")
     print(f"Output v shape  : {v.shape}")
     print(f"Seg Logits shape: {seg_logits.shape}")
