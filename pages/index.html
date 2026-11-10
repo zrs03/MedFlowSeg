@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="description" content="MedFlowSeg: Flow Matching for Medical Image Segmentation with Frequency-Aware Attention.">
+  <title>MedFlowSeg | Project Page</title>
+  <style>
+    :root{--ink:#252b38;--muted:#4d5665;--blue:#4b70cf;--pink:#df78a5;--line:#dfe3e8;--wash:#f6f8fa;--max:960px}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--ink);background:#fff;font-family:Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;font-size:16px;line-height:1.65}a{color:var(--blue);text-decoration:none}a:hover{color:#304ea0;text-decoration:underline}.page{max-width:var(--max);width:calc(100% - 40px);margin:0 auto}.hero{text-align:center;padding:54px 0 47px}.hero h1{max-width:900px;margin:0 auto 20px;font-size:clamp(34px,5vw,50px);line-height:1.13;letter-spacing:-.035em;font-weight:750}.authors{font-size:18px;line-height:1.75;margin:12px auto 8px}.authors span{font-weight:600;color:var(--blue)}.authors sup,.affiliations sup{font-size:.7em;position:relative;top:-.15em}.affiliations{font-size:15px;line-height:1.55;color:#3d4653}.venue{margin-top:11px;font-weight:600;color:#303846}.actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin:28px 0 0}.pill{display:inline-flex;align-items:center;gap:8px;border-radius:9px;background:#272d3b;color:#fff;padding:10px 17px;font-size:14px;font-weight:650;box-shadow:0 2px 5px #10182720;transition:transform .18s,background .18s}.pill:hover{color:#fff;background:#414a5e;text-decoration:none;transform:translateY(-1px)}.pill svg{width:17px;height:17px;fill:currentColor}.meta{color:#6f7784;font-size:13px;margin-top:19px}.section{padding:34px 0 39px}.section h2{font-size:32px;line-height:1.2;text-align:center;margin:0 0 24px;color:#454b54;font-weight:700}.section h2:after{content:"";display:block;width:48px;height:4px;margin:11px auto 0;border-radius:3px;background:linear-gradient(90deg,#56a8c8,#d879a6)}.section h3{font-size:22px;line-height:1.3;margin:27px 0 8px}.section p{margin:12px 0;color:#343b46}.abstract-band{background:var(--wash);border-block:1px solid #e9edf1}.abstract{max-width:880px;padding:43px 0 46px}.abstract p{text-align:justify;margin:0;font-size:16px;line-height:1.75}.em{font-weight:700;color:#313a49}.figure{margin:25px auto 8px;text-align:center}.figure img{display:block;max-width:100%;height:auto;margin:0 auto}.figure .wide{width:min(100%,900px)}.figure .arch{width:min(100%,900px)}.figure .qual{width:min(100%,900px)}.caption{font-size:14px!important;color:#555e69!important;text-align:center;line-height:1.55;margin:11px auto 0!important;max-width:850px}.motivation{max-width:850px;margin:0 auto}.motivation p{text-align:justify}.two-points{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin:20px 0 8px}.point{border-left:3px solid #83a8dc;padding:2px 0 2px 14px}.point b{display:block;font-size:16px;margin-bottom:3px}.point span{font-size:14px;color:#596270}.method-copy{max-width:850px;margin:0 auto}.method-copy p{text-align:justify}.method-list{display:grid;grid-template-columns:1fr 1fr;gap:12px 25px;margin:20px auto 10px;max-width:850px}.method-item{padding:14px 15px;background:#fafbfc;border:1px solid #edf0f3;border-radius:9px}.method-item b{display:block;color:#344055;font-size:15px;margin-bottom:3px}.method-item span{font-size:14px;color:#525c69}.results-lead{text-align:center;color:#58616d}.table-wrap{overflow-x:auto;margin:22px auto 8px;max-width:850px}table{width:100%;border-collapse:collapse;font-size:14px;min-width:600px}caption{caption-side:top;text-align:left;font-weight:650;color:#3c4552;padding:0 0 9px}th,td{padding:9px 12px;border-bottom:1px solid #e5e8ed;text-align:right;white-space:nowrap}th{font-weight:650;border-top:1px solid #9da4ad;border-bottom:1px solid #9da4ad;color:#3d4652}th:first-child,td:first-child{text-align:left}tbody tr:last-child{border-bottom:1px solid #9da4ad}.ours{font-weight:700;background:#f6f8fb}.ours td:first-child{color:#526fc1}.dataset-list{text-align:center;margin:21px auto 0;display:flex;justify-content:center;gap:8px;flex-wrap:wrap}.dataset-list span{font-size:12px;color:#58616e;border:1px solid #dfe4ea;border-radius:20px;padding:5px 11px;background:#fff}.poster-link{font-size:13px}.bib{position:relative;max-width:850px;margin:0 auto}.bib pre{margin:0;padding:20px 22px;overflow:auto;background:#f5f6f8;border:1px solid #e3e6ea;border-radius:7px;color:#333b47;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}.copy{position:absolute;right:10px;top:10px;border:1px solid #d9dfe6;border-radius:6px;background:#fff;color:#485260;padding:6px 10px;font:12px Arial,sans-serif;cursor:pointer}.copy:hover{background:#f1f4f7}.footer{border-top:1px solid #e2e6eb;padding:18px 0 27px;text-align:center;color:#717a86;font-size:12px}.footer p{margin:5px 0}.footer a{color:#6278aa}.poster-details{max-width:850px;margin:23px auto 0;text-align:center}.poster-details details{border:1px solid #e2e6eb;border-radius:8px;padding:11px 15px;background:#fff}.poster-details summary{cursor:pointer;color:#526178;font-weight:600;font-size:14px}.poster-details img{max-width:100%;height:auto;display:block;margin:17px auto 4px;border:1px solid #e7e9ed}
+    @media(max-width:640px){.page{width:calc(100% - 28px)}.hero{padding:38px 0 34px}.hero h1{font-size:34px}.authors{font-size:16px}.affiliations{font-size:13px}.section{padding:28px 0 33px}.section h2{font-size:27px;margin-bottom:19px}.abstract{padding:32px 0 35px}.abstract p,.section p{font-size:15px}.two-points,.method-list{grid-template-columns:1fr;gap:12px}.figure{margin-top:18px}.caption{font-size:12px!important}.actions{gap:8px;margin-top:21px}.pill{padding:9px 13px;font-size:13px}.meta{font-size:12px}.poster-details summary{text-align:left}}
+  </style>
+</head>
+<body>
+  <header class="page hero">
+    <h1>MedFlowSeg: Flow Matching for Medical Image Segmentation with Frequency-Aware Attention</h1>
+    <div class="authors">
+      <span>Zhi Chen</span><sup>1,*</sup>,
+      <span>Runze Hu</span><sup>2,*</sup>,
+      <span>Le Zhang</span><sup>1,†</sup>
+    </div>
+    <div class="affiliations"><sup>1</sup> School of Engineering, University of Birmingham<br><sup>2</sup> School of Public Health, Peking University</div>
+    <div class="venue">Medical Image Segmentation · Research Project</div>
+    <div class="actions">
+      <a class="pill" href="https://arxiv.org/abs/2604.19675" target="_blank" rel="noreferrer"><svg viewBox="0 0 24 24"><path d="M5 2h9l5 5v15H5V2zm8 1.8V8h4.2L13 3.8zM8 12h8v1.6H8V12zm0 3.5h8v1.6H8v-1.6zm0 3.5h5v1.6H8V19z"/></svg>Paper</a>
+      <a class="pill" href="https://github.com/zrs03/MedFlowSeg" target="_blank" rel="noreferrer"><svg viewBox="0 0 24 24"><path d="M12 .9a11.1 11.1 0 0 0-3.51 21.63c.55.1.75-.24.75-.53v-1.86c-3.08.67-3.73-1.31-3.73-1.31-.5-1.28-1.23-1.62-1.23-1.62-1-.69.08-.68.08-.68 1.11.08 1.7 1.14 1.7 1.14.99 1.7 2.6 1.2 3.23.92.1-.72.39-1.2.7-1.48-2.46-.28-5.05-1.23-5.05-5.49 0-1.21.43-2.2 1.14-2.97-.12-.28-.5-1.4.11-2.92 0 0 .93-.3 3.05 1.13a10.6 10.6 0 0 1 5.55 0c2.12-1.44 3.05-1.13 3.05-1.13.61 1.52.23 2.64.11 2.92.71.77 1.14 1.76 1.14 2.97 0 4.27-2.6 5.2-5.07 5.48.4.35.75 1.02.75 2.05V22c0 .29.2.63.76.53A11.1 11.1 0 0 0 12 .9z"/></svg>Code</a>
+      <a class="pill" href="https://arxiv.org/abs/2604.19675" target="_blank" rel="noreferrer">↗ arXiv</a>
+      <a class="pill" href="poster.png" target="_blank" rel="noreferrer">▧ Poster</a>
+    </div>
+    <div class="meta">* Equal contribution &nbsp; · &nbsp; † Corresponding author</div>
+  </header>
+
+  <section class="abstract-band"><div class="page abstract section">
+    <h2>Abstract</h2>
+    <p>Flow matching offers a deterministic generative framework for medical image segmentation, but effective alignment between noisy intermediate states and clean image features remains challenging. We present <span class="em">MedFlowSeg</span>, a conditional flow matching framework that learns a time-dependent vector field to transform a simple prior into a target segmentation. Its dual-conditioning design combines a <span class="em">Dual-Branch Spatial Attention (DB-SA)</span> module for multi-frequency structural guidance with <span class="em">Frequency-Aware Attention (FA-Attention)</span> for discrepancy-aware interactions across spatial and spectral representations. A time-conditioned Neural Modulator further adapts semantic features along the flow trajectory. Experiments across five medical image segmentation datasets show strong results across MRI, fundus, histology, and ultrasound modalities.</p>
+  </div></section>
+
+  <main class="page">
+    <section class="section">
+      <h2>Motivation</h2>
+      <div class="motivation">
+        <p>Generative segmentation can represent complex anatomical variation, yet diffusion-based approaches often rely on many denoising iterations. Flow matching provides a continuous path from noise to a mask, but the evolving noisy state and the clean semantic features extracted from the image can be difficult to align.</p>
+        <div class="two-points"><div class="point"><b>Efficient generation</b><span>Learn a continuous velocity field and follow it with an ODE solver.</span></div><div class="point"><b>Better conditional alignment</b><span>Guide the flow with spatial structure and time-aware semantic information.</span></div></div>
+      </div>
+      <figure class="figure"><img class="wide" src="pipeline.png" alt="MedFlowSeg conditional flow matching pipeline, from Gaussian noise to a segmentation mask"><figcaption class="caption">Overview of conditional flow matching. The image condition guides the Flow Network as an initial noise sample moves toward the target segmentation.</figcaption></figure>
+    </section>
+
+    <section class="section">
+      <h2>Method</h2>
+      <div class="method-copy"><p>MedFlowSeg uses two U-Net-style streams. The <span class="em">Condition Network</span> extracts image features, while a time-conditioned <span class="em">Flow Network</span> predicts the velocity of the current mask state. The two streams interact at complementary levels: DB-SA injects low- and high-frequency structural cues into shallow flow features, and FA-Attention aligns deep semantic features across spatial and frequency domains.</p></div>
+      <figure class="figure"><img class="arch" src="architecture.png" alt="MedFlowSeg architecture showing its Condition Network, Flow Network, DB-SA, FA-Attention, and Neural Modulator"><figcaption class="caption">MedFlowSeg architecture: structural guidance is introduced through DB-SA, and semantic alignment is refined by FA-Attention and the time-conditioned Neural Modulator.</figcaption></figure>
+      <div class="method-list"><div class="method-item"><b>Dual-Branch Spatial Attention (DB-SA)</b><span>Separates coarse anatomical structure from fine boundary details and injects both into the shallow flow representation.</span></div><div class="method-item"><b>Frequency-Aware Attention (FA-Attention)</b><span>Combines global spectral interactions with spatial-token discrepancy modeling at the bottleneck.</span></div></div>
+      <p class="caption">Training jointly optimizes velocity supervision and an auxiliary segmentation objective on the condition branch.</p>
+    </section>
+
+    <section class="section">
+      <h2>Experiments</h2>
+      <p class="results-lead">MedFlowSeg is evaluated on five public datasets spanning cardiac MRI, brain MRI, fundus images, histology, and echocardiography.</p>
+      <div class="dataset-list"><span>ACDC · Cardiac MRI</span><span>BraTS-2021 · Brain MRI</span><span>REFUGE-2 · Fundus</span><span>GlaS · Histology</span><span>CAMUS · Echocardiography</span></div>
+      <div class="table-wrap"><table><caption>ACDC cardiac segmentation results (average over RV, myocardium, and LV)</caption><thead><tr><th>Method</th><th>Dice ↑</th><th>IoU ↑</th><th>HD95 ↓</th></tr></thead><tbody><tr><td>EnsemDiff</td><td>92.76</td><td>86.61</td><td>6.25</td></tr><tr><td>MedSegDiff</td><td>91.89</td><td>85.12</td><td>7.16</td></tr><tr><td>MedSegDiff-V2</td><td>92.68</td><td>86.39</td><td>6.03</td></tr><tr><td>FlowSDF</td><td>91.43</td><td>84.25</td><td>6.38</td></tr><tr class="ours"><td>MedFlowSeg</td><td>93.57</td><td>87.73</td><td>5.27</td></tr></tbody></table></div>
+      <figure class="figure"><img class="qual" src="qualitative.png" alt="Qualitative segmentation comparison across brain MRI, fundus, ultrasound, and histology"><figcaption class="caption">Qualitative comparison across imaging modalities. Rows show brain MRI, fundus, echocardiography, and histology; the final column shows MedFlowSeg predictions.</figcaption></figure>
+    </section>
+
+    <section class="section">
+      <h2>BibTeX</h2>
+      <div class="bib"><button class="copy" id="copyBib">Copy</button><pre id="bibtex">@article{chen2026medflowseg,
+  title={MedFlowSeg: Flow Matching for Medical Image Segmentation with Frequency-Aware Attention},
+  author={Chen, Zhi and Hu, Runze and Zhang, Le},
+  journal={arXiv preprint arXiv:2604.19675},
+  year={2026}
+}</pre></div>
+    </section>
+    <div class="poster-details"><details><summary>View the complete research poster</summary><img src="poster.png" alt="Full MedFlowSeg research poster"></details></div>
+  </main>
+  <footer class="page footer">
+    <p>Project page for <a href="https://arxiv.org/abs/2604.19675" target="_blank" rel="noreferrer">MedFlowSeg</a>.</p>
+    <p>Page layout inspired by <a href="https://artanic30.github.io/project_pages/NoisyGRPO/" target="_blank" rel="noreferrer">NoisyGRPO</a> and the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank" rel="noreferrer">Academic Project Page Template</a>, adapted from the Nerfies project page.</p>
+    <p>Research prototype; not intended for clinical diagnosis or treatment decisions.</p>
+  </footer>
+  <script>
+    const copyButton=document.getElementById('copyBib');
+    copyButton.addEventListener('click',async()=>{const text=document.getElementById('bibtex').innerText;try{await navigator.clipboard.writeText(text);copyButton.textContent='Copied!'}catch{copyButton.textContent='Select and copy'}setTimeout(()=>copyButton.textContent='Copy',1800)});
+  </script>
+</body>
+</html>
